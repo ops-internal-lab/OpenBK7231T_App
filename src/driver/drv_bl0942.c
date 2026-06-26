@@ -1,15 +1,9 @@
 #include "drv_bl0942.h"
-#include "../obk_config.h"
-
-
-
-#if ENABLE_DRIVER_BL0942 
 
 #include <math.h>
 #include <stdint.h>
 
 #include "../logging/logging.h"
-#include "../new_cfg.h"
 #include "../new_pins.h"
 #include "../cmnds/cmd_public.h"
 #include "drv_bl_shared.h"
@@ -18,16 +12,6 @@
 #include "drv_uart.h"
 
 static unsigned short bl0942_baudRate = 4800;
-#if ENABLE_BL_TWIN
-//bl0942_opts - bit0 - UART1, bit1 - UART2
-// 0=default mode - UART on port according to OBK_FLAG_USE_SECONDARY_UART
-// 3=two BL0942 on UART1 and UART2
-static unsigned short bl0942_opts= 0;
-#define BL0942_OPTBIT0_UART1 1
-#define BL0942_OPTBIT1_UART2 2
-#endif
-#define BL0942_DEVICE_INDEX_0 0
-#define BL0942_DEVICE_INDEX_1 1
 
 #define BL0942_UART_RECEIVE_BUFFER_SIZE 256
 #define BL0942_UART_ADDR 0 // 0 - 3
@@ -46,15 +30,25 @@ static unsigned short bl0942_opts= 0;
 #define BL0942_REG_I_RMS 0x03
 #define BL0942_REG_V_RMS 0x04
 #define BL0942_REG_WATT 0x06
-#define BL0942_REG_CF_CNT 0x7
+#define BL0942_REG_CF_CNT 0x07
 #define BL0942_REG_FREQ 0x08
 #define BL0942_REG_USR_WRPROT 0x1D
 #define BL0942_USR_WRPROT_DISABLE 0x55
 
 // User operation register (read and write)
+#define BL0942_REG_WA_CREEP 0x14	// Minimun power measurement register
 #define BL0942_REG_MODE 0x19
-#define BL0942_MODE_DEFAULT 0x87
+#define BL0942_REG_CF_CNT_CLR_SEL
+// Changed to reset at every read. This way we end up summing little values
+// Instead of ever increasing ones, which should resolve overflow issues
+// Bit 6 = 1
+#define BL0942_MODE_DEFAULT 0xC7	
 #define BL0942_MODE_RMS_UPDATE_SEL_800_MS (1 << 3)
+
+// Minimun power measurement value. Can be in the range of 0 to 255.
+// below this value, consumption is reported at zero. Ideal for parasitic loads or where
+// the device measures it's own power concumption
+#define DEFAULT_WA_CREEP_VAL 64		
 
 #define DEFAULT_VOLTAGE_CAL 15188
 #define DEFAULT_CURRENT_CAL 251210
@@ -70,126 +64,97 @@ typedef struct {
     uint32_t freq;
 } bl0942_data_t;
 
-#if ENABLE_BL_TWIN
-static uint32_t PrevCfCnt[2] = {CF_CNT_INVALID, CF_CNT_INVALID};
-#else
-static uint32_t PrevCfCnt[1] = {CF_CNT_INVALID};
-#endif
+static uint32_t PrevCfCnt = CF_CNT_INVALID;
 
 static int32_t Int24ToInt32(int32_t val) {
     return (val & (1 << 23) ? val | (0xFF << 24) : val);
 }
 
-#if ENABLE_BL_TWIN
-static void ScaleAndUpdate(int adeviceindex, bl0942_data_t *data) {
-#else
-static void ScaleAndUpdate(bl0942_data_t * data) {
-  int adeviceindex = BL0942_DEVICE_INDEX_0;
-#endif
-  float voltage, current, power;
+static void ScaleAndUpdate(bl0942_data_t *data) {
+    float voltage, current, power;
     PwrCal_Scale(data->v_rms, data->i_rms, data->watt, &voltage, &current,
                  &power);
 
-    float frequency = 2 * 500000.0f / data->freq;
-
-    float energyWh = 0;
-    if (PrevCfCnt[adeviceindex] != CF_CNT_INVALID) {
-      int diff = (data->cf_cnt < PrevCfCnt[adeviceindex]
-        ? data->cf_cnt + (0xFFFFFF - PrevCfCnt[adeviceindex]) + 1
-        : data->cf_cnt - PrevCfCnt[adeviceindex]);
-      energyWh =
-        fabsf(PwrCal_ScalePowerOnly(diff)) * 1638.4f * 256.0f / 3600.0f;
-    }
-    PrevCfCnt[adeviceindex] = data->cf_cnt;
-#if ENABLE_BL_TWIN
-    //I assume that adeviceindex BL0942_DEVICE_INDEX_0/1 is equal to BL_SENSORS_IX_0/1 [to save flash memory]
-    BL_ProcessUpdateEx(adeviceindex, voltage, current, power, frequency, energyWh);
-#else
-    BL_ProcessUpdate(voltage, current, power, frequency, energyWh);
-#endif
-    //addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER, "Sensors ix %i v=%.f c=%.f p=%.f e=%.f",
-    //    adeviceindex, voltage, current, power, frequency, energyWh);
-}
-
-#if !ENABLE_BL_TWIN
-static int BL0942_UART_TryToGetNextPacket() {
-  int cs;
-  int i;
-  int c_garbage_consumed = 0;
-  byte checksum;
-
-  cs = UART_GetDataSize();
-
-  if(cs < BL0942_UART_PACKET_LEN) {
-    return 0;
-  }
-  // skip garbage data (should not happen)
-  while(cs > 0) {
-    if (UART_GetByte(0) != BL0942_UART_PACKET_HEAD) {
-      UART_ConsumeBytes(1);
-      c_garbage_consumed++;
-      cs--;
+    // Guard power against a non-finite/absurd reading (it feeds (int)power
+    // downstream). Hold the last good value rather than letting NaN/inf or
+    // a wild spike propagate. Voltage/current are display-only and bounded
+    // by the chip's RMS registers, so they don't need the same treatment.
+    #define BL0942_MAX_SANE_POWER_W 30000.0f
+    static float lastGoodPower = 0.0f;
+    if (!isfinite(power) || power > BL0942_MAX_SANE_POWER_W || power < -BL0942_MAX_SANE_POWER_W) {
+        power = lastGoodPower;
     } else {
-      break;
+        lastGoodPower = power;
     }
-  }
-  if(c_garbage_consumed > 0){
-    ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
-      "Consumed %i unwanted non-header byte in BL0942 buffer\n",
-      c_garbage_consumed);
-  }
-  if(cs < BL0942_UART_PACKET_LEN) {
-    return 0;
-  }
-  if (UART_GetByte(0) != 0x55)
-    return 0;
-  checksum = BL0942_UART_CMD_READ(BL0942_UART_ADDR);
+    // data->freq can read 0 on a glitched/failed register read; avoid a
+    // divide-by-zero (which would yield inf/NaN). Report 0 Hz instead.
+    float frequency = (data->freq != 0) ? (2 * 500000.0f / data->freq) : 0.0f;
+    float energyWh = 0;
+    energyWh = fabsf(PwrCal_ScalePowerOnly(data->cf_cnt)) * 1638.4f * 256.0f / 3600.0f;
 
-  for(i = 0; i < BL0942_UART_PACKET_LEN-1; i++) {
-    checksum += UART_GetByte(i);
-  }
-  checksum ^= 0xFF;
+    // Glitch guard: cf_cnt is normally reset on every read, so energyWh
+    // represents the energy of a single ~1s sample - a small value. If a
+    // read is missed/corrupted (more likely under high power, where the
+    // counter climbs fast), the raw value can come back enormous or even
+    // non-finite, which later poisons the float->int casts downstream and
+    // can crash. If this sample is not finite or exceeds a physically
+    // impossible per-sample energy, discard it and reuse the last known
+    // good value instead of zero (zero would dip the running total).
+    #define BL0942_MAX_SANE_ENERGY_WH 50.0f   // ~180kW for 1s; far above any real load
+    static float lastGoodEnergyWh = 0.0f;
+    if (!isfinite(energyWh) || energyWh < 0.0f || energyWh > BL0942_MAX_SANE_ENERGY_WH) {
+        ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                    "BL0942 energyWh glitch (%f), holding last good value\n", energyWh);
+        energyWh = lastGoodEnergyWh;
+    } else {
+        lastGoodEnergyWh = energyWh;
+    }
 
-  if (checksum != UART_GetByte(BL0942_UART_PACKET_LEN - 1)) {
-    ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
-      "Skipping packet with bad checksum %02X wanted %02X\n",
-      UART_GetByte(BL0942_UART_PACKET_LEN - 1), checksum);
-    UART_ConsumeBytes(BL0942_UART_PACKET_LEN);
-    return 1;
-  }
+    // Apply sign convention
+    float signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
 
-  bl0942_data_t data;
-  data.i_rms =
-    (UART_GetByte(3) << 16) | (UART_GetByte(2) << 8) | UART_GetByte(1);
-  data.v_rms =
-    (UART_GetByte(6) << 16) | (UART_GetByte(5) << 8) | UART_GetByte(4);
-  data.watt = Int24ToInt32((UART_GetByte(12) << 16) |
-    (UART_GetByte(11) << 8) | UART_GetByte(10));
-  data.cf_cnt =
-    (UART_GetByte(15) << 16) | (UART_GetByte(14) << 8) | UART_GetByte(13);
-  data.freq = (UART_GetByte(17) << 8) | UART_GetByte(16);
-  ScaleAndUpdate(&data);
+    // ====================================================================
+    // 10-SECOND TICK LOGIC (INSTANTANEOUS SENSORS + ACCUMULATED ENERGY)
+    // ====================================================================
+    #define SAMPLES_PER_UPDATE 5
 
-  UART_ConsumeBytes(BL0942_UART_PACKET_LEN);
-  return BL0942_UART_PACKET_LEN;
+    static int   sampleCount = 0;
+    static float energyAccum = 0.0f;
+
+    // Energy must always be summed so consumption data is not lost between updates
+    energyAccum += energyWh;
+    sampleCount++;
+
+    if (sampleCount < SAMPLES_PER_UPDATE) {
+        return; // Do nothing else until the 10th call
+    }
+
+    // On the 10th call, pass instantaneous readings from THIS exact sample,
+    // alongside the total energy accumulated over the last 10 samples.
+    float totalEnergyWh = energyAccum;
+
+    BL_ProcessUpdate(voltage, current, signedPower, frequency, totalEnergyWh);
+
+    // Reset counters for the next 10-second window
+    energyAccum = 0.0f;
+    sampleCount = 0;
 }
 
-#else
-static int BL0942_UART_TryToGetNextPacket(int adeviceindex, int auartindex) {
+static int UART_TryToGetNextPacket(void) {
 	int cs;
 	int i;
 	int c_garbage_consumed = 0;
 	byte checksum;
 
-	cs = UART_GetDataSizeEx(auartindex);
+	cs = UART_GetDataSize();
 
 	if(cs < BL0942_UART_PACKET_LEN) {
 		return 0;
 	}
 	// skip garbage data (should not happen)
 	while(cs > 0) {
-        if (UART_GetByteEx(auartindex,0) != BL0942_UART_PACKET_HEAD) {
-			UART_ConsumeBytesEx(auartindex, 1);
+        if (UART_GetByte(0) != BL0942_UART_PACKET_HEAD) {
+			UART_ConsumeBytes(1);
 			c_garbage_consumed++;
 			cs--;
 		} else {
@@ -204,44 +169,40 @@ static int BL0942_UART_TryToGetNextPacket(int adeviceindex, int auartindex) {
 	if(cs < BL0942_UART_PACKET_LEN) {
 		return 0;
 	}
-    if (UART_GetByteEx(auartindex, 0) != 0x55)
+    if (UART_GetByte(0) != 0x55)
 		return 0;
     checksum = BL0942_UART_CMD_READ(BL0942_UART_ADDR);
 
     for(i = 0; i < BL0942_UART_PACKET_LEN-1; i++) {
-        checksum += UART_GetByteEx(auartindex, i);
+        checksum += UART_GetByte(i);
 	}
 	checksum ^= 0xFF;
 
-    if (checksum != UART_GetByteEx(auartindex, BL0942_UART_PACKET_LEN - 1)) {
+    if (checksum != UART_GetByte(BL0942_UART_PACKET_LEN - 1)) {
         ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
                     "Skipping packet with bad checksum %02X wanted %02X\n",
-                    UART_GetByteEx(auartindex, BL0942_UART_PACKET_LEN - 1), checksum);
-        UART_ConsumeBytesEx(auartindex, BL0942_UART_PACKET_LEN);
+                    UART_GetByte(BL0942_UART_PACKET_LEN - 1), checksum);
+        UART_ConsumeBytes(BL0942_UART_PACKET_LEN);
 		return 1;
 	}
 
     bl0942_data_t data;
     data.i_rms =
-        (UART_GetByteEx(auartindex, 3) << 16) | (UART_GetByteEx(auartindex, 2) << 8) | UART_GetByteEx(auartindex, 1);
+        (UART_GetByte(3) << 16) | (UART_GetByte(2) << 8) | UART_GetByte(1);
     data.v_rms =
-        (UART_GetByteEx(auartindex, 6) << 16) | (UART_GetByteEx(auartindex, 5) << 8) | UART_GetByteEx(auartindex, 4);
-    data.watt = Int24ToInt32((UART_GetByteEx(auartindex, 12) << 16) |
-                             (UART_GetByteEx(auartindex, 11) << 8) | UART_GetByteEx(auartindex, 10));
+        (UART_GetByte(6) << 16) | (UART_GetByte(5) << 8) | UART_GetByte(4);
+    data.watt = Int24ToInt32((UART_GetByte(12) << 16) |
+                             (UART_GetByte(11) << 8) | UART_GetByte(10));
     data.cf_cnt =
-        (UART_GetByteEx(auartindex, 15) << 16) | (UART_GetByteEx(auartindex, 14) << 8) | UART_GetByteEx(auartindex, 13);
-    data.freq = (UART_GetByteEx(auartindex, 17) << 8) | UART_GetByteEx(auartindex, 16);
-    ScaleAndUpdate(adeviceindex, &data);
-    UART_ConsumeBytesEx(auartindex, BL0942_UART_PACKET_LEN);
+        (UART_GetByte(15) << 16) | (UART_GetByte(14) << 8) | UART_GetByte(13);
+    data.freq = (UART_GetByte(17) << 8) | UART_GetByte(16);
+    ScaleAndUpdate(&data);
+
+    UART_ConsumeBytes(BL0942_UART_PACKET_LEN);
 	return BL0942_UART_PACKET_LEN;
 }
-#endif
 
-#if ENABLE_BL_TWIN
-static void UART_WriteReg(int auartindex, uint8_t reg, uint32_t val) {
-#else  
 static void UART_WriteReg(uint8_t reg, uint32_t val) {
-#endif
     uint8_t send[5];
     send[0] = BL0942_UART_CMD_WRITE(BL0942_UART_ADDR);
     send[1] = reg;
@@ -251,19 +212,11 @@ static void UART_WriteReg(uint8_t reg, uint32_t val) {
     uint8_t crc = 0;
 
     for (int i = 0; i < sizeof(send); i++) {
-#if ENABLE_BL_TWIN
-      UART_SendByteEx(auartindex, send[i]);
-#else
-      UART_SendByte(send[i]);
-#endif
+        UART_SendByte(send[i]);
         crc += send[i];
     }
 
-#if ENABLE_BL_TWIN
-    UART_SendByteEx(auartindex, crc ^ 0xFF);
-#else
     UART_SendByte(crc ^ 0xFF);
-#endif
 }
 
 static int SPI_ReadReg(uint8_t reg, uint32_t *val) {
@@ -315,11 +268,8 @@ static int SPI_WriteReg(uint8_t reg, uint32_t val) {
     return -1;
 }
 
-static void BL0942_Init(void) {
-  PrevCfCnt[BL0942_DEVICE_INDEX_0] = CF_CNT_INVALID;
-#if ENABLE_BL_TWIN
-  PrevCfCnt[BL0942_DEVICE_INDEX_1] = CF_CNT_INVALID;
-#endif
+static void Init(void) {
+    PrevCfCnt = CF_CNT_INVALID;
 
     BL_Shared_Init();
 
@@ -329,91 +279,32 @@ static void BL0942_Init(void) {
 
 // THIS IS called by 'startDriver BL0942' command
 // You can set alternate baud with 'startDriver BL0942 9600' syntax
-#if !ENABLE_BL_TWIN
 void BL0942_UART_Init(void) {
-  BL0942_Init();
-
-  bl0942_baudRate = Tokenizer_GetArgIntegerDefault(1, 4800);
-
-  UART_InitUART(bl0942_baudRate, 0, false);
-  UART_InitReceiveRingBuffer(BL0942_UART_RECEIVE_BUFFER_SIZE);
-
-  UART_WriteReg(BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
-  UART_WriteReg(BL0942_REG_MODE,
-    BL0942_MODE_DEFAULT | BL0942_MODE_RMS_UPDATE_SEL_800_MS);
-}
-#else
-void BL0942_UART_InitEx(int auartindex) {
-	BL0942_Init();
+	Init();
 
 	bl0942_baudRate = Tokenizer_GetArgIntegerDefault(1, 4800);
 
-	UART_InitUARTEx(auartindex, bl0942_baudRate, 0, false);
-	UART_InitReceiveRingBufferEx(auartindex, BL0942_UART_RECEIVE_BUFFER_SIZE);
+	UART_InitUART(bl0942_baudRate, 0);
+	UART_InitReceiveRingBuffer(BL0942_UART_RECEIVE_BUFFER_SIZE);
 
-    UART_WriteReg(auartindex, BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
-    UART_WriteReg(auartindex, BL0942_REG_MODE,
+    UART_WriteReg(BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
+    UART_WriteReg(BL0942_REG_MODE,
                   BL0942_MODE_DEFAULT | BL0942_MODE_RMS_UPDATE_SEL_800_MS);
-}
-
-void BL0942_UART_Init(void) {
-  if (!bl0942_opts) {
-    int fuartindex = UART_GetSelectedPortIndex();
-    BL0942_UART_InitEx(fuartindex);
-  }
-  else {
-    if (bl0942_opts & BL0942_OPTBIT0_UART1) {
-      BL0942_UART_InitEx(UART_PORT_INDEX_0);
-    }
-    if (bl0942_opts & BL0942_OPTBIT1_UART2) {
-      BL0942_UART_InitEx(UART_PORT_INDEX_1);
-    }
-  }
-}
-#endif
-
-#if ENABLE_BL_TWIN
-void BL0942_UART_RunEverySecondEx(int adeviceindex, int auartindex) {
-  BL0942_UART_TryToGetNextPacket(adeviceindex, auartindex);
-
-  UART_InitUARTEx(auartindex, bl0942_baudRate, 0, false);
-  UART_SendByteEx(auartindex, BL0942_UART_CMD_READ(BL0942_UART_ADDR));
-  UART_SendByteEx(auartindex, BL0942_UART_REG_PACKET);
+    // Set the minimun power measurement
+    UART_WriteReg(BL0942_REG_WA_CREEP,DEFAULT_WA_CREEP_VAL);
 }
 
 void BL0942_UART_RunEverySecond(void) {
-  if (!bl0942_opts) {
-    int fuartindex = UART_GetSelectedPortIndex();
-    BL0942_UART_RunEverySecondEx(BL0942_DEVICE_INDEX_0, fuartindex);
-  }
-  else {
-    if (bl0942_opts & BL0942_OPTBIT0_UART1) {
-      BL0942_UART_RunEverySecondEx(BL0942_DEVICE_INDEX_0, UART_PORT_INDEX_0);
-    }
-    if (bl0942_opts & BL0942_OPTBIT1_UART2) {
-      BL0942_UART_RunEverySecondEx(BL0942_DEVICE_INDEX_1, UART_PORT_INDEX_1);
-    }
-  }
+    UART_TryToGetNextPacket();
+
+    UART_InitUART(bl0942_baudRate, 0);
+
+    UART_SendByte(BL0942_UART_CMD_READ(BL0942_UART_ADDR));
+    UART_SendByte(BL0942_UART_REG_PACKET);
 }
-#else
-void BL0942_UART_RunEverySecond(void) {
-#if ENABLE_BL_TWIN
-  int fuartindex = UART_GetSelectedPortIndex();
-  BL0942_UART_TryToGetNextPacket(BL0942_DEVICE_INDEX_0, fuartindex);
-  UART_InitUARTEx(fuartindex, bl0942_baudRate, 0, false);
-  UART_SendByteEx(fuartindex, BL0942_UART_CMD_READ(BL0942_UART_ADDR));
-  UART_SendByteEx(fuartindex, BL0942_UART_REG_PACKET);
-#else
-  BL0942_UART_TryToGetNextPacket();
-  UART_InitUART(bl0942_baudRate, 0, false);
-  UART_SendByte(BL0942_UART_CMD_READ(BL0942_UART_ADDR));
-  UART_SendByte(BL0942_UART_REG_PACKET);
-#endif
-}
-#endif
 
 void BL0942_SPI_Init(void) {
-	BL0942_Init();
+	Init();
 
 	SPI_DriverInit();
 	spi_config_t cfg;
@@ -424,7 +315,7 @@ void BL0942_SPI_Init(void) {
 	cfg.wire_mode = SPI_3WIRE_MODE;
 	cfg.baud_rate = BL0942_SPI_BAUD_RATE;
 	cfg.bit_order = SPI_MSB_FIRST;
-	OBK_SPI_Init(&cfg);
+	SPI_Init(&cfg);
 
     SPI_WriteReg(BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
     SPI_WriteReg(BL0942_REG_MODE,
@@ -439,51 +330,5 @@ void BL0942_SPI_RunEverySecond(void) {
     data.watt = Int24ToInt32(data.watt);
     SPI_ReadReg(BL0942_REG_CF_CNT, &data.cf_cnt);
     SPI_ReadReg(BL0942_REG_FREQ, &data.freq);
-#if ENABLE_BL_TWIN
-    ScaleAndUpdate(BL0942_DEVICE_INDEX_0,&data);
-#else
     ScaleAndUpdate(&data);
-#endif
 }
-
-#if ENABLE_BL_TWIN
-static commandResult_t CMD_BL0942opts(const void* context, const char* cmd, const char* args, int cmdFlags) {
-  Tokenizer_TokenizeString(args, 0);
-
-  if (Tokenizer_GetArgsCount() >= 1) {
-    bl0942_opts = Tokenizer_GetArgInteger(0);
-  }
-  char buffer[25];
-  if (!bl0942_opts) {
-    snprintf(buffer, sizeof(buffer), "default, using");
-    if (CFG_HasFlag(OBK_FLAG_USE_SECONDARY_UART)) {
-      snprintf(buffer, sizeof(buffer), "UART2");
-    } else {
-      snprintf(buffer, sizeof(buffer), "UART1");
-    }
-  } else {
-    if (bl0942_opts & BL0942_OPTBIT0_UART1) {
-      snprintf(buffer, sizeof(buffer), "UART1");
-    }
-    if (bl0942_opts & BL0942_OPTBIT1_UART2) {
-      if (bl0942_opts & BL0942_OPTBIT0_UART1) {
-        snprintf(buffer, sizeof(buffer), ", ");
-      }
-      snprintf(buffer, sizeof(buffer), "UART2");
-    }
-  }
-  addLogAdv(LOG_INFO, LOG_FEATURE_GENERAL, "BL0942opts = %i = mode %s", bl0942_opts, buffer);
-  BL_ResetRecivedDataBool();
-  return CMD_RES_OK;
-}
-
-void BL0942_AddCommands(void) {
-  //cmddetail:{"name":"BL0942opts","args":"opts",
-  //cmddetail:"descr":"BL0942opts 0= default mode (as set in config Flag 26), 3= two BL0942 on both UARTs (bit0 BL0942 on UART1, bit1 BL0942 on UART2)",
-  //cmddetail:"fn":"CMD_BL0942opts","file":"driver/drv_bl0942.c","requires":"",
-  //cmddetail:"examples":""}
-  CMD_RegisterCommand("BL0942opts", CMD_BL0942opts, NULL);
-}
-#endif
-// close ENABLE_DRIVER_BL0942 
-#endif
