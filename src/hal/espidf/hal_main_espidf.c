@@ -17,6 +17,9 @@ void Main_OnEverySecond();
 void HAL_BTProxy_PreInit(void);
 void HAL_BTProxy_OnEverySecond(void);
 #endif
+#ifdef ENABLE_JK_BMS
+#include "../../driver/drv_jkbms.h"
+#endif
 float g_wifi_temperature = 0;
 
 #if !CONFIG_IDF_TARGET_ESP32 && !PLATFORM_ESP8266
@@ -61,6 +64,11 @@ void app_main(void)
 #endif
 
     Main_Init();
+
+#ifdef ENABLE_JK_BMS
+    /* Start BLE connection to JK-BMS (NVS must be init'd by Main_Init first) */
+    JKBMS_AutoStart();
+#endif
 
     while(1)
     {

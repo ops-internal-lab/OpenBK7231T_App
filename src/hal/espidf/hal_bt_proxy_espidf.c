@@ -8,11 +8,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
-#if defined(CONFIG_BT_ENABLED) || defined(CONFIG_BT_BLE_ENABLED)
+// Controller-level header: available on all ESP32 targets with BT enabled
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
 #include "esp_bt.h"
+#include "esp_timer.h"
+#endif
+
+// Bluedroid-specific headers: NOT available on C3/C6/S3 which use NimBLE only
+#if defined(CONFIG_BT_BLUEDROID_ENABLED) && CONFIG_BT_BLUEDROID_ENABLED
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
-#include "esp_timer.h"
 #endif
 #include "esp_err.h"
 
@@ -45,7 +50,7 @@ static QueueHandle_t s_bt_cmd_queue = NULL;
 // Active connection slots
 static bt_proxy_conn_slot_t s_bt_connections[BT_PROXY_MAX_CONNECTIONS] = {0};
 
-#if defined(CONFIG_BT_ENABLED) || defined(CONFIG_BT_BLE_ENABLED)
+#if defined(CONFIG_BT_BLUEDROID_ENABLED) && CONFIG_BT_BLUEDROID_ENABLED
 static const esp_ble_scan_params_t s_ble_scan_params = {
 	.scan_type = BLE_SCAN_TYPE_ACTIVE,
 	.own_addr_type = BLE_ADDR_TYPE_PUBLIC,
@@ -58,8 +63,7 @@ static const esp_ble_scan_params_t s_ble_scan_params = {
 
 static void HAL_BTProxy_LogHealth(const char* stage)
 {
-#if defined(CONFIG_BT_ENABLED) || defined(CONFIG_BT_BLE_ENABLED)
-	if (!stage) {
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
 		stage = "unknown";
 	}
 	ADDLOG_INFO(LOG_FEATURE_GENERAL,
@@ -75,7 +79,7 @@ static void HAL_BTProxy_LogHealth(const char* stage)
 #endif
 }
 
-#if defined(CONFIG_BT_ENABLED) || defined(CONFIG_BT_BLE_ENABLED)
+#if defined(CONFIG_BT_BLUEDROID_ENABLED) && CONFIG_BT_BLUEDROID_ENABLED
 static void HAL_BTProxy_RecordScan(const esp_ble_gap_cb_param_t* param)
 {
 	int pos;
@@ -160,8 +164,7 @@ static void HAL_BTProxy_GapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb
 
 static void HAL_BTProxy_InitController(void)
 {
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-#if defined(CONFIG_BT_BLE_ENABLED) && CONFIG_BT_BLE_ENABLED
+#if defined(CONFIG_BT_BLUEDROID_ENABLED) && CONFIG_BT_BLUEDROID_ENABLED
 	esp_err_t err;
 	esp_bt_controller_status_t ctrl_status = esp_bt_controller_get_status();
 
@@ -229,17 +232,6 @@ static void HAL_BTProxy_InitController(void)
 	}
 #else
 	ADDLOG_WARN(LOG_FEATURE_GENERAL, "BT proxy: CONFIG_BT_BLUEDROID_ENABLED is disabled");
-#endif
-
-	s_bt_proxy_init_done = 1;
-	bk_printf("BT proxy: ESP-IDF phase2 controller initialized\r\n");
-	ADDLOG_INFO(LOG_FEATURE_GENERAL, "BT proxy: ESP-IDF phase2 controller initialized");
-	HAL_BTProxy_LogHealth("init_ok");
-#else
-	ADDLOG_WARN(LOG_FEATURE_GENERAL, "BT proxy: CONFIG_BT_BLE_ENABLED is disabled");
-#endif
-#else
-	ADDLOG_WARN(LOG_FEATURE_GENERAL, "BT proxy: CONFIG_BT_ENABLED is disabled");
 #endif
 }
 
