@@ -20,6 +20,10 @@ set(PROJ_ALL_SRC
 	${OBKM_SRC}
 	${BERRY_SRC_C}
 	../../../libraries/mqtt_patched.c
+	# JK-BMS BLE monitor (NimBLE central)
+	${OBK_SRCS}driver/jk_bms.c
+	${OBK_SRCS}driver/drv_jkbms.c
+	${OBK_SRCS}driver/bms_frontend.c
 )
 set(ENABLE_MDNS_ESPIDF 0)
 if("$ENV{IDF_TARGET}" STREQUAL "esp32" OR "$ENV{IDF_TARGET}" STREQUAL "esp32c6" OR "$ENV{IDF_TARGET}" STREQUAL "esp32s3")
