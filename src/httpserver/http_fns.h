@@ -38,3 +38,7 @@ int http_fn_pmntp(http_request_t* request);
 // NEW DASHBOARD HANDLERS
 int http_fn_api_dash(http_request_t* request);
 int http_fn_custom_dash(http_request_t* request);
+
+// JK-BMS LIVE MONITOR
+int http_fn_bms_page(http_request_t* request);
+int http_fn_api_bms(http_request_t* request);
