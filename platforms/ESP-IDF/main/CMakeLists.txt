@@ -40,3 +40,8 @@ idf_component_register(SRCS ${PROJ_ALL_SRC} WHOLE_ARCHIVE
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE USER_SW_VER="$ENV{APP_VERSION}")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE OBK_VARIANT=$ENV{OBK_VARIANT})
+
+# BT/BLE support: give main component access to bt component headers
+if(CONFIG_BT_ENABLED)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE idf::bt)
+endif()
