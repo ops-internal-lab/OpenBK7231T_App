@@ -1,4 +1,4 @@
-#if 0 //PLATFORM_ESPIDF
+#if PLATFORM_ESPIDF
 
 #include "../../new_common.h"
 #include "../../logging/logging.h"
