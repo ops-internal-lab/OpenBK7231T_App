@@ -513,6 +513,12 @@
 #endif
 //#define ENABLE_DRIVER_DCF77					1
 
+// Enable BT proxy when the BT stack is compiled in (set via sdkconfig)
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+#define ENABLE_BT_PROXY							1
+#define ENABLE_DRIVER_ESPHOME_API				1
+#endif
+
 #elif PLATFORM_TR6260
 
 // #define ENABLE_SEND_POSTANDGET				1
