@@ -18,6 +18,15 @@
 // See: https://github.com/openshwprojects/OpenBK7231T_App/issues/314
 #define HTTP_CLIENT_STACK_SIZE 8192
 
+// Maximum number of HTTP client connections served at once.
+// Each client runs in its own thread (HTTP_CLIENT_STACK_SIZE of stack +
+// ~3KB of buffers), and that memory is only reclaimed once the idle task
+// runs. A burst of connections (e.g. several dashboards open at once) can
+// exhaust RAM and trip the watchdog. Connections beyond this limit get an
+// HTTP 503 and are closed immediately.
+#define HTTP_MAX_CLIENTS 3
+static volatile int g_activeHttpClients = 0;
+
 #if PLATFORM_XR809 || PLATFORM_XR872
 
 #define DISABLE_SEPARATE_THREAD_FOR_EACH_TCP_CLIENT 1
@@ -139,6 +148,9 @@ exit:
 
 	lwip_close(fd);
 
+	if (g_activeHttpClients > 0)
+		g_activeHttpClients--;	// this client is done; free up a slot
+
 #if DISABLE_SEPARATE_THREAD_FOR_EACH_TCP_CLIENT
 
 #else
@@ -193,12 +205,28 @@ static void tcp_server_thread(beken_thread_arg_t arg)
 				tcp_client_thread((beken_thread_arg_t)client_fd);
 #else
 				//ADDLOG_ERROR(LOG_FEATURE_HTTP, "HTTP [multi thread] Client %s:%d connected, fd: %d", client_ip_str, client_addr.sin_port, client_fd);
+				// Refuse connections beyond the limit so we never spawn more
+				// client threads than we have RAM for: reply 503 and close.
+				if (g_activeHttpClients >= HTTP_MAX_CLIENTS)
+				{
+					static const char busyMsg[] =
+						"HTTP/1.1 503 Service Unavailable\r\n"
+						"Content-Type: text/plain\r\n"
+						"Connection: close\r\n"
+						"\r\n"
+						"Too many connections. Limit is 3.\n";
+					send(client_fd, busyMsg, sizeof(busyMsg) - 1, 0);
+					lwip_close(client_fd);
+					client_fd = -1;
+					continue;
+				}
 				// delay each accept by 20ms
 				// this allows previous to finish if
 				// in a loop of sends from the browser, e.g. OTA
 				// and we MUST get some IDLE thread time, else
 				// thread resources are not deleted.
 				rtos_delay_milliseconds(20);
+				g_activeHttpClients++;	// count this client; the thread decrements on exit
 				// Create separate thread for client
 				if (kNoErr !=
 #if PLATFORM_XR809
@@ -222,6 +250,7 @@ static void tcp_server_thread(beken_thread_arg_t arg)
 					ADDLOG_DEBUG(LOG_FEATURE_HTTP, "TCP Client %s:%d thread creation failed! fd: %d", client_ip_str, client_addr.sin_port, client_fd);
 					lwip_close(client_fd);
 					client_fd = -1;
+					g_activeHttpClients--;	// spawn failed, undo the count
 				}
 #endif
 			}

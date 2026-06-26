@@ -366,18 +366,18 @@ void http_html_end(http_request_t *request)
 	char upTimeStr[128];
 	unsigned char mac[32];
 
-	poststr(request, " | ");
-	poststr(request, htmlFooterInfo);
+	//poststr(request, " | ");
+	//poststr(request, htmlFooterInfo);
 	poststr(request, "<br>");
-	poststr(request, g_build_str);
+	//poststr(request, g_build_str);
 
 	hprintf255(request, "<br>Online for&nbsp;<span id=\"onlineFor\" data-initial=\"%i\">-</span>", g_secondsElapsed);
-	WiFI_GetMacAddress((char *)mac);
+	//WiFI_GetMacAddress((char *)mac);
 
-	snprintf(upTimeStr, sizeof(upTimeStr), "<br>Device MAC: %02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-	poststr(request, upTimeStr);
-	snprintf(upTimeStr, sizeof(upTimeStr), "<br>Short name: %s, Chipset %s", CFG_GetShortDeviceName(), PLATFORM_MCU_NAME);
-	poststr(request, upTimeStr);
+	//snprintf(upTimeStr, sizeof(upTimeStr), "<br>Device MAC: %02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	//poststr(request, upTimeStr);
+	//snprintf(upTimeStr, sizeof(upTimeStr), "<br>Short name: %s, Chipset %s", CFG_GetShortDeviceName(), PLATFORM_MCU_NAME);
+	//poststr(request, upTimeStr);
 #ifdef PLATFORM_ESPIDF
 	snprintf(upTimeStr, sizeof(upTimeStr), " ESP-IDF %s", esp_get_idf_version());
 	poststr(request, upTimeStr);
@@ -1048,6 +1048,12 @@ int HTTP_ProcessPacket(http_request_t *request)
 	if (http_checkUrlBase(urlStr, "pmntp"))
 		return http_fn_pmntp(request); // poor mans NTP
 #endif
+
+	// ---> NEW DASHBOARD ROUTES <---
+	if (http_checkUrlBase(urlStr, "dash")) return http_fn_custom_dash(request);
+	if (http_checkUrlBase(urlStr, "api_dash")) return http_fn_api_dash(request);
+	// --------------------------------------
+
 	return http_fn_other(request);
 }
 
