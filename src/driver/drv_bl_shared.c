@@ -1108,3 +1108,23 @@ int http_fn_api_dash(http_request_t *request) {
 // Dashboard HTML/CSS/JS frontend has been moved to dash_frontend.c
 // (see http_fn_custom_dash). This file only serves the JSON data
 // via http_fn_api_dash, consumed by that frontend's polling JS.
+
+/* =========================================================================
+   BL_HasEnergySensorReading / BL_HasEnergySensorReadingEx
+   -------------------------------------------------------------------------
+   These are declared in drv_public.h and called by http_fns.c for HASS
+   discovery (checking if a sensor channel actually has a live reading).
+   Our build uses a single flat sensors[] array (no ENABLE_BL_TWIN twin
+   datasets), so asensdatasetix must be 0 for any match.
+   ========================================================================= */
+int BL_HasEnergySensorReadingEx(int asensdatasetix, energySensor_t type)
+{
+    if (asensdatasetix != BL_SENSORS_IX_0) return 0;
+    if (type < OBK__FIRST || type > OBK__LAST) return 0;
+    return !isnan((float)sensors[type].lastReading);
+}
+
+int BL_HasEnergySensorReading(energySensor_t type)
+{
+    return BL_HasEnergySensorReadingEx(BL_SENSORS_IX_0, type);
+}
