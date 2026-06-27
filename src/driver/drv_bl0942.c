@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "../logging/logging.h"
+#include "../new_cfg.h"
 #include "../new_pins.h"
 #include "../cmnds/cmd_public.h"
 #include "drv_bl_shared.h"
@@ -284,7 +285,7 @@ void BL0942_UART_Init(void) {
 
 	bl0942_baudRate = Tokenizer_GetArgIntegerDefault(1, 4800);
 
-	UART_InitUART(bl0942_baudRate, 0);
+	UART_InitUART(bl0942_baudRate, 0, false);
 	UART_InitReceiveRingBuffer(BL0942_UART_RECEIVE_BUFFER_SIZE);
 
     UART_WriteReg(BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
@@ -297,7 +298,7 @@ void BL0942_UART_Init(void) {
 void BL0942_UART_RunEverySecond(void) {
     UART_TryToGetNextPacket();
 
-    UART_InitUART(bl0942_baudRate, 0);
+    UART_InitUART(bl0942_baudRate, 0, false);
 
     UART_SendByte(BL0942_UART_CMD_READ(BL0942_UART_ADDR));
     UART_SendByte(BL0942_UART_REG_PACKET);
@@ -315,7 +316,7 @@ void BL0942_SPI_Init(void) {
 	cfg.wire_mode = SPI_3WIRE_MODE;
 	cfg.baud_rate = BL0942_SPI_BAUD_RATE;
 	cfg.bit_order = SPI_MSB_FIRST;
-	SPI_Init(&cfg);
+	OBK_SPI_Init(&cfg);
 
     SPI_WriteReg(BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
     SPI_WriteReg(BL0942_REG_MODE,

@@ -71,7 +71,7 @@ int charger_c_auto = 1;
 #include "../hal/hal_flashVars.h"
 #include "../logging/logging.h"
 #include "../mqtt/new_mqtt.h"
-#include "../ota/ota.h"
+#include "../hal/hal_ota.h"
 #include "drv_local.h"
 #include "drv_ntp.h"
 #include "drv_public.h"
