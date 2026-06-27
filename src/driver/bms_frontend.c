@@ -6,6 +6,7 @@
    =========================================================================== */
 
 #include "bms_frontend.h"
+#include <stddef.h>
 #include "../httpserver/new_http.h"
 
 int http_fn_serve_bms_html(http_request_t *request)
