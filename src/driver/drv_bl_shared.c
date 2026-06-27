@@ -396,7 +396,6 @@ float BL_ChangeEnergyUnitIfNeeded(float Wh) {
 
 void BL_ProcessUpdate(float voltage, float current, float power, float frequency, float energyWh) {
     int i;
-    int xPassedTicks;
     time_t ntpTime;
     struct tm *ltm;
     char datetime[64];
@@ -921,10 +920,14 @@ int http_fn_api_dash(http_request_t *request) {
 
         if (volt_v > 0xFFFF) volt_v = 0xFFFF;
         if (curr_v > 0xFFFF) curr_v = 0xFFFF;
-        if (pwr_v  >  32767) pwr_v  =  32767; if (pwr_v  < -32768) pwr_v  = -32768;
-        if (cpwr_v >  32767) cpwr_v =  32767; if (cpwr_v < -32768) cpwr_v = -32768;
-        if (bal_v  >  32767) bal_v  =  32767; if (bal_v  < -32768) bal_v  = -32768;
-        if (est_v  >  32767) est_v  =  32767; if (est_v  < -32768) est_v  = -32768;
+        if (pwr_v  >  32767) pwr_v  =  32767;
+        if (pwr_v  < -32768) pwr_v  = -32768;
+        if (cpwr_v >  32767) cpwr_v =  32767;
+        if (cpwr_v < -32768) cpwr_v = -32768;
+        if (bal_v  >  32767) bal_v  =  32767;
+        if (bal_v  < -32768) bal_v  = -32768;
+        if (est_v  >  32767) est_v  =  32767;
+        if (est_v  < -32768) est_v  = -32768;
         if (lms_v  > 0xFFFF) lms_v  = 0xFFFF;
 
         raw[0]  = (unsigned char)(volt_v  & 0xFF);
