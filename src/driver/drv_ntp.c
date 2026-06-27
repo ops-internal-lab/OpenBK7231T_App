@@ -382,4 +382,18 @@ bool NTP_IsTimeSynced()
     return g_synced;
 }
 
+int NTP_GetHour() {
+	struct tm *ltm;
+	ltm = gmtime(&g_ntpTime);
+	if (ltm == 0) return 0;
+	return ltm->tm_hour;
+}
+
+int NTP_GetMinute() {
+	struct tm *ltm;
+	ltm = gmtime(&g_ntpTime);
+	if (ltm == 0) return 0;
+	return ltm->tm_min;
+}
+
 #endif // #if ENABLE_NTP
