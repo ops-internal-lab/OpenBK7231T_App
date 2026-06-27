@@ -76,6 +76,9 @@ int charger_c_auto = 1;
 #include "../logging/logging.h"
 #include "../mqtt/new_mqtt.h"
 #include "../hal/hal_ota.h"
+#if PLATFORM_ESPIDF
+#include "drv_uart_tcp_client.h"
+#endif
 #include "drv_local.h"
 #include "drv_ntp.h"
 #include "drv_public.h"
