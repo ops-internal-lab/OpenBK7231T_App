@@ -1,5 +1,8 @@
 #include "dash_frontend.h"
-#include "rtos_pub.h" // Required for rtos_delay_milliseconds
+#include "../new_common.h"  /* defines rtos_delay_milliseconds per platform */
+#if !PLATFORM_ESPIDF
+#include "rtos_pub.h"       /* Beken/BK7231 only — ESP32 uses vTaskDelay via new_common.h */
+#endif
 #include "dash_gz.h"  // pre-gzipped /dash page (g_dashGz / DASH_GZ_LEN)
 #include <string.h>   // strstr
 
