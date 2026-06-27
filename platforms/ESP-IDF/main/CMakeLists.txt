@@ -25,6 +25,8 @@ set(PROJ_ALL_SRC
 	${OBK_SRCS}driver/jk_bms.c
 	${OBK_SRCS}driver/drv_jkbms.c
 	${OBK_SRCS}driver/bms_frontend.c
+	# TCP UART client (remote UART-over-TCP, targets via setUartTarget1..4)
+	${OBK_SRCS}driver/drv_uart_tcp_client.c
 )
 set(ENABLE_MDNS_ESPIDF 0)
 if("$ENV{IDF_TARGET}" STREQUAL "esp32" OR "$ENV{IDF_TARGET}" STREQUAL "esp32c6" OR "$ENV{IDF_TARGET}" STREQUAL "esp32s3")
