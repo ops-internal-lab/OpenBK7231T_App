@@ -20,6 +20,7 @@ void HAL_BTProxy_OnEverySecond(void);
 #ifdef ENABLE_JK_BMS
 #include "../../driver/drv_jkbms.h"
 #endif
+#include "../../driver/drv_uart_tcp_client.h"
 float g_wifi_temperature = 0;
 
 #if !CONFIG_IDF_TARGET_ESP32 && !PLATFORM_ESP8266
@@ -64,6 +65,9 @@ void app_main(void)
 #endif
 
     Main_Init();
+
+    /* TCP UART client — load saved targets and register console commands */
+    UART_TCP_ClientInit();
 
 #ifdef ENABLE_JK_BMS
     /* Start BLE connection to JK-BMS (NVS must be init'd by Main_Init first) */
