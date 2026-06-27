@@ -7,8 +7,9 @@
 #define BOOT_COMPLETE_SECONDS 30
 #define MAX_RETAIN_CHANNELS 12
 
-/* Fixed size 32 bytes */
+/* Fixed size 36 bytes (TotalGeneration added for bi-directional metering) */
 typedef struct ENERGY_METERING_DATA {
+	float TotalGeneration;
 	float TotalConsumption;
 	float TodayConsumpion;
 	float YesterdayConsumption;
