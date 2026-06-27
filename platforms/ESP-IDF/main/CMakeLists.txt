@@ -20,7 +20,8 @@ set(PROJ_ALL_SRC
 	${OBKM_SRC}
 	${BERRY_SRC_C}
 	../../../libraries/mqtt_patched.c
-	# JK-BMS BLE monitor (NimBLE central)
+	# Dashboard and JK-BMS pages
+	${OBK_SRCS}driver/dash_frontend.c
 	${OBK_SRCS}driver/jk_bms.c
 	${OBK_SRCS}driver/drv_jkbms.c
 	${OBK_SRCS}driver/bms_frontend.c
