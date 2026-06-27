@@ -1,13 +1,5 @@
 /* ===========================================================================
    jk_bms.c  --  JK-BMS BLE driver for ESP-IDF (NimBLE GATT client, read-only)
-   
-   MERGED VERSION:
-     - Includes passive scan to resolve real BLE address type.
-     - Includes explicit MTU exchange before discovery.
-     - Correctly splits the 0xFFE1 characteristics into separate notify and 
-       write handles (fixing the "Two Handles" problem).
-     - Incorporates the 300ms gap between DEVICE_INFO and CELL_INFO requests 
-       (fixing the timing drop issue).
    =========================================================================== */
 
 #include <string.h>
@@ -52,11 +44,11 @@ static uint8_t    s_own_addr_type;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_svc_start;
 static uint16_t s_svc_end;
-static uint16_t s_notify_handle; /* 0xFFE1 char with NOTIFY property */
-static uint16_t s_write_handle;  /* 0xFFE1 char with WRITE property  */
-static uint16_t s_cccd_handle;   /* 0x2902 descriptor handle         */
+static uint16_t s_notify_handle; 
+static uint16_t s_write_handle;  
+static uint16_t s_cccd_handle;   
 
-static volatile bool s_connecting   = false;
+static volatile bool s_bms_found    = false; /* Replaces buggy s_connecting flag */
 static volatile bool s_subscribed   = false;
 static volatile bool s_kick_pending = false;
 
@@ -146,7 +138,6 @@ static int on_subscribe(uint16_t conn, const struct ble_gatt_error *err,
         return 0;
     }
     
-    /* Write to the correct WRITE handle */
     ble_gattc_write_no_rsp_flat(conn, s_write_handle,
                                 REQ_DEVICE_INFO, sizeof(REQ_DEVICE_INFO));
     s_kick_pending = true;
@@ -166,7 +157,6 @@ static int on_disc_dsc(uint16_t conn, const struct ble_gatt_error *err,
     } else if(err->status == BLE_HS_EDONE){
         if(s_cccd_handle == 0){
             ESP_LOGW(TAG,"no CCCD found -- trying direct kick anyway");
-            /* fallback for clones */
             ble_gattc_write_no_rsp_flat(conn, s_write_handle, REQ_DEVICE_INFO, sizeof(REQ_DEVICE_INFO));
             s_kick_pending = true;
             return 0;
@@ -214,7 +204,6 @@ static int on_disc_chr(uint16_t conn, const struct ble_gatt_error *err,
         }
         
         s_cccd_handle = 0;
-        /* Find CCCD only on the NOTIFY characteristic */
         int rc = ble_gattc_disc_all_dscs(conn, s_notify_handle + 1, s_svc_end,
                                          on_disc_dsc, NULL);
         if(rc != 0){
@@ -274,29 +263,31 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC: {
         if(!addr_mac_match(event->disc.addr.val, s_peer_mac)) return 0;
         s_peer = event->disc.addr;
-        ESP_LOGI(TAG,"BMS found: addr_type=%d RSSI=%d -- connecting",
+        ESP_LOGI(TAG,"BMS found: addr_type=%d RSSI=%d",
                  s_peer.type, event->disc.rssi);
-        s_connecting = true;
-        ble_gap_disc_cancel();
-        start_connect();
+        s_bms_found = true;
+        /* Safe cancel: triggers DISC_COMPLETE async, preventing deadlock */
+        ble_gap_disc_cancel(); 
         return 0;
     }
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
-        if(!s_connecting && s_conn_handle == BLE_HS_CONN_HANDLE_NONE){
+        if(s_bms_found){
+            s_bms_found = false;
+            ESP_LOGI(TAG,"Scan stopped. Safely initiating connection...");
+            start_connect();
+        } else if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
             ESP_LOGW(TAG,"scan complete: BMS not found -- retrying");
             start_scan();
         }
         return 0;
 
     case BLE_GAP_EVENT_CONNECT:
-        s_connecting = false;
         if(event->connect.status == 0){
             s_conn_handle = event->connect.conn_handle;
             s_svc_start = 0; s_svc_end = 0; 
             s_notify_handle = 0; s_write_handle = 0;
-            ESP_LOGI(TAG,"connected handle=%d -- requesting MTU 247", s_conn_handle);
-            ble_att_set_preferred_mtu(247);
+            ESP_LOGI(TAG,"connected handle=%d", s_conn_handle);
             int rc = ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
             if(rc != 0){
                 ESP_LOGW(TAG,"exchange_mtu rc=%d -- starting discovery",rc);
@@ -317,7 +308,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
         s_subscribed   = false;
         s_kick_pending = false;
-        s_connecting   = false;
+        s_bms_found    = false;
         s_len          = 0;
         s_svc_start = 0; s_svc_end = 0; 
         s_notify_handle = 0; s_write_handle = 0;
@@ -347,8 +338,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 static void start_connect(void)
 {
     int rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, gap_event, NULL);
-    if(rc != 0 && rc != BLE_HS_EALREADY)
-        ESP_LOGE(TAG,"ble_gap_connect rc=%d", rc);
+    if(rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG,"ble_gap_connect rc=%d, restarting scan", rc);
+        start_scan();
+    }
 }
 
 static void start_scan(void)
@@ -370,6 +363,7 @@ static void start_scan(void)
 static void on_sync(void)
 {
     ble_hs_id_infer_auto(0, &s_own_addr_type);
+    ble_att_set_preferred_mtu(247); /* Best practice: set this before scanning/connecting */
     ESP_LOGI(TAG,"sync; own_addr_type=%d", s_own_addr_type);
     start_scan();
 }
@@ -389,7 +383,6 @@ static void poll_task(void *p)
     (void)p;
     for(;;){
         if(s_kick_pending){
-            /* Wait 300ms between DEVICE_INFO and CELL_INFO requests */
             vTaskDelay(pdMS_TO_TICKS(300));
             s_kick_pending = false;
             if(s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_write_handle != 0){
