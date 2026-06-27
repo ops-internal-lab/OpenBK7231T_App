@@ -1,7 +1,8 @@
+/* new_common.h must come first so ENABLE_JK_BMS is defined before the guard. */
+#include "../new_common.h"
+
 /* ===========================================================================
    drv_jkbms.c  --  OpenBK integration for the JK-BMS BLE driver
-
-   Wraps jk_bms.c (NimBLE GATT client) and exposes two HTTP endpoints:
 
      GET /bms       → live monitor HTML page (see bms_frontend.c)
      GET /api_bms   → JSON snapshot of the latest decoded BMS frame
