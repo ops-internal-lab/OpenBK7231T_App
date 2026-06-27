@@ -35,7 +35,6 @@ static const uint8_t REQ_CELL_INFO[20]   = {
 /* ---- driver state -------------------------------------------------------- */
 static jk_bms_cb_t  s_cb       = NULL;
 static void        *s_ctx      = NULL;
-static uint32_t     s_poll_ms  = 2000;
 static ble_addr_t   s_peer;
 static uint8_t      s_own_addr_type;
 
@@ -47,6 +46,7 @@ static uint16_t s_cccd_handle;
 static volatile bool s_subscribed   = false;
 static volatile bool s_kick_pending = false;
 static float s_balance_start        = 0.0f;
+static volatile uint32_t s_last_rx_ticks = 0; // Watchdog timer
 
 /* ---- decode helpers ------------------------------------------------------ */
 static inline uint16_t u16(const uint8_t* d, int i){ return d[i] | (d[i+1] << 8); }
@@ -78,7 +78,13 @@ static void decode_cell_info(const uint8_t *d)
     float vmin = 10.0f, vmax = 0.0f; int n = 0;
     for (int i = 0; i < 32; i++) {
         float v = u16(d, 6 + i * 2) * 0.001f;
-        if (v > 0) { m.cells[n] = v; n++; if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+        // Basic safety bound to prevent struct overflow
+        if (v > 0) { 
+            m.cells[n] = v; 
+            n++; 
+            if (v < vmin) vmin = v; 
+            if (v > vmax) vmax = v; 
+        }
     }
     m.cell_count = n;
     m.cell_min   = (n ? vmin : 0.0f);
@@ -94,6 +100,9 @@ static int     s_len = 0;
 
 static void feed(const uint8_t *data, int len)
 {
+    // Feed resets the watchdog timer
+    s_last_rx_ticks = xTaskGetTickCount();
+
     if (len >= 4 && data[0]==0x55 && data[1]==0xAA && data[2]==0xEB && data[3]==0x90)
         s_len = 0;                                   
     for (int i = 0; i < len; i++)
@@ -206,6 +215,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_subscribed  = false;
         s_kick_pending = false;
         s_len = 0;
+        // Delay slightly before reconnecting to prevent thrashing
+        vTaskDelay(pdMS_TO_TICKS(1000));
         start_connect();
         return 0;
 
@@ -222,6 +233,15 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU = %d", event->mtu.value);
         return 0;
+        
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        ESP_LOGI(TAG, "Connection parameters updated (status=%d)", event->conn_update.status);
+        return 0;
+        
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+        // Returning 0 auto-accepts the peripheral's requested connection parameters
+        ESP_LOGI(TAG, "Connection parameter update requested by peripheral. Accepting.");
+        return 0;
 
     default:
         return 0;
@@ -230,7 +250,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
 static void start_connect(void)
 {
-    /* Direct connect by address (skipping scan phase to avoid missing packets) */
     int rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY)
         ESP_LOGE(TAG, "ble_gap_connect rc=%d", rc);
@@ -254,7 +273,7 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-/* ---- polling task -------------------------------------------------------- */
+/* ---- polling watchdog task ----------------------------------------------- */
 static void poll_task(void *param)
 {
     (void)param;
@@ -266,18 +285,21 @@ static void poll_task(void *param)
                 ble_gattc_write_no_rsp_flat(s_conn_handle, s_val_handle,
                                             REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
                 s_subscribed = true;
-                ESP_LOGI(TAG, "Sent 0x96 -- stream initialized");
+                s_last_rx_ticks = xTaskGetTickCount(); // Start the watchdog
+                ESP_LOGI(TAG, "Sent 0x96 initialization -- listening for stream...");
             }
         } else if (s_subscribed && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            // Standard keep-alive refresh trigger
-            vTaskDelay(pdMS_TO_TICKS(s_poll_ms));
-            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_val_handle != 0) {
-                ble_gattc_write_no_rsp_flat(s_conn_handle, s_val_handle,
-                                            REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
+            // Watchdog: If no data has been received for 5 seconds, the stream stopped.
+            if ((xTaskGetTickCount() - s_last_rx_ticks) > pdMS_TO_TICKS(5000)) {
+                ESP_LOGW(TAG, "Stream stalled. Re-sending 0x96 kick...");
+                if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_val_handle != 0) {
+                    ble_gattc_write_no_rsp_flat(s_conn_handle, s_val_handle,
+                                                REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
+                }
+                s_last_rx_ticks = xTaskGetTickCount();
             }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(50));
         }
+        vTaskDelay(pdMS_TO_TICKS(100)); // Yield to freeRTOS
     }
 }
 
@@ -302,7 +324,6 @@ esp_err_t jk_bms_start(const jk_bms_config_t *cfg)
 
     s_cb      = cfg->on_update;
     s_ctx     = cfg->user_ctx;
-    s_poll_ms = cfg->poll_ms ? cfg->poll_ms : 2000;
 
     esp_err_t err = nimble_port_init();        
     if (err != ESP_OK) { ESP_LOGE(TAG, "nimble_port_init: %d", err); return err; }
