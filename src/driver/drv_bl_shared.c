@@ -207,8 +207,9 @@ static int base64_encode(const unsigned char *in, int len, char *out) {
     return o;
 }
 
-void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request)
+void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState)
 {
+	(void)bPreState; /* dashboard replaces the old pre/post-state HTML pattern */
     // Dashboard migrated to standalone JSON architecture on /dash
 }
 
