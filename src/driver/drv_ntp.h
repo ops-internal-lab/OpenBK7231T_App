@@ -16,6 +16,8 @@ void NTP_AppendInformationToHTTPIndexPage(http_request_t* request, int bPreState
 bool NTP_IsTimeSynced();
 int NTP_GetTimesZoneOfsSeconds();
 void NTP_SetTimesZoneOfsSeconds(int o);
+int NTP_GetHour();
+int NTP_GetMinute();
 // for Simulator only, on Windows, for unit testing
 void NTP_SetSimulatedTime(unsigned int timeNow);
 // drv_ntp_events.c
