@@ -293,9 +293,9 @@ int http_fn_custom_dash(http_request_t *request) {
         "var b=_b64toBytes(d.net),n=b.length;"
         "state_import=new Array(n);state_export=new Array(n);"
         "for(var i=0;i<n;i++){"
-        "var v=b[i]*2-150;"          /* decode: -150..+300 Wh */
-        "state_import[i]=v>0?v:0;"   /* positive part → import (red up) */
-        "state_export[i]=v<0?v:0;"   /* negative part → export (green down) */
+        "var v=b[i]*2-150;"
+        "state_import[i]=v>0?v:0;"
+        "state_export[i]=v<0?v:0;"
         "}}"
 
         "function _decodeChgInv(s){"
