@@ -2,9 +2,10 @@
    jk_bms.c  --  JK-BMS BLE driver for ESP-IDF (NimBLE GATT client, read-only)
 
    Flow:
-     sync -> connect(MAC) -> disc_all_svcs -> find 0xFFE0 -> disc_all_chrs
-          -> find 0xFFE1 val_handle -> disc_all_dscs -> try CCCD (optional)
-          -> write 0x97 + 0x96 to kick stream
+     sync -> connect(MAC) -> disc_all_svcs -> find 0xFFE0 -> [EDONE] ->
+     disc_all_chrs -> find 0xFFE1 val_handle -> [EDONE] ->
+     disc_all_dscs -> find CCCD 0x2902 -> [EDONE] ->
+     write CCCD 0x0001 -> [ACK] -> write 0x97 + 0x96 to kick stream
      notify_rx -> reassemble 300-byte frames -> checksum -> decode -> callback
      poll_task re-sends 0x96 every poll_ms to keep readings fresh.
 
@@ -21,6 +22,18 @@
          receives 0x96/0x97, never beeps, never sends data -- even though the
          BLE link is up (which is why the BMS stops advertising).
        Fix: use ble_gattc_disc_all_svcs and match 0xFFE0 manually.
+   v3  CRITICAL race-condition fix: NimBLE allows only ONE active GATT
+       procedure per connection at a time.  v2 called ble_gattc_disc_all_chrs
+       from within the on_disc_svc callback while disc_all_svcs was still
+       in progress (status==0 means "found one service, keep going").
+       NimBLE returned BLE_HS_EALREADY; the unchecked return value caused a
+       silent no-op: s_val_handle stayed 0, the GATT chain stopped, and
+       kick_stream wrote to handle 0 -- silently dropped by the stack.
+       Fix: in on_disc_svc status==0 only SAVE the service handles.
+            Start chr discovery from the BLE_HS_EDONE branch when disc_all_svcs
+            has actually finished and the connection is procedure-idle.
+       Added s_svc_start (was missing in v2) for storing the service range.
+       Added explicit rc checks on all ble_gattc_ calls.
    =========================================================================== */
 
 #include <string.h>
@@ -61,9 +74,10 @@ static ble_addr_t   s_peer;
 static uint8_t      s_own_addr_type;
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t s_svc_end;
-static uint16_t s_val_handle;       /* 0xFFE1 value handle (write target)   */
-static uint16_t s_cccd_handle;      /* 0x2902 – 0 when absent               */
+static uint16_t s_svc_start;           /* 0xFFE0 start handle               */
+static uint16_t s_svc_end;             /* 0xFFE0 end handle                 */
+static uint16_t s_val_handle;          /* 0xFFE1 value handle (write target) */
+static uint16_t s_cccd_handle;         /* 0x2902 – 0 when absent            */
 static volatile bool s_subscribed = false;
 
 static float s_balance_start = 0.0f;
@@ -126,103 +140,121 @@ static void feed(const uint8_t *data, int len)
     }
 }
 
-/* ---- kick_stream: send the two request frames that wake the BMS ---------- */
-static void kick_stream(uint16_t conn)
-{
-    ble_gattc_write_no_rsp_flat(conn,s_val_handle,REQ_DEVICE_INFO,sizeof(REQ_DEVICE_INFO));
-    ble_gattc_write_no_rsp_flat(conn,s_val_handle,REQ_CELL_INFO,  sizeof(REQ_CELL_INFO));
-    s_subscribed=true;
-    ESP_LOGI(TAG,"stream kick sent (val_handle=0x%04x)",s_val_handle);
-}
-
 /* ---- GATT callbacks ------------------------------------------------------ */
 static void start_connect(void);
 
-/* CCCD write response: kick stream regardless of success/failure */
-static int on_cccd_write(uint16_t conn, const struct ble_gatt_error *err,
-                         struct ble_gatt_attr *attr, void *arg)
+/* on_subscribe: called when CCCD write is acknowledged.
+   Only kick the stream after a confirmed subscribe -- otherwise the BMS
+   may not be listening yet and both writes get silently dropped.           */
+static int on_subscribe(uint16_t conn, const struct ble_gatt_error *err,
+                        struct ble_gatt_attr *attr, void *arg)
 {
-    (void)attr;(void)arg;
-    if(err->status!=0)
-        ESP_LOGW(TAG,"CCCD write status=%d, kicking anyway",err->status);
-    else
-        ESP_LOGI(TAG,"CCCD ack'd");
-    kick_stream(conn);
+    (void)attr; (void)arg;
+    if(err->status != 0){
+        ESP_LOGW(TAG,"CCCD enable failed (status=%d) -- disconnecting",err->status);
+        ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+    s_subscribed = true;
+    /* Device-info first (triggers the BMS beep + settings frame),
+       then cell-info (continuous data stream).                             */
+    ble_gattc_write_no_rsp_flat(conn, s_val_handle, REQ_DEVICE_INFO, sizeof(REQ_DEVICE_INFO));
+    ble_gattc_write_no_rsp_flat(conn, s_val_handle, REQ_CELL_INFO,   sizeof(REQ_CELL_INFO));
+    ESP_LOGI(TAG,"subscribed -- stream kicked (val_handle=0x%04x)", s_val_handle);
     return 0;
 }
 
-/* Descriptor discovery: find 0x2902, write it, then kick */
+/* Descriptor discovery over [val_handle, svc_end]: find 0x2902 and write it. */
 static int on_disc_dsc(uint16_t conn, const struct ble_gatt_error *err,
                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
-    (void)chr_val_handle;(void)arg;
-    if(err->status==0){
-        if(ble_uuid_cmp(&dsc->uuid.u,&CCCD_UUID.u)==0){
-            s_cccd_handle=dsc->handle;
-            ESP_LOGI(TAG,"CCCD at 0x%04x",s_cccd_handle);
+    (void)chr_val_handle; (void)arg;
+    if(err->status == 0){
+        if(ble_uuid_cmp(&dsc->uuid.u, &CCCD_UUID.u) == 0){
+            s_cccd_handle = dsc->handle;
+            ESP_LOGI(TAG,"CCCD at 0x%04x", s_cccd_handle);
         }
-    } else if(err->status==BLE_HS_EDONE){
-        if(s_cccd_handle!=0){
-            uint8_t val[2]={0x01,0x00};
-            int rc=ble_gattc_write_flat(conn,s_cccd_handle,val,sizeof(val),on_cccd_write,NULL);
-            if(rc!=0){
-                ESP_LOGW(TAG,"CCCD write enqueue rc=%d, kicking anyway",rc);
-                kick_stream(conn);
-            }
-        } else {
-            /* No CCCD – CC2541 auto-notifies; just send the request frames */
-            ESP_LOGW(TAG,"no CCCD – kicking stream directly");
-            kick_stream(conn);
+    } else if(err->status == BLE_HS_EDONE){
+        if(s_cccd_handle == 0){
+            /* No CCCD: this BMS variant auto-notifies -- rare but real.
+               Disconnect and retry; if it keeps happening add a direct kick here. */
+            ESP_LOGW(TAG,"no CCCD found -- disconnecting to retry");
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
+        uint8_t val[2] = {0x01, 0x00};    /* notifications on */
+        int rc = ble_gattc_write_flat(conn, s_cccd_handle, val, sizeof(val),
+                                      on_subscribe, NULL);
+        if(rc != 0){
+            ESP_LOGE(TAG,"CCCD write enqueue failed rc=%d", rc);
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
         }
     }
     return 0;
 }
 
-/* Characteristic discovery over 0xFFE0: find 0xFFE1 val_handle */
+/* Characteristic discovery over 0xFFE0: find 0xFFE1 val_handle. */
 static int on_disc_chr(uint16_t conn, const struct ble_gatt_error *err,
                        const struct ble_gatt_chr *chr, void *arg)
 {
     (void)arg;
-    if(err->status==0){
-        if(ble_uuid_cmp(&chr->uuid.u,&CHR_UUID.u)==0){
-            s_val_handle=chr->val_handle;
+    if(err->status == 0){
+        if(ble_uuid_cmp(&chr->uuid.u, &CHR_UUID.u) == 0){
+            s_val_handle = chr->val_handle;
             ESP_LOGI(TAG,"0xFFE1 val_handle=0x%04x props=0x%02x",
-                     s_val_handle,chr->properties);
+                     s_val_handle, chr->properties);
         }
-    } else if(err->status==BLE_HS_EDONE){
-        if(s_val_handle==0){
+    } else if(err->status == BLE_HS_EDONE){
+        if(s_val_handle == 0){
             ESP_LOGW(TAG,"0xFFE1 not found in service");
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
             return 0;
         }
-        s_cccd_handle=0;
-        /* FIX: start descriptor search from val_handle+1 */
-        ble_gattc_disc_all_dscs(conn,s_val_handle+1,s_svc_end,on_disc_dsc,NULL);
+        s_cccd_handle = 0;
+        /* val_handle is the attribute value; descriptors start one handle later */
+        int rc = ble_gattc_disc_all_dscs(conn, s_val_handle+1, s_svc_end,
+                                         on_disc_dsc, NULL);
+        if(rc != 0){
+            ESP_LOGE(TAG,"disc_all_dscs failed rc=%d", rc);
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        }
     }
     return 0;
 }
 
-/* Service discovery (all services): find 0xFFE0, then discover its chrs.
-   FIX: uses disc_all_svcs (ATT opcode 0x10) instead of disc_svc_by_uuid
-   (ATT opcode 0x06).  Some CC2541 modules silently drop opcode 0x06.       */
+/* Service discovery (all services): find 0xFFE0, then wait for EDONE.
+   FIX v2: disc_all_svcs (ATT 0x10) instead of disc_svc_by_uuid (ATT 0x06).
+   FIX v3: store handles in status==0; launch chr discovery ONLY from
+           BLE_HS_EDONE when disc_all_svcs has completed and the connection
+           is procedure-idle.  Calling disc_all_chrs from status==0 returns
+           BLE_HS_EALREADY (another procedure still active) and is silently
+           ignored, leaving s_val_handle==0 forever.                        */
 static int on_disc_svc(uint16_t conn, const struct ble_gatt_error *err,
                        const struct ble_gatt_svc *svc, void *arg)
 {
     (void)arg;
-    if(err->status==0){
-        if(ble_uuid_cmp(&svc->uuid.u,&SVC_UUID.u)==0){
-            s_svc_end=svc->end_handle;
+    if(err->status == 0){
+        if(ble_uuid_cmp(&svc->uuid.u, &SVC_UUID.u) == 0){
+            /* Just save the handles -- do NOT start a new GATT procedure here,
+               disc_all_svcs is still in flight and would return BLE_HS_EALREADY. */
+            s_svc_start = svc->start_handle;
+            s_svc_end   = svc->end_handle;
             ESP_LOGI(TAG,"0xFFE0 found: start=0x%04x end=0x%04x",
-                     svc->start_handle, svc->end_handle);
-            /* Kick characteristic discovery immediately while the callback
-               chain is live – don't wait for BLE_HS_EDONE.                 */
-            s_val_handle=0;
-            ble_gattc_disc_all_chrs(conn,svc->start_handle,svc->end_handle,
-                                    on_disc_chr,NULL);
+                     s_svc_start, s_svc_end);
         }
-    } else if(err->status==BLE_HS_EDONE){
-        if(s_val_handle==0 && s_svc_end==0)
-            ESP_LOGW(TAG,"0xFFE0 service not found – is this a JK BMS?");
-        /* else: discovery was triggered inside the status==0 branch above */
+    } else if(err->status == BLE_HS_EDONE){
+        /* disc_all_svcs is now done -- safe to start chr discovery */
+        if(s_svc_end == 0){
+            ESP_LOGW(TAG,"0xFFE0 service not found -- is this a JK BMS?");
+            return 0;
+        }
+        s_val_handle = 0;
+        int rc = ble_gattc_disc_all_chrs(conn, s_svc_start, s_svc_end,
+                                         on_disc_chr, NULL);
+        if(rc != 0){
+            ESP_LOGE(TAG,"disc_all_chrs failed rc=%d", rc);
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        }
     }
     return 0;
 }
@@ -234,42 +266,40 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     switch(event->type){
 
     case BLE_GAP_EVENT_CONNECT:
-        if(event->connect.status==0){
-            s_conn_handle=event->connect.conn_handle;
-            s_svc_end=0; s_val_handle=0;
-            ESP_LOGI(TAG,"connected handle=%d; discovering all services",s_conn_handle);
-            /* FIX: disc_all_svcs instead of disc_svc_by_uuid */
-            ble_gattc_disc_all_svcs(s_conn_handle,on_disc_svc,NULL);
+        if(event->connect.status == 0){
+            s_conn_handle = event->connect.conn_handle;
+            s_svc_start = 0; s_svc_end = 0; s_val_handle = 0;
+            ESP_LOGI(TAG,"connected handle=%d; discovering all services", s_conn_handle);
+            int rc = ble_gattc_disc_all_svcs(s_conn_handle, on_disc_svc, NULL);
+            if(rc != 0)
+                ESP_LOGE(TAG,"disc_all_svcs failed rc=%d", rc);
         } else {
-            ESP_LOGW(TAG,"connect failed status=%d; retrying",event->connect.status);
+            ESP_LOGW(TAG,"connect failed status=%d; retrying", event->connect.status);
             start_connect();
         }
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGW(TAG,"disconnected reason=%d; reconnecting",event->disconnect.reason);
-        s_conn_handle=BLE_HS_CONN_HANDLE_NONE;
-        s_subscribed=false; s_len=0; s_svc_end=0; s_val_handle=0;
+        ESP_LOGW(TAG,"disconnected reason=%d; reconnecting", event->disconnect.reason);
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_subscribed  = false;
+        s_len         = 0;
+        s_svc_start   = 0; s_svc_end = 0; s_val_handle = 0;
         start_connect();
         return 0;
 
-    case BLE_GAP_EVENT_NOTIFY_RX:{
-        struct os_mbuf *om=event->notify_rx.om;
-        uint16_t total=OS_MBUF_PKTLEN(om);
-        uint8_t chunk[256];
-        uint16_t n=total>sizeof(chunk)?(uint16_t)sizeof(chunk):total;
-        os_mbuf_copydata(om,0,n,chunk);
-        feed(chunk,n);
-        /* Accept spontaneous notifications from auto-notify modules */
-        if(!s_subscribed && s_val_handle!=0){
-            ESP_LOGI(TAG,"notify before kick – auto-notify mode");
-            s_subscribed=true;
-        }
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        struct os_mbuf *om = event->notify_rx.om;
+        uint16_t total = OS_MBUF_PKTLEN(om);
+        uint8_t  chunk[256];
+        uint16_t n = total > sizeof(chunk) ? (uint16_t)sizeof(chunk) : total;
+        os_mbuf_copydata(om, 0, n, chunk);
+        feed(chunk, n);
         return 0;
     }
 
     case BLE_GAP_EVENT_MTU:
-        ESP_LOGI(TAG,"MTU=%d",event->mtu.value);
+        ESP_LOGI(TAG,"MTU=%d", event->mtu.value);
         return 0;
 
     default:
@@ -279,20 +309,20 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
 static void start_connect(void)
 {
-    int rc=ble_gap_connect(s_own_addr_type,&s_peer,30000,NULL,gap_event,NULL);
-    if(rc!=0 && rc!=BLE_HS_EALREADY)
-        ESP_LOGE(TAG,"ble_gap_connect rc=%d",rc);
+    int rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, gap_event, NULL);
+    if(rc != 0 && rc != BLE_HS_EALREADY)
+        ESP_LOGE(TAG,"ble_gap_connect rc=%d", rc);
 }
 
 /* ---- NimBLE host lifecycle ----------------------------------------------- */
 static void on_sync(void)
 {
-    ble_hs_id_infer_auto(0,&s_own_addr_type);
-    ESP_LOGI(TAG,"sync; own_addr_type=%d",s_own_addr_type);
+    ble_hs_id_infer_auto(0, &s_own_addr_type);
+    ESP_LOGI(TAG,"sync; own_addr_type=%d", s_own_addr_type);
     start_connect();
 }
 
-static void on_reset(int reason){ ESP_LOGW(TAG,"nimble reset reason=%d",reason); }
+static void on_reset(int reason){ ESP_LOGW(TAG,"nimble reset reason=%d", reason); }
 
 static void host_task(void *p)
 {
@@ -306,9 +336,9 @@ static void poll_task(void *p)
     (void)p;
     for(;;){
         vTaskDelay(pdMS_TO_TICKS(s_poll_ms));
-        if(s_subscribed && s_conn_handle!=BLE_HS_CONN_HANDLE_NONE)
-            ble_gattc_write_no_rsp_flat(s_conn_handle,s_val_handle,
-                                        REQ_CELL_INFO,sizeof(REQ_CELL_INFO));
+        if(s_subscribed && s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+            ble_gattc_write_no_rsp_flat(s_conn_handle, s_val_handle,
+                                        REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
     }
 }
 
@@ -316,35 +346,36 @@ static void poll_task(void *p)
 static int parse_mac(const char *s, ble_addr_t *out)
 {
     unsigned b[6];
-    if(sscanf(s,"%x:%x:%x:%x:%x:%x",&b[0],&b[1],&b[2],&b[3],&b[4],&b[5])!=6)
+    if(sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) != 6)
         return -1;
-    out->type=BLE_ADDR_PUBLIC;
-    for(int i=0;i<6;i++) out->val[i]=(uint8_t)b[5-i];
+    out->type = BLE_ADDR_PUBLIC;
+    for(int i=0;i<6;i++) out->val[i] = (uint8_t)b[5-i];
     return 0;
 }
 
 /* ---- public API ---------------------------------------------------------- */
 esp_err_t jk_bms_start(const jk_bms_config_t *cfg)
 {
-    if(!cfg||!cfg->mac||!cfg->on_update) return ESP_ERR_INVALID_ARG;
-    if(parse_mac(cfg->mac,&s_peer)!=0)   return ESP_ERR_INVALID_ARG;
-    s_cb=cfg->on_update; s_ctx=cfg->user_ctx;
-    s_poll_ms=cfg->poll_ms?cfg->poll_ms:2000;
+    if(!cfg || !cfg->mac || !cfg->on_update) return ESP_ERR_INVALID_ARG;
+    if(parse_mac(cfg->mac, &s_peer) != 0)    return ESP_ERR_INVALID_ARG;
+    s_cb      = cfg->on_update;
+    s_ctx     = cfg->user_ctx;
+    s_poll_ms = cfg->poll_ms ? cfg->poll_ms : 2000;
 
-    esp_err_t err=nimble_port_init();
-    if(err!=ESP_OK){ESP_LOGE(TAG,"nimble_port_init: %d",err);return err;}
+    esp_err_t err = nimble_port_init();
+    if(err != ESP_OK){ ESP_LOGE(TAG,"nimble_port_init: %d", err); return err; }
 
-    ble_hs_cfg.reset_cb       =on_reset;
-    ble_hs_cfg.sync_cb        =on_sync;
-    ble_hs_cfg.store_status_cb=ble_store_util_status_rr;
+    ble_hs_cfg.reset_cb        = on_reset;
+    ble_hs_cfg.sync_cb         = on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_store_config_init();
 
     nimble_port_freertos_init(host_task);
-    xTaskCreate(poll_task,"jk_poll",3072,NULL,5,NULL);
+    xTaskCreate(poll_task, "jk_poll", 3072, NULL, 5, NULL);
     return ESP_OK;
 }
 
 bool jk_bms_is_connected(void)
 {
-    return s_conn_handle!=BLE_HS_CONN_HANDLE_NONE && s_subscribed;
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_subscribed;
 }
