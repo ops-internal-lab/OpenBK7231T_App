@@ -6,6 +6,9 @@
 #include "../logging/logging.h"
 #include "../new_cfg.h"
 #include "../new_pins.h"
+#if PLATFORM_ESPIDF
+#include "drv_uart_tcp_client.h"
+#endif
 #include "../cmnds/cmd_public.h"
 #include "drv_bl_shared.h"
 #include "drv_pwrCal.h"
@@ -197,6 +200,23 @@ static int UART_TryToGetNextPacket(void) {
     data.cf_cnt =
         (UART_GetByte(15) << 16) | (UART_GetByte(14) << 8) | UART_GetByte(13);
     data.freq = (UART_GetByte(17) << 8) | UART_GetByte(16);
+
+    /* ---------------------------------------------------------------
+       TCP UART mode hook — DO NOT REMOVE
+       When UART_TCP_GetLastSlot() >= 0 this reading came from a remote
+       BK7231N via TCP, not from the local hardware UART.
+
+       TODO (multi-device): route data to the correct sensor group:
+         int slot = UART_TCP_GetLastSlot();   // 0-3, or -1 = HW UART
+         if (slot >= 0) { ... update sensors[slot] ... }
+
+       Charger command hook:
+         UART_TCP_SendChargerCmd("/api/charger?cmd=xxx")
+         Called here when energy conditions trigger a charge/stop action.
+         UART_TCP_GetChargerIP(0) = placeholder IP (future use)
+         UART_TCP_GetChargerIP(1) = active charger IP
+    --------------------------------------------------------------- */
+
     ScaleAndUpdate(&data);
 
     UART_ConsumeBytes(BL0942_UART_PACKET_LEN);

@@ -60,7 +60,7 @@ static int target_export = 20;
 static int target_power = 100;
 
 #define dump_load_relay_number 6
-#define charger_c_ip 21
+/* charger_c_ip removed — charger IPs now configured via setChargerIP1/2 */
 #define net_metering_period 15
 
 static int dump_load_relay[dump_load_relay_number] = {0};
@@ -287,9 +287,17 @@ commandResult_t BL09XX_SetDumpLoad(const void *context, const char *cmd, const c
         char fallback_cmd[64];
 
         dump_load_relay[5] = atoi(args);
-        
-        snprintf(fallback_cmd, sizeof(fallback_cmd), "SendGet http://192.168.8.%d/cm?cmnd=Channel3%%20%d", charger_c_ip, dump_load_relay[5]);
-        CMD_ExecuteCommand(fallback_cmd, 0);
+
+        /* Fire command to each configured charger IP */
+        { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
+            const char *_cip = UART_TCP_GetChargerIP(_ci);
+            if (!_cip) continue;
+            char fallback_cmd[96];
+            snprintf(fallback_cmd, sizeof(fallback_cmd),
+                     "SendGet http://%s/cm?cmnd=Channel3%%20%d",
+                     _cip, dump_load_relay[5]);
+            CMD_ExecuteCommand(fallback_cmd, 0);
+        }}
     }
     return CMD_RES_OK;
 }
@@ -307,11 +315,17 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
         
         // Instant execution if manual
         if (charger_c_auto == 0) {
-            char fallback_cmd[64];
             dump_load_relay[5] = target_power;
-
-            snprintf(fallback_cmd, sizeof(fallback_cmd), "SendGet http://192.168.8.%d/cm?cmnd=Channel3%%20%d", charger_c_ip, dump_load_relay[5]);
-            CMD_ExecuteCommand(fallback_cmd, 0);
+            /* Fire command to each configured charger IP */
+            { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
+                const char *_cip = UART_TCP_GetChargerIP(_ci);
+                if (!_cip) continue;
+                char fallback_cmd[96];
+                snprintf(fallback_cmd, sizeof(fallback_cmd),
+                         "SendGet http://%s/cm?cmnd=Channel3%%20%d",
+                         _cip, dump_load_relay[5]);
+                CMD_ExecuteCommand(fallback_cmd, 0);
+            }}
         }
     }
     return CMD_RES_OK;
@@ -711,9 +725,16 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 
                 dump_load_relay[5] = persistent_state;
 
-                // Send Commands via process loop
-                snprintf(fallback_cmd, sizeof(fallback_cmd), "SendGet http://192.168.8.%d/cm?cmnd=Channel3%%20%d", charger_c_ip, dump_load_relay[5]);
-                CMD_ExecuteCommand(fallback_cmd, 0);
+                /* Fire command to each configured charger IP */
+                { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
+                    const char *_cip = UART_TCP_GetChargerIP(_ci);
+                    if (!_cip) continue;
+                    char fallback_cmd[96];
+                    snprintf(fallback_cmd, sizeof(fallback_cmd),
+                             "SendGet http://%s/cm?cmnd=Channel3%%20%d",
+                             _cip, dump_load_relay[5]);
+                    CMD_ExecuteCommand(fallback_cmd, 0);
+                }}
             } // END OF AUTO BLOCK
         }
     } 
