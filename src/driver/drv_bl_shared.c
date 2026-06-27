@@ -49,6 +49,10 @@ static int saved_persistent_state = 0;
 static int saved_solar_excess = 0;
 static int rollover_just_happened = 0;
 
+/* Daily export (generation) totals — loaded from NVS on boot, rolled over
+   at midnight via NTP. Index: [0]=today, [1]=yesterday, [2]=2d ago, [3]=3d ago */
+static float export_daily[4] = {0.0f};
+
 int estimated_energy_period = 0;
 
 // NEW GLOBAL TARGETS
@@ -71,7 +75,7 @@ int charger_c_auto = 1;
 #include "../hal/hal_flashVars.h"
 #include "../logging/logging.h"
 #include "../mqtt/new_mqtt.h"
-#include "../hal/hal_ota.h"
+#include "../ota/ota.h"
 #include "drv_local.h"
 #include "drv_ntp.h"
 #include "drv_public.h"
@@ -207,9 +211,8 @@ static int base64_encode(const unsigned char *in, int len, char *out) {
     return o;
 }
 
-void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState)
+void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request)
 {
-	(void)bPreState; /* dashboard replaces the old pre/post-state HTML pattern */
     // Dashboard migrated to standalone JSON architecture on /dash
 }
 
@@ -218,7 +221,7 @@ void BL09XX_SaveEmeteringStatistics()
     ENERGY_METERING_DATA data;
     memset(&data, 0, sizeof(ENERGY_METERING_DATA));
 
-    data.TotalGeneration = sensors[OBK_GENERATION_TOTAL].lastReading;
+    /* TotalGeneration no longer in the struct — stored as NVS key "eExpTotal" */
     data.TotalConsumption = sensors[OBK_CONSUMPTION_TOTAL].lastReading;
     data.TodayConsumpion = sensors[OBK_CONSUMPTION_TODAY].lastReading;
     data.YesterdayConsumption = sensors[OBK_CONSUMPTION_YESTERDAY].lastReading;
@@ -230,6 +233,14 @@ void BL09XX_SaveEmeteringStatistics()
     data.save_counter = ConsumptionSaveCounter;
 
     HAL_SetEnergyMeterStatus(&data);
+
+    /* Export total and daily history stored separately so the struct stays 32 bytes */
+    HAL_FlashVars_SaveEnergyExportTotal(sensors[OBK_GENERATION_TOTAL].lastReading);
+    HAL_FlashVars_SaveEnergyImportTotal(sensors[OBK_CONSUMPTION_TOTAL].lastReading);
+    HAL_FlashVars_SaveEnergyExportDaily(0, export_daily[0]);
+    HAL_FlashVars_SaveEnergyExportDaily(1, export_daily[1]);
+    HAL_FlashVars_SaveEnergyExportDaily(2, export_daily[2]);
+    HAL_FlashVars_SaveEnergyExportDaily(3, export_daily[3]);
 }
 
 commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, const char *args, int cmdFlags)
@@ -397,6 +408,7 @@ float BL_ChangeEnergyUnitIfNeeded(float Wh) {
 
 void BL_ProcessUpdate(float voltage, float current, float power, float frequency, float energyWh) {
     int i;
+    int xPassedTicks;
     time_t ntpTime;
     struct tm *ltm;
     char datetime[64];
@@ -517,16 +529,13 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
 
                 // Rolling last-hour IMPORT total: sum of the positive
                 // (consumption) portions of the 4 most recent 15-minute
-                // net values. Export periods contribute 0 here - export
-                // is tracked separately via OBK_GENERATION_TOTAL, not as
-                // part of "last hour" - so this value is never negative.
+                // slots. Use consumption_matrix directly — always positive,
+                // no sign check needed.
                 {
                     float lh_sum = 0;
                     int lh_idx = last_matrix_index;
                     for (int lh_k = 0; lh_k < 4; lh_k++) {
-                        if (net_matrix[lh_idx] > 0) {
-                            lh_sum += net_matrix[lh_idx];
-                        }
+                        lh_sum += (float)consumption_matrix[lh_idx];
                         lh_idx = (lh_idx - 1 + MATRIX_SIZE) % MATRIX_SIZE;
                     }
                     sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = lh_sum;
@@ -548,7 +557,9 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     sensors[OBK_CONSUMPTION_TOTAL].lastReading += period_net;
                     sensors[OBK_CONSUMPTION_TODAY].lastReading += period_net;
                 } else if (period_net < 0) {
-                    sensors[OBK_GENERATION_TOTAL].lastReading += (-period_net);
+                    float exp_wh = -period_net;
+                    sensors[OBK_GENERATION_TOTAL].lastReading += exp_wh;
+                    export_daily[0] += exp_wh;   /* track today's export separately */
                 }
                 mark_energy_dirty();
 
@@ -566,6 +577,15 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     lastSavedGenerationCounterValue = sensors[OBK_GENERATION_TOTAL].lastReading;
                     BL09XX_SaveEmeteringStatistics();
                     lastConsumptionSaveStamp = xTaskGetTickCount();
+#if PLATFORM_ESPIDF
+                    /* Persist the 48-byte net_graph_matrix so the graph
+                       survives power cuts. Charger/inverter arrays also
+                       saved. Total NVS write: ~150 bytes every 15 min. */
+                    HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
+                                                   charger_c_matrix, inverter_matrix,
+                                                   MATRIX_SIZE, last_matrix_index,
+                                                   (unsigned int)NTP_GetCurrentTime());
+#endif
                 }
 
                 // Preserve charger/inverter state across this reset - it will
@@ -742,6 +762,11 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 sensors[i].lastReading = sensors[i - 1].lastReading;
             }
             sensors[OBK_CONSUMPTION_TODAY].lastReading = 0.0;
+            /* Roll over export daily history in parallel */
+            export_daily[3] = export_daily[2];
+            export_daily[2] = export_daily[1];
+            export_daily[1] = export_daily[0];
+            export_daily[0] = 0.0f;
             actual_mday = ltm->tm_mday;
             mark_energy_dirty();
             // Persistence for this rollover happens on the next 15-minute save.
@@ -835,18 +860,38 @@ void BL_Shared_Init(void)
     addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER, "Read ENERGYMETER status values. sizeof(ENERGY_METERING_DATA)=%d\n", sizeof(ENERGY_METERING_DATA));
 
     HAL_GetEnergyMeterStatus(&data);
-    sensors[OBK_CONSUMPTION_TOTAL].lastReading = data.TotalConsumption;
-    sensors[OBK_GENERATION_TOTAL].lastReading = data.TotalGeneration;
-    sensors[OBK_CONSUMPTION_TODAY].lastReading = data.TodayConsumpion;
+    sensors[OBK_CONSUMPTION_TOTAL].lastReading    = data.TotalConsumption;
+    sensors[OBK_GENERATION_TOTAL].lastReading     = HAL_FlashVars_GetEnergyExportTotal();
+    sensors[OBK_CONSUMPTION_TODAY].lastReading    = data.TodayConsumpion;
     sensors[OBK_CONSUMPTION_YESTERDAY].lastReading = data.YesterdayConsumption;
-    actual_mday = data.actual_mday;   
+    actual_mday = data.actual_mday;
     lastSavedEnergyCounterValue = data.TotalConsumption;
-    lastSavedGenerationCounterValue = data.TotalGeneration;
+    lastSavedGenerationCounterValue = sensors[OBK_GENERATION_TOTAL].lastReading;
     sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading = data.ConsumptionHistory[0];
     sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading = data.ConsumptionHistory[1];
     ConsumptionResetTime = data.ConsumptionResetTime;
     ConsumptionSaveCounter = data.save_counter;
     lastConsumptionSaveStamp = xTaskGetTickCount();
+
+    /* Load daily export history */
+    export_daily[0] = HAL_FlashVars_GetEnergyExportDaily(0);
+    export_daily[1] = HAL_FlashVars_GetEnergyExportDaily(1);
+    export_daily[2] = HAL_FlashVars_GetEnergyExportDaily(2);
+    export_daily[3] = HAL_FlashVars_GetEnergyExportDaily(3);
+
+    /* Restore 12-hour graph from NVS so it survives power cuts */
+    {
+        int saved_idx = 0;
+        unsigned int saved_ts = 0;
+        if (HAL_FlashVars_LoadGraphMatrices(net_graph_matrix,
+                                            charger_c_matrix, inverter_matrix,
+                                            MATRIX_SIZE, &saved_idx, &saved_ts)) {
+            last_matrix_index = saved_idx;
+            addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                      "Graph matrix restored from NVS (idx=%d)\n", saved_idx);
+        }
+        /* If load failed: matrices stay zero-init — correct for a fresh start */
+    }
 
     CMD_RegisterCommand("SetDumpLoad", BL09XX_SetDumpLoad, NULL);
     CMD_RegisterCommand("EnergyCntReset", BL09XX_ResetEnergyCounter, NULL);
@@ -921,14 +966,10 @@ int http_fn_api_dash(http_request_t *request) {
 
         if (volt_v > 0xFFFF) volt_v = 0xFFFF;
         if (curr_v > 0xFFFF) curr_v = 0xFFFF;
-        if (pwr_v  >  32767) pwr_v  =  32767;
-        if (pwr_v  < -32768) pwr_v  = -32768;
-        if (cpwr_v >  32767) cpwr_v =  32767;
-        if (cpwr_v < -32768) cpwr_v = -32768;
-        if (bal_v  >  32767) bal_v  =  32767;
-        if (bal_v  < -32768) bal_v  = -32768;
-        if (est_v  >  32767) est_v  =  32767;
-        if (est_v  < -32768) est_v  = -32768;
+        if (pwr_v  >  32767) pwr_v  =  32767; if (pwr_v  < -32768) pwr_v  = -32768;
+        if (cpwr_v >  32767) cpwr_v =  32767; if (cpwr_v < -32768) cpwr_v = -32768;
+        if (bal_v  >  32767) bal_v  =  32767; if (bal_v  < -32768) bal_v  = -32768;
+        if (est_v  >  32767) est_v  =  32767; if (est_v  < -32768) est_v  = -32768;
         if (lms_v  > 0xFFFF) lms_v  = 0xFFFF;
 
         raw[0]  = (unsigned char)(volt_v  & 0xFF);
@@ -1025,74 +1066,62 @@ int http_fn_api_dash(http_request_t *request) {
     }
 
     // ---- GRAPH ARRAYS (req=net | req=chginv) ----
-    // Sent as base64 of packed binary, 1 byte per sample (48 bytes total):
-    //   "net":    uint8, value = (clamp(net_Wh, -150, 300) + 150) / 2
-    //             i.e. net_Wh = byte*2 - 150. Halves resolution to 2Wh
-    //             steps but covers the full -150..+300 range in one byte.
-    //   "chginv": int8 (signed), +v = charger at v%% (0..100),
-    //             -v = inverter at v%% (0..100), 0 = neither.
-    //             Charger and inverter are mutually exclusive so one
-    //             signed byte replaces the previous two separate arrays.
+    // req=net:    {"net":"b64_48"} — original signed packing kept:
+    //   1 byte per slot = (clamp(net_Wh,-150,300)+150)/2.
+    //   JS splits by sign at render time: positive=import(red up),
+    //   negative=export(green down). No extra bytes needed.
+    // req=chginv: {"chginv":"b64_48"}
+    //   int8 signed: +v=charger at v%, -v=inverter at v%, 0=neither.
     else if (has_ntp && req_param) {
-        unsigned int msm      = NTP_GetHour() * 60 + NTP_GetMinute();
-        const char  *key      = NULL;
-        int          is_net   = 0;
-        int          is_chginv = 0;
-        int          net_live = 0, chg_live = 0, inv_live = 0;
-        int          has_live = 0;
+        unsigned int msm = NTP_GetHour() * 60 + NTP_GetMinute();
 
         if (strncmp(req_param, "req=net", 7) == 0) {
-            key = "net"; is_net = 1;
-            net_live = safe_int(real_consumption - real_export);
-            has_live = 1;
+            unsigned char raw[MATRIX_SIZE];
+            char          b64[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            int           raw_len = 0, b64l;
+            int           net_live = safe_int(real_consumption - real_export);
+
+            for (int i = 47; i >= 0; i--) {
+                int idx  = (msm / net_metering_period - i + 96) % 96;
+                int slot = idx % MATRIX_SIZE;
+                if (i == 0) {
+                    int val = net_live;
+                    if (val > 300)  val = 300;
+                    if (val < -150) val = -150;
+                    raw[raw_len++] = (unsigned char)((val + 150) / 2);
+                } else {
+                    raw[raw_len++] = net_graph_matrix[slot];
+                }
+            }
+            b64l = base64_encode(raw, raw_len, b64); b64[b64l] = '\0';
+            B("\"net\":\"%s\"", b64);
+
         } else if (strncmp(req_param, "req=chginv", 10) == 0) {
-            key = "chginv"; is_chginv = 1;
-            has_live = (sample_count_30s > 0);
+            unsigned char raw[MATRIX_SIZE];
+            char          b64[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            int           raw_len = 0, b64_len;
+            int           has_live = (sample_count_30s > 0);
+            int           chg_live = 0, inv_live = 0;
             if (has_live) {
                 chg_live = current_charger_c_accum / sample_count_30s;
                 inv_live = current_inverter_accum / sample_count_30s;
             }
-        }
-
-        if (key) {
-            unsigned char raw[MATRIX_SIZE];
-            char          b64[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
-            int           raw_len = 0;
-            int           b64_len;
-
             for (int i = 47; i >= 0; i--) {
-                int idx = (msm / net_metering_period - i + 96) % 96;
+                int idx  = (msm / net_metering_period - i + 96) % 96;
                 int slot = idx % MATRIX_SIZE;
-
-                if (is_net) {
-                    if (i == 0 && has_live) {
-                        int val = net_live;
-                        if (val > 300)  val = 300;
-                        if (val < -150) val = -150;
-                        raw[raw_len++] = (unsigned char)((val + 150) / 2);
-                    } else {
-                        raw[raw_len++] = net_graph_matrix[slot];
-                    }
-                } else if (is_chginv) {
-                    int chg_v = charger_c_matrix[slot];
-                    int inv_v = inverter_matrix[slot];
-                    int combined;
-                    if (i == 0 && has_live) {
-                        chg_v = chg_live;
-                        inv_v = inv_live;
-                    }
-                    if (chg_v > 0)      combined = chg_v;
-                    else if (inv_v > 0) combined = -inv_v;
-                    else                combined = 0;
-                    if (combined > 127)  combined = 127;
-                    if (combined < -127) combined = -127;
-                    raw[raw_len++] = (unsigned char)((signed char)combined);
-                }
+                int chg_v = (i == 0 && has_live) ? chg_live : charger_c_matrix[slot];
+                int inv_v = (i == 0 && has_live) ? inv_live : inverter_matrix[slot];
+                int combined;
+                if (chg_v > 0)      combined = chg_v;
+                else if (inv_v > 0) combined = -inv_v;
+                else                combined = 0;
+                if (combined > 127)  combined = 127;
+                if (combined < -127) combined = -127;
+                raw[raw_len++] = (unsigned char)((signed char)combined);
             }
-
             b64_len = base64_encode(raw, raw_len, b64);
             b64[b64_len] = '\0';
-            B("\"%s\":\"%s\"", key, b64);
+            B("\"chginv\":\"%s\"", b64);
         }
     }
 
@@ -1108,23 +1137,3 @@ int http_fn_api_dash(http_request_t *request) {
 // Dashboard HTML/CSS/JS frontend has been moved to dash_frontend.c
 // (see http_fn_custom_dash). This file only serves the JSON data
 // via http_fn_api_dash, consumed by that frontend's polling JS.
-
-/* =========================================================================
-   BL_HasEnergySensorReading / BL_HasEnergySensorReadingEx
-   -------------------------------------------------------------------------
-   These are declared in drv_public.h and called by http_fns.c for HASS
-   discovery (checking if a sensor channel actually has a live reading).
-   Our build uses a single flat sensors[] array (no ENABLE_BL_TWIN twin
-   datasets), so asensdatasetix must be 0 for any match.
-   ========================================================================= */
-int BL_HasEnergySensorReadingEx(int asensdatasetix, energySensor_t type)
-{
-    if (asensdatasetix != BL_SENSORS_IX_0) return 0;
-    if (type < OBK__FIRST || type > OBK__LAST) return 0;
-    return !isnan((float)sensors[type].lastReading);
-}
-
-int BL_HasEnergySensorReading(energySensor_t type)
-{
-    return BL_HasEnergySensorReadingEx(BL_SENSORS_IX_0, type);
-}
