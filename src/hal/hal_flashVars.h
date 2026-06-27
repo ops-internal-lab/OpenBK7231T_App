@@ -7,9 +7,8 @@
 #define BOOT_COMPLETE_SECONDS 30
 #define MAX_RETAIN_CHANNELS 12
 
-/* Fixed size 36 bytes (TotalGeneration added for bi-directional metering) */
+/* Fixed size 32 bytes — TotalGeneration removed; stored as NVS key "eExpTotal" */
 typedef struct ENERGY_METERING_DATA {
-	float TotalGeneration;
 	float TotalConsumption;
 	float TodayConsumpion;
 	float YesterdayConsumption;
@@ -67,8 +66,32 @@ int HAL_FlashVars_GetChannelValue(int ch);
 int HAL_GetEnergyMeterStatus(ENERGY_METERING_DATA* data);
 int HAL_SetEnergyMeterStatus(ENERGY_METERING_DATA* data);
 void HAL_FlashVars_SaveTotalConsumption(float total_consumption);
-void HAL_FlashVars_SaveEnergyExport(float f);
-float HAL_FlashVars_GetEnergyExport();
+
+/* ---- Import / Export lifetime totals (NVS keys "eImpTotal", "eExpTotal") ---- */
+void  HAL_FlashVars_SaveEnergyImportTotal(float v);
+float HAL_FlashVars_GetEnergyImportTotal(void);
+void  HAL_FlashVars_SaveEnergyExportTotal(float v);
+float HAL_FlashVars_GetEnergyExportTotal(void);
+
+/* ---- Daily import history (NVS keys "eImpD0".."eImpD3", 0=today) ----------- */
+void  HAL_FlashVars_SaveEnergyImportDaily(int daysAgo, float v);
+float HAL_FlashVars_GetEnergyImportDaily(int daysAgo);
+
+/* ---- Daily export history (NVS keys "eExpD0".."eExpD3", 0=today) ----------- */
+void  HAL_FlashVars_SaveEnergyExportDaily(int daysAgo, float v);
+float HAL_FlashVars_GetEnergyExportDaily(int daysAgo);
+
+/* ---- 12-hour graph matrix persistence ---- */
+/* net_graph = 48 unsigned chars (already encoded as (Wh+150)/2).  */
+/* chg/inv   = 48 ints (0..127).                                    */
+/* idx = last_matrix_index. ts = Unix timestamp of the save.        */
+void HAL_FlashVars_SaveGraphMatrices(unsigned char *net_graph,
+                                     int *chg, int *inv,
+                                     int size, int idx, unsigned int ts);
+/* Returns 1 on success, 0 if NVS had no valid data. */
+int  HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
+                                     int *chg, int *inv,
+                                     int size, int *idx, unsigned int *ts);
 
 #ifdef ENABLE_DRIVER_HLW8112SPI
 void HAL_FlashVars_SaveEnergy(ENERGY_DATA** data, int channel_count);
