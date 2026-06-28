@@ -74,8 +74,8 @@ static int charger_manual_temp = 0;
 static int          divert_user          = 0;
 static int          divert_is_on         = 0;   // last state commanded to the .22 load
 static int          divert_threshold     = 60;  // ON point (Wh), kept >= target_export+10
-static portTickType charger_on_tick      = 0;   // tick the charger last went off->on
 static int          charger_was_running  = 0;
+// charger_on_tick (portTickType) is declared after the FreeRTOS headers below.
 
 #define dump_load_relay_number 6
 /* charger_c_ip removed — charger IPs now configured via setChargerIP1/2 */
@@ -192,6 +192,7 @@ static void divert_send(int on) {
 // export, OFF at <= target_export Wh. AUTO mode additionally requires the
 // charger to be running and 5 s to have elapsed since it went off->on. A user
 // force-on (divert_user 1/2) ignores the charger gate.
+static portTickType charger_on_tick = 0;   // tick the charger last went off->on
 static void evaluate_diversion(void) {
     int charger_running = (dump_load_relay[5] >= 18);
     portTickType now = xTaskGetTickCount();
@@ -1289,7 +1290,9 @@ int http_fn_api_dash(http_request_t *request) {
             jk_bms_data_t d;
             mac = JKBMS_GetMac();
             if (JKBMS_GetData(&d)) {
-                int   soc   = d.soc; if (soc < 0) soc = 0; if (soc > 100) soc = 100;
+                int   soc   = d.soc;
+                if (soc < 0)   soc = 0;
+                if (soc > 100) soc = 100;
                 int   volt  = (int)(d.total_voltage * 100.0f + 0.5f);
                 int   rem   = (int)(d.remaining_ah   * 10.0f + 0.5f);
                 int   full  = (int)(d.full_charge_ah * 10.0f + 0.5f);
@@ -1301,11 +1304,16 @@ int http_fn_api_dash(http_request_t *request) {
                 int   t2    = (int)(d.temp_2      * 10.0f  + (d.temp_2      < 0 ? -0.5f : 0.5f));
                 int   tmos  = (int)(d.temp_mosfet * 10.0f  + (d.temp_mosfet < 0 ? -0.5f : 0.5f));
                 int   bcur  = (int)(d.balance_current * 100.0f + (d.balance_current < 0 ? -0.5f : 0.5f));
-                if (volt < 0) volt = 0; if (volt > 0xFFFF) volt = 0xFFFF;
-                if (rem  < 0) rem  = 0; if (rem  > 0xFFFF) rem  = 0xFFFF;
-                if (full < 0) full = 0; if (full > 0xFFFF) full = 0xFFFF;
-                if (cmin < 0) cmin = 0; if (cmin > 0xFFFF) cmin = 0xFFFF;
-                if (cmax < 0) cmax = 0; if (cmax > 0xFFFF) cmax = 0xFFFF;
+                if (volt < 0) volt = 0;
+                if (volt > 0xFFFF) volt = 0xFFFF;
+                if (rem  < 0) rem  = 0;
+                if (rem  > 0xFFFF) rem  = 0xFFFF;
+                if (full < 0) full = 0;
+                if (full > 0xFFFF) full = 0xFFFF;
+                if (cmin < 0) cmin = 0;
+                if (cmin > 0xFFFF) cmin = 0xFFFF;
+                if (cmax < 0) cmax = 0;
+                if (cmax > 0xFFFF) cmax = 0xFFFF;
 
                 connected = 1;
                 raw[0]  = (unsigned char)((d.charge_enabled?1:0) | (d.discharge_enabled?2:0)
