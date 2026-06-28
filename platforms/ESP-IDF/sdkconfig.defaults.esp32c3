@@ -22,3 +22,6 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # Extra heap for BLE stack (BLE + WiFi together need more RAM)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=5120
+
+# Reduce WiFi TX power from 20dBm to 17dBm
+CONFIG_ESP_PHY_MAX_WIFI_TX_POWER=17
