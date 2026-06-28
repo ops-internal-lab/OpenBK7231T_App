@@ -62,6 +62,22 @@ void JKBMS_AutoStart(void)
     }
 }
 
+/* ---- public: snapshot accessor + MAC ------------------------------------- */
+
+int JKBMS_GetData(jk_bms_data_t *out)
+{
+    if (!out) return 0;
+    if (!jk_bms_is_connected() || !s_has_data) return 0;
+    memcpy(out, &s_data, sizeof(*out));
+    return 1;
+}
+
+const char *JKBMS_GetMac(void)
+{
+    /* Uppercase form for display; matches the hard-coded BLE MAC. */
+    return "C8:47:80:1A:18:B5";
+}
+
 /* ---- /api_bms → JSON ----------------------------------------------------- */
 /*
    Response when not yet connected:

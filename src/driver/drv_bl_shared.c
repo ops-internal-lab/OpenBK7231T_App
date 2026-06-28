@@ -56,8 +56,26 @@ static float export_daily[4] = {0.0f};
 int estimated_energy_period = 0;
 
 // NEW GLOBAL TARGETS
-static int target_export = 20;
-static int target_power = 100;
+static int target_export       = 20;   // export low/OFF point (Wh), global (auto+manual)
+static int target_power_auto   = 100;  // AUTO  : ceiling the loop regulates up to (%)
+static int target_power_manual = 100;  // MANUAL: actual charger output (%)
+
+// Charger AUTO/MANUAL mode. charger_c_auto stays the master "is auto" flag so the
+// existing control logic keeps working; charger_manual_temp marks the temporary
+// (purple) manual that auto-reverts to AUTO at the next 15-minute rollover:
+//   charger_c_auto==1                       -> AUTO            (blue)
+//   charger_c_auto==0 && charger_manual_temp -> MANUAL temp     (purple, reverts)
+//   charger_c_auto==0 && !charger_manual_temp-> MANUAL locked   (red)
+static int charger_manual_temp = 0;
+
+// Diversion (.22 load) overlay. Works the same in AUTO and MANUAL:
+//   divert_user 0 = auto (follow hysteresis), 1 = force-on temp (reverts at rollover),
+//               2 = force-on locked.
+static int          divert_user          = 0;
+static int          divert_is_on         = 0;   // last state commanded to the .22 load
+static int          divert_threshold     = 60;  // ON point (Wh), kept >= target_export+10
+static int          charger_was_running  = 0;
+// charger_on_tick (portTickType) is declared after the FreeRTOS headers below.
 
 #define dump_load_relay_number 6
 /* charger_c_ip removed — charger IPs now configured via setChargerIP1/2 */
@@ -83,9 +101,15 @@ int charger_c_auto = 1;
 #include "drv_ntp.h"
 #include "drv_public.h"
 #include "drv_uart.h"
+#include "../hal/hal_wifi.h"     // HAL_GetMyIPString (for the .22 diversion target)
 #include "../cmnds/cmd_public.h" //for enum EventCode
 #include <math.h>
 #include <time.h>
+
+#ifdef ENABLE_JK_BMS
+#include "drv_jkbms.h"   // JKBMS_GetData / JKBMS_GetMac
+#include "jk_bms.h"      // jk_bms_data_t
+#endif
 
 int stat_updatesSkipped = 0;
 int stat_updatesSent = 0;
@@ -139,6 +163,61 @@ static int safe_int(double v) {
     if (v >  1000000000.0) return  1000000000;
     if (v < -1000000000.0) return -1000000000;
     return (int)v;
+}
+
+// ====================================================================
+// DIVERSION (.22 load) CONTROL
+// ====================================================================
+// Builds "<my-subnet>.22" from the device's own IP and fires a Tasmota
+// Power ON/OFF to it. Fired only on state changes (edges) so the .22
+// device isn't spammed every loop.
+static void divert_send(int on) {
+    const char *myip = HAL_GetMyIPString();
+    char ip[24];
+    char cmd[96];
+    char *last_dot;
+    if (!myip || !*myip) return;
+    strncpy(ip, myip, sizeof(ip) - 1);
+    ip[sizeof(ip) - 1] = '\0';
+    last_dot = strrchr(ip, '.');
+    if (!last_dot) return;
+    *last_dot = '\0';                       // ip now holds the /24 prefix
+    snprintf(cmd, sizeof(cmd),
+             "SendGet http://%s.22/cm?cmnd=Power%%20%s",
+             ip, on ? "ON" : "OFF");
+    CMD_ExecuteCommand(cmd, 0);
+}
+
+// Evaluated every loop. Hysteresis band: turn ON at >= divert_threshold Wh of
+// export, OFF at <= target_export Wh. AUTO mode additionally requires the
+// charger to be running and 5 s to have elapsed since it went off->on. A user
+// force-on (divert_user 1/2) ignores the charger gate.
+static portTickType charger_on_tick = 0;   // tick the charger last went off->on
+static void evaluate_diversion(void) {
+    int charger_running = (dump_load_relay[5] >= 18);
+    portTickType now = xTaskGetTickCount();
+    int want_on;
+
+    if (charger_running && !charger_was_running) charger_on_tick = now;
+    charger_was_running = charger_running;
+
+    if (divert_user >= 1) {
+        want_on = 1;                                    // force-on (temp or locked)
+    } else if (!charger_running) {
+        want_on = 0;                                    // auto needs charger on
+    } else if ((now - charger_on_tick) < (5000 / portTICK_PERIOD_MS)) {
+        want_on = divert_is_on;                         // 5 s grace after charger start
+    } else {
+        int export_wh = -estimated_energy_period;       // +ve when exporting
+        if (export_wh >= divert_threshold)   want_on = 1;
+        else if (export_wh <= target_export) want_on = 0;
+        else                                 want_on = divert_is_on; // inside the band
+    }
+
+    if (want_on != divert_is_on) {
+        divert_is_on = want_on;
+        divert_send(want_on);
+    }
 }
 
 // ====================================================================
@@ -309,16 +388,20 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
 {
     if(args && *args) {
         int val = atoi(args);
-        
-        // Ensure values fall into logic limits
-        if (val > 5 && val < 18) val = 18;
-        if (val > 100) val = 100;
-        
-        target_power = val;
-        
-        // Instant execution if manual
-        if (charger_c_auto == 0) {
-            dump_load_relay[5] = target_power;
+
+        if (charger_c_auto == 1) {
+            // AUTO: this is the ceiling the loop may regulate up to.
+            if (val < 18)  val = 18;
+            if (val > 100) val = 100;
+            target_power_auto = val;
+        } else {
+            // MANUAL: this is the actual charger output, applied instantly.
+            if (val > 5 && val < 18) val = 18;
+            if (val > 100) val = 100;
+            if (val < 0)   val = 0;
+            target_power_manual = val;
+
+            dump_load_relay[5] = target_power_manual;
             /* Fire command to each configured charger IP */
             { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
                 const char *_cip = UART_TCP_GetChargerIP(_ci);
@@ -337,7 +420,45 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
 commandResult_t BL09XX_SetTargetExport(const void *context, const char *cmd, const char *args, int cmdFlags)
 {
     if(args && *args) {
-        target_export = atoi(args);
+        int val = atoi(args);
+        if (val < 0)   val = 0;
+        if (val > 100) val = 100;
+        target_export = val;
+        // Diversion ON point must stay at least 10 Wh above the export level.
+        if (divert_threshold < target_export + 10) divert_threshold = target_export + 10;
+    }
+    return CMD_RES_OK;
+}
+
+// Charger mode: 0 = AUTO, 1 = MANUAL temp (reverts at next rollover), 2 = MANUAL locked.
+commandResult_t BL09XX_SetChargerMode(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int m = (args && *args) ? atoi(args) : 0;
+    if (m == 0)      { charger_c_auto = 1; charger_manual_temp = 0; }
+    else if (m == 1) { charger_c_auto = 0; charger_manual_temp = 1; }
+    else             { charger_c_auto = 0; charger_manual_temp = 0; }
+    return CMD_RES_OK;
+}
+
+// Diversion override: 0 = auto, 1 = force-on temp (reverts at rollover), 2 = force-on locked.
+commandResult_t BL09XX_SetDivertUser(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int u = (args && *args) ? atoi(args) : 0;
+    if (u < 0) u = 0;
+    if (u > 2) u = 2;
+    divert_user = u;
+    return CMD_RES_OK;
+}
+
+// Diversion ON threshold (Wh). Clamped to >= target_export + 10.
+commandResult_t BL09XX_SetDivertThreshold(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) {
+        int v = atoi(args);
+        int floor_v = target_export + 10;
+        if (v < floor_v) v = floor_v;
+        if (v > 255)     v = 255;
+        divert_threshold = v;
     }
     return CMD_RES_OK;
 }
@@ -612,6 +733,16 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 saved_solar_excess = solar_excess;
                 rollover_just_happened = 1;
 
+                // Device-side auto-revert of the "temporary" (purple) overrides:
+                // the temp manual charger mode falls back to AUTO, and a temp
+                // force-on diversion falls back to auto control. Works even if
+                // no browser is connected.
+                if (charger_c_auto == 0 && charger_manual_temp) {
+                    charger_c_auto = 1;
+                    charger_manual_temp = 0;
+                }
+                if (divert_user == 1) divert_user = 0;
+
                 real_export = 0;
                 real_consumption = 0;
                 net_energy = 0;
@@ -720,7 +851,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     
                     persistent_state = 18 + solar_excess;
                     
-                    int active_max = target_power;
+                    int active_max = target_power_auto;
                     if (active_max < 18) active_max = 100;
                     
                     if (persistent_state > active_max) persistent_state = active_max;
@@ -740,6 +871,10 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 }}
             } // END OF AUTO BLOCK
         }
+
+        // Diversion (.22 load) control — evaluated every loop while time is synced
+        // (5 s charger delay + hysteresis handled inside).
+        evaluate_diversion();
     } 
 
     sensors[OBK_VOLTAGE].lastReading = voltage;
@@ -922,6 +1057,9 @@ void BL_Shared_Init(void)
     CMD_RegisterCommand("ToggleAuto", BL09XX_ToggleAuto, NULL);
     CMD_RegisterCommand("SetTargetPower", BL09XX_SetTargetPower, NULL);
     CMD_RegisterCommand("SetTargetExport", BL09XX_SetTargetExport, NULL);
+    CMD_RegisterCommand("SetChargerMode", BL09XX_SetChargerMode, NULL);
+    CMD_RegisterCommand("SetDivertUser", BL09XX_SetDivertUser, NULL);
+    CMD_RegisterCommand("SetDivertThreshold", BL09XX_SetDivertThreshold, NULL);
     CMD_RegisterCommand("VCPPublishThreshold", BL09XX_VCPPublishThreshold, NULL);
     CMD_RegisterCommand("VCPPrecision", BL09XX_VCPPrecision, NULL);
     CMD_RegisterCommand("VCPPublishIntervals", BL09XX_VCPPublishIntervals, NULL);
@@ -955,29 +1093,33 @@ int http_fn_api_dash(http_request_t *request) {
     B("{");
 
     // ---- CORE (default or req=core) ----
-    // Packed binary layout (23 bytes), little-endian, base64-encoded:
+    // Packed binary layout (26 bytes), little-endian, base64-encoded:
     //   bytes 0-1:  voltage   (uint16 ×10,  e.g. 2303 = 230.3 V)
     //   bytes 2-3:  current   (uint16 ×100, e.g. 1500 = 15.00 A)
     //   bytes 4-5:  power     (int16, whole W, signed)
     //   bytes 6-7:  calc_pwr  (int16, whole W, signed)
     //   bytes 8-9:  bal       (int16, whole Wh, signed)
     //   bytes 10-11:est       (int16, whole Wh, signed)
-    //   byte  12:   dmp       (uint8, 0/5/18..100)
-    //   byte  13:   auto      (uint8, 0 or 1)
-    //   byte  14:   t_pwr     (uint8, 0..100)
-    //   byte  15:   t_exp     (uint8, 0..100)
+    //   byte  12:   dmp       (uint8, 0/5/18..100 — current charger output)
+    //   byte  13:   mode      (uint8, 0=AUTO, 1=MANUAL temp, 2=MANUAL locked)
+    //   byte  14:   t_pwr_a   (uint8, 0..100 — AUTO ceiling)
+    //   byte  15:   t_exp     (uint8, 0..100 — export Wh, global)
     //   byte  16:   clk_h     (uint8, 0..23)
     //   byte  17:   clk_m     (uint8, 0..59)
     //   bytes 18-19:loop_ms   (uint16, ms between BL_ProcessUpdate calls)
     //   bytes 20-21:ev        (uint16, energy version counter)
-    //   byte  22:   flags     (uint8, bit0 = has_ntp)
+    //   byte  22:   flags     (uint8, bit0 = has_ntp, bit1 = divert_is_on)
+    //   byte  23:   t_pwr_m   (uint8, 0..100 — MANUAL charger output)
+    //   byte  24:   div_user  (uint8, 0=auto, 1=force-on temp, 2=force-on locked)
+    //   byte  25:   div_thr   (uint8, Wh — diversion ON threshold)
     // chg_v/chg_c/pwr_cls/bal_cls/est_cls are all derived client-side from
     // the values themselves, saving further bytes.
     if (!req_param || strncmp(req_param, "req=core", 8) == 0) {
-        unsigned char raw[23];
-        char          b64[((23 + 2) / 3) * 4 + 1];
+        unsigned char raw[26];
+        char          b64[((26 + 2) / 3) * 4 + 1];
         int           b64_len;
         int           dmp = dump_load_relay[5];
+        int           mode_v = charger_c_auto ? 0 : (charger_manual_temp ? 1 : 2);
 
         unsigned int volt_v  = (unsigned int)(sensors[OBK_VOLTAGE].lastReading * 10.0f  + 0.5f);
         unsigned int curr_v  = (unsigned int)(sensors[OBK_CURRENT].lastReading * 100.0f + 0.5f);
@@ -1013,16 +1155,19 @@ int http_fn_api_dash(http_request_t *request) {
         raw[10] = (unsigned char)((unsigned short)est_v   & 0xFF);
         raw[11] = (unsigned char)(((unsigned short)est_v  >> 8) & 0xFF);
         raw[12] = (unsigned char)(dmp < 0 ? 0 : dmp > 255 ? 255 : dmp);
-        raw[13] = (unsigned char)(charger_c_auto ? 1 : 0);
-        raw[14] = (unsigned char)(target_power  < 0 ? 0 : target_power  > 255 ? 255 : target_power);
-        raw[15] = (unsigned char)(target_export < 0 ? 0 : target_export > 255 ? 255 : target_export);
+        raw[13] = (unsigned char)mode_v;
+        raw[14] = (unsigned char)(target_power_auto   < 0 ? 0 : target_power_auto   > 255 ? 255 : target_power_auto);
+        raw[15] = (unsigned char)(target_export       < 0 ? 0 : target_export       > 255 ? 255 : target_export);
         raw[16] = (unsigned char)NTP_GetHour();
         raw[17] = (unsigned char)NTP_GetMinute();
         raw[18] = (unsigned char)(lms_v  & 0xFF);
         raw[19] = (unsigned char)((lms_v  >> 8) & 0xFF);
         raw[20] = (unsigned char)(ev_v   & 0xFF);
         raw[21] = (unsigned char)((ev_v   >> 8) & 0xFF);
-        raw[22] = (unsigned char)(has_ntp ? 1 : 0);
+        raw[22] = (unsigned char)((has_ntp ? 1 : 0) | (divert_is_on ? 2 : 0));
+        raw[23] = (unsigned char)(target_power_manual < 0 ? 0 : target_power_manual > 255 ? 255 : target_power_manual);
+        raw[24] = (unsigned char)(divert_user < 0 ? 0 : divert_user > 2 ? 2 : divert_user);
+        raw[25] = (unsigned char)(divert_threshold < 0 ? 0 : divert_threshold > 255 ? 255 : divert_threshold);
 
         b64_len = base64_encode(raw, sizeof(raw), b64);
         b64[b64_len] = '\0';
@@ -1031,21 +1176,33 @@ int http_fn_api_dash(http_request_t *request) {
 
     // ---- ENERGY TOTALS (req=energy) ----
     // Packed binary layout (19 bytes), little-endian, base64-encoded:
-    //   byte 0:     pf   (uint8,  value*100, 0.00-1.00)
-    //   bytes 1-4:  econs (uint32, kWh*100)  -- lifetime total consumption
-    //   bytes 5-8:  egen  (uint32, kWh*100)  -- lifetime total generation
-    //   bytes 9-10: clh    (uint16, kWh*100) -- last hour
-    //   bytes 11-12:ctoday (uint16, kWh*100)
-    //   bytes 13-14:cyest  (uint16, kWh*100)
-    //   bytes 15-16:c2d    (uint16, kWh*100)
-    //   bytes 17-18:c3d    (uint16, kWh*100)
-    // The browser divides by 100 and appends " kWh" itself.
+    //   bytes 0-3:   econs  (uint32, kWh*100)  -- lifetime import (consumption)
+    //   bytes 4-7:   egen   (uint32, kWh*100)  -- lifetime export (generation)
+    //   bytes 8-9:   clh    (uint16, kWh*100)  -- import last hour
+    //   bytes 10-11: ctoday (uint16, kWh*100)
+    //   bytes 12-13: cyest  (uint16, kWh*100)
+    //   bytes 14-15: c2d    (uint16, kWh*100)
+    //   bytes 16-17: c3d    (uint16, kWh*100)
+    //   bytes 18-19: elh    (uint16, kWh*100)  -- export last hour
+    //   bytes 20-21: etoday (uint16, kWh*100)
+    //   bytes 22-23: eyest  (uint16, kWh*100)
+    //   bytes 24-25: e2d    (uint16, kWh*100)
+    //   bytes 26-27: e3d    (uint16, kWh*100)
+    // The browser divides by 100 and renders import/export columns itself.
     else if (strncmp(req_param, "req=energy", 10) == 0 && has_ntp) {
-        unsigned char raw[19];
-        char          b64[((19 + 2) / 3) * 4 + 1];
+        unsigned char raw[28];
+        char          b64[((28 + 2) / 3) * 4 + 1];
         int           b64_len;
 
-        float pf_v     = sensors[OBK_POWER_FACTOR].lastReading;
+        /* Export last hour: sum of the last 4 fifteen-minute export slots,
+           mirroring how OBK_CONSUMPTION_LAST_HOUR is built for import. */
+        float elh_wh = 0.0f;
+        { int idx = (last_matrix_index < 0) ? 0 : last_matrix_index, k;
+          for (k = 0; k < 4; k++) {
+              elh_wh += (float)export_matrix[idx];
+              idx = (idx - 1 + MATRIX_SIZE) % MATRIX_SIZE;
+          } }
+
         unsigned long econs_v  = (unsigned long)(0.1 * sensors[OBK_CONSUMPTION_TOTAL].lastReading + 0.5f);
         unsigned long egen_v   = (unsigned long)(0.1 * sensors[OBK_GENERATION_TOTAL].lastReading + 0.5f);
         unsigned int  clh_v    = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading + 0.5f);
@@ -1053,44 +1210,133 @@ int http_fn_api_dash(http_request_t *request) {
         unsigned int  cyest_v  = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_YESTERDAY].lastReading + 0.5f);
         unsigned int  c2d_v    = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading + 0.5f);
         unsigned int  c3d_v    = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading + 0.5f);
-
-        int pf_byte = safe_int(pf_v * 100.0f + 0.5f);
-        if (pf_byte > 255) pf_byte = 255;
-        if (pf_byte < 0)   pf_byte = 0;
+        unsigned int  elh_v    = (unsigned int)(0.1 * elh_wh + 0.5f);
+        unsigned int  etoday_v = (unsigned int)(0.1 * export_daily[0] + 0.5f);
+        unsigned int  eyest_v  = (unsigned int)(0.1 * export_daily[1] + 0.5f);
+        unsigned int  e2d_v    = (unsigned int)(0.1 * export_daily[2] + 0.5f);
+        unsigned int  e3d_v    = (unsigned int)(0.1 * export_daily[3] + 0.5f);
 
         if (clh_v    > 0xFFFF) clh_v    = 0xFFFF;
         if (ctoday_v > 0xFFFF) ctoday_v = 0xFFFF;
         if (cyest_v  > 0xFFFF) cyest_v  = 0xFFFF;
         if (c2d_v    > 0xFFFF) c2d_v    = 0xFFFF;
         if (c3d_v    > 0xFFFF) c3d_v    = 0xFFFF;
+        if (elh_v    > 0xFFFF) elh_v    = 0xFFFF;
+        if (etoday_v > 0xFFFF) etoday_v = 0xFFFF;
+        if (eyest_v  > 0xFFFF) eyest_v  = 0xFFFF;
+        if (e2d_v    > 0xFFFF) e2d_v    = 0xFFFF;
+        if (e3d_v    > 0xFFFF) e3d_v    = 0xFFFF;
 
-        raw[0] = (unsigned char)pf_byte;
-
-        raw[1] = (unsigned char)(econs_v & 0xFF);
-        raw[2] = (unsigned char)((econs_v >> 8) & 0xFF);
-        raw[3] = (unsigned char)((econs_v >> 16) & 0xFF);
-        raw[4] = (unsigned char)((econs_v >> 24) & 0xFF);
-
-        raw[5] = (unsigned char)(egen_v & 0xFF);
-        raw[6] = (unsigned char)((egen_v >> 8) & 0xFF);
-        raw[7] = (unsigned char)((egen_v >> 16) & 0xFF);
-        raw[8] = (unsigned char)((egen_v >> 24) & 0xFF);
-
-        raw[9]  = (unsigned char)(clh_v & 0xFF);
-        raw[10] = (unsigned char)((clh_v >> 8) & 0xFF);
-        raw[11] = (unsigned char)(ctoday_v & 0xFF);
-        raw[12] = (unsigned char)((ctoday_v >> 8) & 0xFF);
-        raw[13] = (unsigned char)(cyest_v & 0xFF);
-        raw[14] = (unsigned char)((cyest_v >> 8) & 0xFF);
-        raw[15] = (unsigned char)(c2d_v & 0xFF);
-        raw[16] = (unsigned char)((c2d_v >> 8) & 0xFF);
-        raw[17] = (unsigned char)(c3d_v & 0xFF);
-        raw[18] = (unsigned char)((c3d_v >> 8) & 0xFF);
+        raw[0]  = (unsigned char)(econs_v & 0xFF);
+        raw[1]  = (unsigned char)((econs_v >> 8) & 0xFF);
+        raw[2]  = (unsigned char)((econs_v >> 16) & 0xFF);
+        raw[3]  = (unsigned char)((econs_v >> 24) & 0xFF);
+        raw[4]  = (unsigned char)(egen_v & 0xFF);
+        raw[5]  = (unsigned char)((egen_v >> 8) & 0xFF);
+        raw[6]  = (unsigned char)((egen_v >> 16) & 0xFF);
+        raw[7]  = (unsigned char)((egen_v >> 24) & 0xFF);
+        raw[8]  = (unsigned char)(clh_v & 0xFF);
+        raw[9]  = (unsigned char)((clh_v >> 8) & 0xFF);
+        raw[10] = (unsigned char)(ctoday_v & 0xFF);
+        raw[11] = (unsigned char)((ctoday_v >> 8) & 0xFF);
+        raw[12] = (unsigned char)(cyest_v & 0xFF);
+        raw[13] = (unsigned char)((cyest_v >> 8) & 0xFF);
+        raw[14] = (unsigned char)(c2d_v & 0xFF);
+        raw[15] = (unsigned char)((c2d_v >> 8) & 0xFF);
+        raw[16] = (unsigned char)(c3d_v & 0xFF);
+        raw[17] = (unsigned char)((c3d_v >> 8) & 0xFF);
+        raw[18] = (unsigned char)(elh_v & 0xFF);
+        raw[19] = (unsigned char)((elh_v >> 8) & 0xFF);
+        raw[20] = (unsigned char)(etoday_v & 0xFF);
+        raw[21] = (unsigned char)((etoday_v >> 8) & 0xFF);
+        raw[22] = (unsigned char)(eyest_v & 0xFF);
+        raw[23] = (unsigned char)((eyest_v >> 8) & 0xFF);
+        raw[24] = (unsigned char)(e2d_v & 0xFF);
+        raw[25] = (unsigned char)((e2d_v >> 8) & 0xFF);
+        raw[26] = (unsigned char)(e3d_v & 0xFF);
+        raw[27] = (unsigned char)((e3d_v >> 8) & 0xFF);
 
         b64_len = base64_encode(raw, sizeof(raw), b64);
         b64[b64_len] = '\0';
 
         B("\"e\":\"%s\",\"ev\":%d", b64, energy_version);
+    }
+
+    // ---- BMS (req=bms) ----
+    // {"b":"<base64 23 bytes>","mac":"AA:BB:.."}  -- iOS-5 safe (XHR + base64).
+    // Packed layout (23 bytes), little-endian:
+    //   byte 0:     flags (bit0 chg, bit1 dis, bit2 bal, bit3 connected)
+    //   byte 1:     soc (0..100)
+    //   bytes 2-3:  voltage   (uint16 ×100)
+    //   bytes 4-5:  current   (int16  ×100, signed)
+    //   bytes 6-7:  remaining (uint16 ×10, Ah)
+    //   bytes 8-9:  full      (uint16 ×10, Ah)
+    //   bytes 10-11:cell_min  (uint16 ×1000, V)
+    //   bytes 12-13:cell_max  (uint16 ×1000, V)
+    //   bytes 14-15:temp_1    (int16  ×10, signed)
+    //   bytes 16-17:temp_2    (int16  ×10, signed)
+    //   bytes 18-19:temp_mos  (int16  ×10, signed)
+    //   bytes 20-21:bal_curr  (int16  ×100, signed)
+    //   byte 22:    cell_count
+    else if (req_param && strncmp(req_param, "req=bms", 7) == 0) {
+        unsigned char raw[23];
+        char          b64[((23 + 2) / 3) * 4 + 1];
+        int           b64_len, connected = 0;
+        const char   *mac = "--";
+
+        memset(raw, 0, sizeof(raw));
+#ifdef ENABLE_JK_BMS
+        {
+            jk_bms_data_t d;
+            mac = JKBMS_GetMac();
+            if (JKBMS_GetData(&d)) {
+                int   soc   = d.soc;
+                if (soc < 0)   soc = 0;
+                if (soc > 100) soc = 100;
+                int   volt  = (int)(d.total_voltage * 100.0f + 0.5f);
+                int   rem   = (int)(d.remaining_ah   * 10.0f + 0.5f);
+                int   full  = (int)(d.full_charge_ah * 10.0f + 0.5f);
+                int   cmin  = (int)(d.cell_min * 1000.0f + 0.5f);
+                int   cmax  = (int)(d.cell_max * 1000.0f + 0.5f);
+                /* signed values: round away from zero so negatives are correct */
+                int   curr  = (int)(d.current     * 100.0f + (d.current     < 0 ? -0.5f : 0.5f));
+                int   t1    = (int)(d.temp_1      * 10.0f  + (d.temp_1      < 0 ? -0.5f : 0.5f));
+                int   t2    = (int)(d.temp_2      * 10.0f  + (d.temp_2      < 0 ? -0.5f : 0.5f));
+                int   tmos  = (int)(d.temp_mosfet * 10.0f  + (d.temp_mosfet < 0 ? -0.5f : 0.5f));
+                int   bcur  = (int)(d.balance_current * 100.0f + (d.balance_current < 0 ? -0.5f : 0.5f));
+                if (volt < 0) volt = 0;
+                if (volt > 0xFFFF) volt = 0xFFFF;
+                if (rem  < 0) rem  = 0;
+                if (rem  > 0xFFFF) rem  = 0xFFFF;
+                if (full < 0) full = 0;
+                if (full > 0xFFFF) full = 0xFFFF;
+                if (cmin < 0) cmin = 0;
+                if (cmin > 0xFFFF) cmin = 0xFFFF;
+                if (cmax < 0) cmax = 0;
+                if (cmax > 0xFFFF) cmax = 0xFFFF;
+
+                connected = 1;
+                raw[0]  = (unsigned char)((d.charge_enabled?1:0) | (d.discharge_enabled?2:0)
+                                          | (d.balancer_enabled?4:0) | 8 /*connected*/);
+                raw[1]  = (unsigned char)soc;
+                raw[2]  = (unsigned char)(volt & 0xFF);   raw[3]  = (unsigned char)((volt >> 8) & 0xFF);
+                raw[4]  = (unsigned char)(curr & 0xFF);   raw[5]  = (unsigned char)((curr >> 8) & 0xFF);
+                raw[6]  = (unsigned char)(rem & 0xFF);    raw[7]  = (unsigned char)((rem >> 8) & 0xFF);
+                raw[8]  = (unsigned char)(full & 0xFF);   raw[9]  = (unsigned char)((full >> 8) & 0xFF);
+                raw[10] = (unsigned char)(cmin & 0xFF);   raw[11] = (unsigned char)((cmin >> 8) & 0xFF);
+                raw[12] = (unsigned char)(cmax & 0xFF);   raw[13] = (unsigned char)((cmax >> 8) & 0xFF);
+                raw[14] = (unsigned char)(t1 & 0xFF);     raw[15] = (unsigned char)((t1 >> 8) & 0xFF);
+                raw[16] = (unsigned char)(t2 & 0xFF);     raw[17] = (unsigned char)((t2 >> 8) & 0xFF);
+                raw[18] = (unsigned char)(tmos & 0xFF);   raw[19] = (unsigned char)((tmos >> 8) & 0xFF);
+                raw[20] = (unsigned char)(bcur & 0xFF);   raw[21] = (unsigned char)((bcur >> 8) & 0xFF);
+                raw[22] = (unsigned char)(d.cell_count & 0xFF);
+            }
+        }
+#endif
+        (void)connected;
+        b64_len = base64_encode(raw, sizeof(raw), b64);
+        b64[b64_len] = '\0';
+        B("\"b\":\"%s\",\"mac\":\"%s\"", b64, mac);
     }
 
     // ---- GRAPH ARRAYS (req=net | req=chginv) ----
