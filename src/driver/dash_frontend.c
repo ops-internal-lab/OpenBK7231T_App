@@ -18,7 +18,7 @@ int http_fn_custom_dash(http_request_t *request) {
         poststr(request, "HTTP/1.1 200 OK\r\n");
         poststr(request, "Content-Type: text/html\r\n");
         poststr(request, "Content-Encoding: gzip\r\n");
-        poststr(request, "Cache-Control: max-age=86400\r\n");
+        poststr(request, "Cache-Control: no-cache, no-store, must-revalidate\r\n");
         poststr(request, "Connection: close\r\n");
         poststr(request, "\r\n");
         postany(request, (const char*)g_dashGz, DASH_GZ_LEN);
