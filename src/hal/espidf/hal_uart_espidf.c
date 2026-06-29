@@ -16,9 +16,12 @@
 /* Active TCP socket (-1 = hardware UART mode) */
 static int s_tcp_sock = -1;
 /* Guard against spawning uart_event_task more than once.
-   Guarded by a portENTER_CRITICAL section on every write; reads are
-   in the same critical section so no torn read on dual-core ESP32. */
-static volatile int s_task_started = 0;
+   portMUX_TYPE spinlock required by both Xtensa and RISC-V (C3/C6) ports:
+   - Xtensa: portENTER_CRITICAL(&mux) disables interrupts + takes spinlock
+   - RISC-V: portENTER_CRITICAL(&mux) disables interrupts (mux is accepted
+     but internally unused on single-core C3) */
+static volatile int  s_task_started    = 0;
+static portMUX_TYPE  s_task_start_mux  = portMUX_INITIALIZER_UNLOCKED;
 
 #ifdef CONFIG_IDF_TARGET_ESP32C6
 #define RX1_PIN GPIO_NUM_7
@@ -158,13 +161,13 @@ int HAL_UART_Init(int baud, int parity, bool hwflowc, int txOverride, int rxOver
 		   Stack 4096 bytes — 1024 was too small and caused stack overflow
 		   panics (ESP_RST_PANIC=4) once logging ran inside the task.
 		   Priority 5 — was 16 which starved HTTP threads (slow web UI). */
-		taskENTER_CRITICAL();
+		taskENTER_CRITICAL(&s_task_start_mux);
 		if (!s_task_started) {
 			s_task_started = 1;
-			taskEXIT_CRITICAL();
+			taskEXIT_CRITICAL(&s_task_start_mux);
 			xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 5, NULL);
 		} else {
-			taskEXIT_CRITICAL();
+			taskEXIT_CRITICAL(&s_task_start_mux);
 		}
 		return 1;
 	}
@@ -214,13 +217,13 @@ int HAL_UART_Init(int baud, int parity, bool hwflowc, int txOverride, int rxOver
 #endif
 	if (!s_task_started) {
 		/* Same rationale as TCP path: 4096 bytes stack, priority 5. */
-		taskENTER_CRITICAL();
+		taskENTER_CRITICAL(&s_task_start_mux);
 		if (!s_task_started) {
 			s_task_started = 1;
-			taskEXIT_CRITICAL();
+			taskEXIT_CRITICAL(&s_task_start_mux);
 			xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 5, NULL);
 		} else {
-			taskEXIT_CRITICAL();
+			taskEXIT_CRITICAL(&s_task_start_mux);
 		}
 	}
 	return 1;
