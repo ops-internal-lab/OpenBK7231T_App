@@ -86,6 +86,31 @@ static int dump_load_relay[dump_load_relay_number] = {0};
 static int last_matrix_index = -1; 
 int charger_c_auto = 1;
 
+// ====================================================================
+// LOCAL GPIO / PWM ACTUATION  (ESP32-C3 hardware — replaces SendGet)
+// ====================================================================
+#define GPIO_CHARGER_ENABLE     4        // charger enable (digital output, active HIGH)
+#define GPIO_CHARGER_PWM        2        // charger duty   (LEDC PWM, 8-bit, 1 kHz)
+#define GPIO_RELAY_ECON         0        // relay economiser (LEDC PWM, 8-bit)
+
+#define LEDC_CH_CHARGER         4        // LEDC channel for GPIO2
+#define LEDC_CH_RELAY           5        // LEDC channel for GPIO0
+#define LEDC_TIMER_ACTUATION    1        // LEDC timer index (0 may be used by OBK)
+#define LEDC_FREQ_HZ_ACT        1000
+#define LEDC_RES_ACT            LEDC_TIMER_8_BIT
+
+#define RELAY_ECON_DUTY_FULL    255      // 100 % — initial relay pull-in
+#define RELAY_ECON_DUTY_HOLD    204      // ~80 % — economiser hold (204/255 ≈ 80.4 %)
+#define RELAY_ECON_PULSE_MS     500      // ms at 100 % before dropping to hold
+
+// Shadow variables — last duty written to each output (available for debug/MQTT)
+static int charger_pwm      = 0;   // 0-255, mirrors GPIO2
+static int relay_economiser = 0;   // 0 / RELAY_ECON_DUTY_HOLD / RELAY_ECON_DUTY_FULL, mirrors GPIO0
+
+// Economiser edge-detection state (persistent across ApplyDumpLoadGPIO calls)
+static int          inverter_was_active  = 0;
+static portTickType inverter_engage_tick = 0;
+
 #include "drv_bl_shared.h"
 
 #include "../new_cfg.h"
@@ -106,6 +131,10 @@ int charger_c_auto = 1;
 #include "../cmnds/cmd_public.h" //for enum EventCode
 #include <math.h>
 #include <time.h>
+#if PLATFORM_ESPIDF
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#endif
 
 #ifdef ENABLE_JK_BMS
 #include "drv_jkbms.h"   // JKBMS_GetData / JKBMS_GetMac
@@ -362,6 +391,85 @@ commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, 
     return CMD_RES_OK;
 }
 
+// ====================================================================
+// ApplyDumpLoadGPIO — single actuation point for all three call sites
+// ====================================================================
+// state <  3          : everything off  (GPIO4 LOW, GPIO2 duty 0, GPIO0 duty 0)
+// state  3..5         : inverter on     (GPIO4 LOW, GPIO2 0,
+//                                        GPIO0 100% for 500ms then 80% hold)
+//                       Pulse fires only on the 0→active rising edge.
+//                       If state remains inverter-active, holds at 80%.
+// state  18..100      : charger on      (GPIO4 HIGH, GPIO2 PWM 0-255, GPIO0 0)
+//                       Duty scaled linearly: 18→0, 100→255.
+//
+// charger_pwm and relay_economiser are updated to reflect what was last
+// written to hardware (shadow state, useful for diagnostics).
+static void ApplyDumpLoadGPIO(int state)
+{
+#if PLATFORM_ESPIDF
+    int inverter_active = (state >= 3 && state <= 5);
+    int charger_active  = (state >= 18);
+    portTickType now    = xTaskGetTickCount();
+
+    if (charger_active) {
+        // ----- CHARGER MODE -----
+        int duty = ((state - 18) * 255) / 82;
+        if (duty < 0)   duty = 0;
+        if (duty > 255) duty = 255;
+
+        gpio_set_level(GPIO_CHARGER_ENABLE, 1);
+
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, (uint32_t)duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
+
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+
+        charger_pwm         = duty;
+        relay_economiser    = 0;
+        inverter_was_active = 0;
+
+    } else if (inverter_active) {
+        // ----- INVERTER MODE -----
+        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
+        charger_pwm = 0;
+
+        if (!inverter_was_active) {
+            // Rising edge (0 → active): start 100 % pull-in pulse
+            inverter_engage_tick = now;
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_FULL);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+            relay_economiser = RELAY_ECON_DUTY_FULL;
+        } else if ((now - inverter_engage_tick) >= (RELAY_ECON_PULSE_MS / portTICK_PERIOD_MS)) {
+            // 500 ms elapsed: drop to economiser hold duty
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_HOLD);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+            relay_economiser = RELAY_ECON_DUTY_HOLD;
+        }
+        // else: still within 500 ms window — LEDC retains FULL duty, no write needed
+
+        inverter_was_active = 1;
+
+    } else {
+        // ----- OFF (state == 0, 1, or 2) -----
+        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
+
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+
+        charger_pwm         = 0;
+        relay_economiser    = 0;
+        inverter_was_active = 0;
+    }
+#endif
+}
+
 commandResult_t BL09XX_SetDumpLoad(const void *context, const char *cmd, const char *args, int cmdFlags)
 {
     if (charger_c_auto == 1) return CMD_RES_OK; 
@@ -381,6 +489,7 @@ commandResult_t BL09XX_SetDumpLoad(const void *context, const char *cmd, const c
                      _cip, dump_load_relay[5]);
             //CMD_ExecuteCommand(fallback_cmd, 0);
         }}
+        ApplyDumpLoadGPIO(dump_load_relay[5]);
     }
     return CMD_RES_OK;
 }
@@ -413,6 +522,7 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
                          _cip, dump_load_relay[5]);
                // CMD_ExecuteCommand(fallback_cmd, 0);
             }}
+            ApplyDumpLoadGPIO(dump_load_relay[5]);
         }
     }
     return CMD_RES_OK;
@@ -870,6 +980,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                              _cip, dump_load_relay[5]);
                   //  CMD_ExecuteCommand(fallback_cmd, 0);
                 }}
+                ApplyDumpLoadGPIO(dump_load_relay[5]);
             } // END OF AUTO BLOCK
         }
 
@@ -1052,6 +1163,61 @@ void BL_Shared_Init(void)
         }
         /* If load failed: matrices stay zero-init — correct for a fresh start */
     }
+
+#if PLATFORM_ESPIDF
+    // ---- GPIO / LEDC hardware init (charger enable + relay economiser outputs) ----
+    {
+        // GPIO4 — charger enable (digital output, start LOW / disabled)
+        gpio_config_t io_conf;
+        memset(&io_conf, 0, sizeof(io_conf));
+        io_conf.pin_bit_mask = (1ULL << GPIO_CHARGER_ENABLE);
+        io_conf.mode         = GPIO_MODE_OUTPUT;
+        io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.intr_type    = GPIO_INTR_DISABLE;
+        gpio_config(&io_conf);
+        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+
+        // Shared LEDC timer: 1 kHz, 8-bit resolution
+        ledc_timer_config_t tmr;
+        memset(&tmr, 0, sizeof(tmr));
+        tmr.speed_mode      = LEDC_LOW_SPEED_MODE;
+        tmr.timer_num       = LEDC_TIMER_ACTUATION;
+        tmr.duty_resolution = LEDC_RES_ACT;
+        tmr.freq_hz         = LEDC_FREQ_HZ_ACT;
+        tmr.clk_cfg         = LEDC_AUTO_CLK;
+        ledc_timer_config(&tmr);
+
+        // GPIO2 — charger PWM (LEDC channel 4, starts at 0)
+        ledc_channel_config_t ch_chg;
+        memset(&ch_chg, 0, sizeof(ch_chg));
+        ch_chg.gpio_num   = GPIO_CHARGER_PWM;
+        ch_chg.speed_mode = LEDC_LOW_SPEED_MODE;
+        ch_chg.channel    = LEDC_CH_CHARGER;
+        ch_chg.timer_sel  = LEDC_TIMER_ACTUATION;
+        ch_chg.duty       = 0;
+        ch_chg.hpoint     = 0;
+        ch_chg.intr_type  = LEDC_INTR_DISABLE;
+        ledc_channel_config(&ch_chg);
+
+        // GPIO0 — relay economiser PWM (LEDC channel 5, starts at 0)
+        ledc_channel_config_t ch_rel;
+        memset(&ch_rel, 0, sizeof(ch_rel));
+        ch_rel.gpio_num   = GPIO_RELAY_ECON;
+        ch_rel.speed_mode = LEDC_LOW_SPEED_MODE;
+        ch_rel.channel    = LEDC_CH_RELAY;
+        ch_rel.timer_sel  = LEDC_TIMER_ACTUATION;
+        ch_rel.duty       = 0;
+        ch_rel.hpoint     = 0;
+        ch_rel.intr_type  = LEDC_INTR_DISABLE;
+        ledc_channel_config(&ch_rel);
+
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "GPIO actuation init: enable=GPIO%d, chargerPWM=GPIO%d ch%d, relay=GPIO%d ch%d\n",
+                  GPIO_CHARGER_ENABLE, GPIO_CHARGER_PWM, LEDC_CH_CHARGER,
+                  GPIO_RELAY_ECON, LEDC_CH_RELAY);
+    }
+#endif
 
     CMD_RegisterCommand("SetDumpLoad", BL09XX_SetDumpLoad, NULL);
     CMD_RegisterCommand("EnergyCntReset", BL09XX_ResetEnergyCounter, NULL);
