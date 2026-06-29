@@ -287,7 +287,6 @@ int http_fn_custom_dash(http_request_t *request) {
         "<div class='cfg-head'><span>Cut-off Voltage</span><span class='cfg-x' onclick='toggleBatCfg()'>&#x2715;</span></div>"
         "<div class='sld-block'><label>Charger cut (<span id='lbl-cv'>4.00</span> V)</label><input type='range' id='sld-cv' min='360' max='400' value='400' oninput='bvIn(\"cv\",this.value)' onchange='s_cv(this.value)'></div>"
         "<div class='sld-block'><label>Inverter cut (<span id='lbl-iv'>3.30</span> V)</label><input type='range' id='sld-iv' min='330' max='380' value='330' oninput='bvIn(\"iv\",this.value)' onchange='s_iv(this.value)'></div>"
-        "<div class='sld-block'><label>BMS MAC</label><input class='t-inp' type='text' id='inp-mac' maxlength='17' placeholder='AA:BB:CC:DD:EE:FF' onchange='s_mac(this.value)' style='width:100%;letter-spacing:1px;'></div>"
         "</div>"
         "<div class='gauge'>"
         "<svg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'>"
@@ -484,14 +483,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "function t_inv2(){inv2On=!inv2On;if(inv2IP)cmd('/cm?cmnd=SetInv2%20'+(inv2On?1:0),null,0);btnColor();}"
         "function t_chg(){if(mode===0)return;setDump(dmp>=18?0:18);}"
         "function toggleSnsCfg(){var p=document.getElementById('sns-pop');if(p)p.style.display=(p.style.display==='none')?'block':'none';}"
-        "function s_mac(v){bmsMAC=v;try{localStorage.setItem('bmsMAC',v);}catch(e2){}if(v)cmd('/cm?cmnd=SetBmsMAC%20'+encodeURIComponent(v),null,0);}"
-        "function s_mip(n,v){mips[n-1]=v;try{localStorage.setItem('mip'+n,v);}catch(e){}if(v)cmd('/cm?cmnd=SetMeterIP%20'+n+'%20'+v,null,0);}"
-        "function s_inv2ip(v){inv2IP=v;try{localStorage.setItem('inv2IP',v);}catch(e){}if(v)cmd('/cm?cmnd=SetInv2IP%20'+v,null,0);}"
-        "function s_bypip(v){bypIP=v;try{localStorage.setItem('bypIP',v);}catch(e){}if(v)cmd('/cm?cmnd=SetBypassIP%20'+v,null,0);}"
-        "function loadCfg(){try{"
-        "var m=localStorage.getItem('bmsMAC');if(m){bmsMAC=m;setV('inp-mac',m);}"
-        "var i2=localStorage.getItem('inv2IP');if(i2){inv2IP=i2;setV('inp-inv2-ip',i2);}"
-        "var by=localStorage.getItem('bypIP');if(by){bypIP=by;setV('inp-byp-ip',by);}"
+
 
     );
     rtos_delay_milliseconds(1);
@@ -621,7 +613,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "bh=b.clientHeight;ch=0;"
         "for(j=0;j<b.childNodes.length;j++){nd=b.childNodes[j];if(nd.nodeType===1)ch+=nd.offsetHeight||0;}"
         "if(bh>ch+2){p=Math.floor((bh-ch)/2)+'px';b.style.paddingTop=p;b.style.paddingBottom=p;}}"
-        "initGrid();loadAll();setInterval(runCycle,10000);fit();fixBtns();loadCfg();window.onresize=function(){fit();fixBtns();};setTimeout(function(){fit();fixBtns();},350);"
+        "initGrid();loadAll();setInterval(runCycle,10000);fit();fixBtns();btnColor();loadCfg();window.onresize=function(){fit();fixBtns();};setTimeout(function(){fit();fixBtns();},350);"
         "</script></body></html>"
     );
     rtos_delay_milliseconds(1);
