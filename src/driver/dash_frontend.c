@@ -36,17 +36,18 @@ int http_fn_custom_dash(http_request_t *request) {
         "<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>"
         "<title>My Dashboard</title>"
         "<style>"
-        "html,body{height:100%;margin:0;background:#000;}"
-        "#dash-container{max-width:1200px;width:100%;margin:0 auto;min-height:100%;min-height:100vh;background:#121212;padding:10px 20px 20px;-webkit-box-sizing:border-box;box-sizing:border-box;font-family:-apple-system,sans-serif;color:#eee;position:relative;}"
-        ".top-stats{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;-webkit-box-pack:justify;display:-webkit-flex;display:flex;-webkit-justify-content:space-between;justify-content:space-between;-webkit-align-items:center;align-items:center;background:#222;padding:18px;border-radius:8px;text-align:center;margin-top:15px;width:100%;-webkit-box-sizing:border-box;box-sizing:border-box;white-space:nowrap;}"
-        ".top-stats div{display:-webkit-box;-webkit-box-orient:vertical;-webkit-box-align:stretch;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;-webkit-justify-content:center;justify-content:center;margin:0 10px;}"
-        ".top-stats label{color:#888;font-size:20px;text-transform:uppercase;margin-bottom:6px;display:block;}"
-        ".top-stats b{font-size:38px;font-weight:600;}"
+        "html,body{height:100%;margin:0;background:#0b0b0b;overflow:hidden;}"
+        "#scaler{position:absolute;top:50%;left:50%;-webkit-transform-origin:center center;transform-origin:center center;-webkit-transform:translate(-50%,-50%);transform:translate(-50%,-50%);}"
+        "#dash-container{width:980px;background:#121212;padding:12px 14px 14px;-webkit-box-sizing:border-box;box-sizing:border-box;font-family:-apple-system,sans-serif;color:#eee;position:relative;border-radius:10px;}"
+        ".top-stats{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;-webkit-box-pack:justify;display:-webkit-flex;display:flex;-webkit-justify-content:space-between;justify-content:space-between;-webkit-align-items:center;align-items:center;background:#222;padding:12px 16px;border-radius:8px;text-align:center;width:100%;-webkit-box-sizing:border-box;box-sizing:border-box;white-space:nowrap;}"
+        ".top-stats div{display:-webkit-box;-webkit-box-orient:vertical;-webkit-box-align:stretch;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;-webkit-justify-content:center;justify-content:center;margin:0 6px;}"
+        ".top-stats label{color:#888;font-size:13px;text-transform:uppercase;margin-bottom:4px;display:block;}"
+        ".top-stats b{font-size:28px;font-weight:600;}"
         ".c-exp{color:#4caf50;}.c-imp{color:#f44336;}"
-        ".dash-row{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:start;display:-webkit-flex;display:flex;margin-top:15px;-webkit-align-items:flex-start;align-items:flex-start;}"
-        ".left-col{-webkit-box-flex:0;-webkit-flex:0 0 250px;flex:0 0 250px;width:250px;background:#222;padding:12px 14px;border-radius:8px;margin-right:15px;-webkit-box-sizing:border-box;box-sizing:border-box;}"
+        ".dash-row{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:stretch;display:-webkit-flex;display:flex;margin-top:12px;-webkit-align-items:stretch;align-items:stretch;}"
+        ".left-col{-webkit-box-flex:0;-webkit-flex:0 0 231px;flex:0 0 231px;width:231px;background:#222;padding:12px 14px;border-radius:8px;margin-right:14px;-webkit-box-sizing:border-box;box-sizing:border-box;}"
         ".center-col{-webkit-box-flex:1;-webkit-flex:1;flex:1;display:-webkit-box;-webkit-box-orient:vertical;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;min-width:0;}"
-        ".right-col{-webkit-box-flex:0;-webkit-flex:0 0 210px;flex:0 0 210px;width:210px;margin-left:15px;display:-webkit-box;-webkit-box-orient:vertical;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;-webkit-box-sizing:border-box;box-sizing:border-box;}"
+        ".right-col{-webkit-box-flex:0;-webkit-flex:0 0 214px;flex:0 0 214px;width:214px;margin-left:14px;display:-webkit-box;-webkit-box-orient:vertical;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;-webkit-box-sizing:border-box;box-sizing:border-box;}"
     );
     rtos_delay_milliseconds(1);
 
@@ -57,21 +58,25 @@ int http_fn_custom_dash(http_request_t *request) {
         ".reserved{height:46px;border:1px dashed #333;border-radius:6px;}"
         ".etbl{width:100%;border-collapse:collapse;font-size:14px;}"
         ".etbl th{font-size:10px;color:#888;font-weight:600;text-transform:uppercase;letter-spacing:.4px;padding:0 0 6px;border-bottom:1px solid #333;text-align:right;}"
-        ".etbl th.nm{text-align:left;}"
+        ".etbl th.nm{text-align:left;line-height:1.15;vertical-align:top;}"
+        ".etbl td.nm{font-size:12px;}"
         ".etbl td{padding:6px 0;border-bottom:1px solid #2c2c2c;color:#cfcfcf;}"
         ".etbl td.num{text-align:right;font-family:'Courier New',monospace;font-weight:bold;font-size:13px;width:60px;}"
-        ".imp{color:#D97757;}.exp{color:#4caf50;}"
+        ".etbl td.imp{color:#D97757;}.etbl td.exp{color:#37d67a;}"
         ".unit{font-size:9px;color:#666;}"
         ".etbl tr.tot td{border-bottom:none;border-top:1px solid #444;padding-top:8px;font-weight:bold;}"
         ".etbl tr.tot td.nm{color:#fff;text-transform:uppercase;font-size:12px;}"
-        ".leg-box{margin-top:18px;font-size:14px;color:#eee;padding:15px;background:#1a1a1a;border-radius:6px;border:1px solid #333;}"
-        ".leg-row{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;margin-bottom:10px;}"
-        ".leg-swatch{display:inline-block;width:18px;height:4px;margin-right:12px;}"
+        ".etbl tr.tot td.num{font-size:11px;}"
+        ".leg-h{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-pack:center;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-justify-content:center;justify-content:center;-webkit-align-items:center;align-items:center;margin-top:10px;font:12px sans-serif;color:#aaa;}"
+        ".leg-i{display:-webkit-box;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;margin:0 14px;}"
+        ".leg-sw{display:inline-block;width:18px;height:4px;margin-right:8px;}"
         ".graph-col{-webkit-box-flex:0;-webkit-flex:0 0 auto;flex:0 0 auto;background:#222;padding:15px;border-radius:8px;display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:center;justify-content:center;-webkit-box-sizing:border-box;box-sizing:border-box;overflow:hidden;}"
         "canvas{width:100%;max-width:592px;height:auto;display:block;margin:0 auto;}"
-        ".clk-row{background:#222;border-radius:8px;padding:12px 25px;margin-top:15px;display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:center;justify-content:center;-webkit-box-sizing:border-box;box-sizing:border-box;}"
-        ".clk-text{display:-webkit-box;-webkit-box-orient:vertical;-webkit-box-align:start;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;-webkit-align-items:flex-start;align-items:flex-start;margin-left:18px;}"
-        "#d-clk{font-size:100px;font-weight:bold;color:#09F;font-family:monospace;line-height:1;letter-spacing:-4px;}"
+        ".clk-row{-webkit-box-flex:1;-webkit-flex:1;flex:1;background:#222;border-radius:8px;padding:6px 12px;margin-top:14px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-box-align:center;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;-webkit-align-items:center;align-items:center;-webkit-justify-content:center;justify-content:center;-webkit-box-sizing:border-box;box-sizing:border-box;}"
+        ".clk-text{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:baseline;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-flex-direction:row;flex-direction:row;-webkit-align-items:baseline;align-items:baseline;-webkit-justify-content:center;justify-content:center;margin-top:6px;font-size:19px;color:#ccc;}"
+        ".clk-text #d-day{font-weight:bold;color:#fff;}"
+        ".clk-text #d-date{margin-left:9px;color:#aaa;}"
+        "#d-clk{font-size:144px;font-weight:bold;color:#09F;font-family:monospace;line-height:1;letter-spacing:-6px;}"
         "#d-day{font-size:20px;font-weight:600;color:#eee;text-transform:uppercase;letter-spacing:1px;}"
         "#d-date{font-size:14px;color:#888;}"
         ".close-btn{position:absolute;top:10px;right:15px;font-size:16px;color:#666;cursor:pointer;z-index:10;}"
@@ -80,7 +85,13 @@ int http_fn_custom_dash(http_request_t *request) {
 
     // --- CSS part 3: battery gauge + tempblock ---
     poststr(request,
-        ".batt{background:#11161e;border:1px solid #222d3b;border-radius:8px;padding:10px 10px 12px;}"
+        ".batt{background:#11161e;border:1px solid #222d3b;border-radius:8px;padding:10px 10px 12px;position:relative;}"
+        ".bat-gear{position:absolute;top:33px;right:8px;width:30px;height:30px;background:#2a2d31;border:none;border-radius:6px;cursor:pointer;display:-webkit-box;-webkit-box-pack:center;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-justify-content:center;justify-content:center;-webkit-align-items:center;align-items:center;z-index:6;}"
+        ".bat-gear svg{width:17px;height:17px;stroke:#cfd6dd;}"
+        ".cd-side{position:absolute;bottom:4px;}"
+        ".cd-l{left:2px;}"
+        ".cd-r{right:2px;}"
+        ".bat-pop{position:absolute;left:10px;right:10px;top:67px;background:#0c1118;border:1px solid #2a3a4d;border-radius:8px;padding:10px 12px 4px;z-index:7;-webkit-box-sizing:border-box;box-sizing:border-box;}"
         ".batt-head{text-align:center;margin-bottom:6px;}"
         ".batt-head h1{font-size:13px;font-weight:700;color:#e7eef6;font-family:'Courier New',monospace;letter-spacing:.5px;margin:0;}"
         ".gauge{position:relative;width:188px;height:188px;margin:0 auto 8px;}"
@@ -120,8 +131,8 @@ int http_fn_custom_dash(http_request_t *request) {
 
     // --- CSS part 4: button box + sliders ---
     poststr(request,
-        ".btn-box{-webkit-box-flex:0;-webkit-flex:0 0 auto;flex:0 0 auto;background:#222;border-radius:8px;padding:14px;margin-top:15px;position:relative;-webkit-box-sizing:border-box;box-sizing:border-box;}"
-        ".btn-grid{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:stretch;display:-webkit-flex;display:flex;-webkit-align-items:stretch;align-items:stretch;height:156px;}"
+        ".btn-box{-webkit-box-flex:1;-webkit-flex:1;flex:1;background:#222;border-radius:8px;padding:14px;margin-top:14px;position:relative;-webkit-box-sizing:border-box;box-sizing:border-box;display:-webkit-box;-webkit-box-orient:vertical;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;}"
+        ".btn-grid{-webkit-box-flex:1;-webkit-flex:1;flex:1;display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:stretch;display:-webkit-flex;display:flex;-webkit-align-items:stretch;align-items:stretch;min-height:120px;}"
         ".btn{border:none;color:#fff;border-radius:6px;font-weight:bold;cursor:pointer;display:-webkit-box;-webkit-box-pack:center;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-justify-content:center;justify-content:center;-webkit-align-items:center;align-items:center;-webkit-box-sizing:border-box;box-sizing:border-box;}"
         ".btn-left{-webkit-box-flex:1;-webkit-flex:1;flex:1;margin-right:8px;display:-webkit-box;-webkit-box-orient:vertical;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;}"
         ".btn-right{-webkit-box-flex:1;-webkit-flex:1;flex:1;display:-webkit-box;-webkit-box-orient:vertical;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;}"
@@ -144,7 +155,7 @@ int http_fn_custom_dash(http_request_t *request) {
 
     // --- Layout: top stats ---
     poststr(request,
-        "<div id='dash-container'>"
+        "<div id='scaler'><div id='dash-container'>"
         "<div class='close-btn' onclick='window.location.href=\"/index\"'>&#x2715;</div>"
         "<div class='top-stats'>"
         "<div><label>Voltage &amp; Current</label><b id='d-va'>--</b></div>"
@@ -161,9 +172,8 @@ int http_fn_custom_dash(http_request_t *request) {
         "<div class='left-col'>"
         "<div class='sep-lbl'>Sensor Data</div>"
         "<div class='reserved'></div>"
-        "<div class='grp-lbl'>Consumption Details</div>"
-        "<table class='etbl'>"
-        "<tr><th class='nm'></th><th>Import <span class='unit'>kWh</span></th><th>Export <span class='unit'>kWh</span></th></tr>"
+        "<table class='etbl' style='margin-top:14px;'>"
+        "<tr><th class='nm'>Energy<br><span class='unit'>details</span></th><th>Import <span class='unit'>kWh</span></th><th>Export <span class='unit'>kWh</span></th></tr>"
         "<tr><td class='nm'>Last Hour</td><td class='num imp' id='d-clh-i'>--</td><td class='num exp' id='d-clh-e'>--</td></tr>"
         "<tr><td class='nm'>Today</td><td class='num imp' id='d-ctoday-i'>--</td><td class='num exp' id='d-ctoday-e'>--</td></tr>"
         "<tr><td class='nm'>Yesterday</td><td class='num imp' id='d-cyest-i'>--</td><td class='num exp' id='d-cyest-e'>--</td></tr>"
@@ -171,12 +181,6 @@ int http_fn_custom_dash(http_request_t *request) {
         "<tr><td class='nm'>3 Days Ago</td><td class='num imp' id='d-c3d-i'>--</td><td class='num exp' id='d-c3d-e'>--</td></tr>"
         "<tr class='tot'><td class='nm'>Total</td><td class='num imp' id='d-tot-i'>--</td><td class='num exp' id='d-tot-e'>--</td></tr>"
         "</table>"
-        "<div class='leg-box'>"
-        "<div class='sep-lbl' style='margin-bottom:12px;'>Graph Legend</div>"
-        "<div class='leg-row'><span class='leg-swatch' style='background:#aaa;'></span><b>Total Energy</b></div>"
-        "<div class='leg-row'><span class='leg-swatch' style='background:#4caf50;'></span><b>Charger Avg</b></div>"
-        "<div class='leg-row'><span class='leg-swatch' style='background:#ff9800;'></span><b>Inverter Avg</b></div>"
-        "</div>"
         "</div>"
     );
     rtos_delay_milliseconds(1);
@@ -184,11 +188,16 @@ int http_fn_custom_dash(http_request_t *request) {
     // --- Layout: center column (graph + clock) ---
     poststr(request,
         "<div class='center-col'>"
-        "<div class='graph-col'>"
+        "<div class='graph-col' id='graph-col'>"
         "<div style='width:100%;max-width:592px;margin:0 auto;'>"
         "<div style='position:relative;width:100%;padding-bottom:57.43%;'>"
         "<canvas id='dynCanvas' style='position:absolute;top:0;left:0;width:100%;height:100%;'></canvas>"
         "</div></div></div>"
+        "<div class='leg-h' id='leg-h'>"
+        "<span class='leg-i'><span class='leg-sw' style='background:#aaa;'></span>Total Energy</span>"
+        "<span class='leg-i'><span class='leg-sw' style='background:#4caf50;'></span>Charger Avg</span>"
+        "<span class='leg-i'><span class='leg-sw' style='background:#ff9800;'></span>Inverter Avg</span>"
+        "</div>"
         "<div class='clk-row'>"
         "<div id='d-clk'>--:--</div>"
         "<div class='clk-text'><div id='d-day'>--</div><div id='d-date'>--</div></div>"
@@ -200,8 +209,14 @@ int http_fn_custom_dash(http_request_t *request) {
     // --- Layout: right column (battery gauge) ---
     poststr(request,
         "<div class='right-col'>"
-        "<div class='batt'>"
+        "<div class='batt' id='batt-panel'>"
         "<div class='batt-head'><h1 id='bt-title'>--</h1></div>"
+        "<button class='bat-gear' id='bat-gear-btn' onclick='toggleBatCfg()'><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='3'></circle><path d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'></path></svg></button>"
+        "<div id='bat-pop' class='bat-pop' style='display:none;'>"
+        "<div class='cfg-head'><span>Cut-off Voltage</span><span class='cfg-x' onclick='toggleBatCfg()'>&#x2715;</span></div>"
+        "<div class='sld-block'><label>Charger cut (<span id='lbl-cv'>4.00</span> V)</label><input type='range' id='sld-cv' min='360' max='400' value='400' oninput='bvIn(\"cv\",this.value)' onchange='s_cv(this.value)'></div>"
+        "<div class='sld-block'><label>Inverter cut (<span id='lbl-iv'>3.30</span> V)</label><input type='range' id='sld-iv' min='330' max='380' value='330' oninput='bvIn(\"iv\",this.value)' onchange='s_iv(this.value)'></div>"
+        "</div>"
         "<div class='gauge'>"
         "<svg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'>"
         "<circle class='track' cx='100' cy='100' r='90'></circle>"
@@ -218,6 +233,8 @@ int http_fn_custom_dash(http_request_t *request) {
         "<div class='cells'><span id='bt-cells'>-- - --</span> V</div>"
         "<div class='delta'>&#916; <span id='bt-delta'>--</span> mV</div>"
         "</div>"
+        "<div class='cd-side cd-l'><div class='cd-item' id='bt-chg'><svg class='ic ic-bolt' viewBox='0 0 24 24'><path d='M13 2 3 14h7l-1 8 10-12h-7z'/></svg><span class='dot2'></span></div></div>"
+        "<div class='cd-side cd-r'><div class='cd-item' id='bt-dis'><svg class='ic ic-dis' viewBox='0 0 24 24' fill='none' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='2' y='7.5' width='16' height='9' rx='2'/><path d='M21 11v2'/><rect class='lvl' x='4' y='9.5' width='9' height='5' rx='1'/></svg><span class='dot2'></span></div></div>"
         "</div>"
     );
     rtos_delay_milliseconds(1);
@@ -237,11 +254,6 @@ int http_fn_custom_dash(http_request_t *request) {
         "<div class='trow' id='bt-balrow'>"
         "<svg class='ic ic-scale' viewBox='0 0 24 24' fill='none' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z'/><path d='m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z'/><path d='M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2'/></svg>"
         "<span class='lbl'>Balancer:</span><span class='val'><span id='bt-bal'>--</span> <span class='u'>A</span></span>"
-        "</div>"
-        "<div class='tbrule'></div>"
-        "<div class='cdrow'>"
-        "<div class='cd-item' id='bt-chg'><svg class='ic ic-bolt' viewBox='0 0 24 24'><path d='M13 2 3 14h7l-1 8 10-12h-7z'/></svg><span class='dot2'></span></div>"
-        "<div class='cd-item' id='bt-dis'><svg class='ic ic-dis' viewBox='0 0 24 24' fill='none' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='2' y='7.5' width='16' height='9' rx='2'/><path d='M21 11v2'/><rect class='lvl' x='4' y='9.5' width='9' height='5' rx='1'/></svg><span class='dot2'></span></div>"
         "</div>"
         "</div>"
         "</div>"
@@ -281,6 +293,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "</div>"   // right-col
         "</div>"   // dash-row
         "</div>"   // dash-container
+        "</div>"   // scaler
     );
     rtos_delay_milliseconds(1);
 
@@ -328,6 +341,11 @@ int http_fn_custom_dash(http_request_t *request) {
         "function clrIf(k,dev){var p=pend[k];if(p&&dev===p.v)delete pend[k];}"
         "function cmd(u,k,v){if(k!==null)mark(k,v);xhr(u,function(){xhr('/api_dash?req=core',function(d){if(d&&d.c)applyCore(d);});});}"
         "function toggleCfg(){var p=document.getElementById('cfg-pop');if(p)p.style.display=(p.style.display==='none')?'block':'none';}"
+        "function toggleBatCfg(){var p=document.getElementById('bat-pop');if(p)p.style.display=(p.style.display==='none')?'block':'none';}"
+        "var cutCV=400,cutIV=330;"
+        "function bvIn(k,v){var n=parseInt(v,10);if(k==='cv'){cutCV=n;setV('lbl-cv',(n/100).toFixed(2));}else{cutIV=n;setV('lbl-iv',(n/100).toFixed(2));}}"
+        "function s_cv(v){cutCV=parseInt(v,10);setV('lbl-cv',(cutCV/100).toFixed(2));cmd('/cm?cmnd=SetChargerCutoff%20'+v,null,0);}"
+        "function s_iv(v){cutIV=parseInt(v,10);setV('lbl-iv',(cutIV/100).toFixed(2));cmd('/cm?cmnd=SetInverterCutoff%20'+v,null,0);}"
         "function refreshSliders(){"
         "var mp=(mode===0)?tpa:tpm;if(!held('pwr')){setV('lbl-pwr',mp);if(mp>=18)setV('sld-pwr',mp);}"
         "if(!held('exp')){setV('lbl-exp',texp);setV('sld-exp',texp);}"
@@ -470,7 +488,11 @@ int http_fn_custom_dash(http_request_t *request) {
         "if(state_export.length>0){var ge=ctx.createLinearGradient(0,225,0,310);ge.addColorStop(0,'rgba(55,214,122,.05)');ge.addColorStop(1,'rgba(55,214,122,.5)');drawSmooth(ctx,state_export,225,true,ge,'#37d67a',2.5);}"
         "if(state_chg.length>0)drawSmooth(ctx,state_chg,60,false,null,'#4caf50',2.5);"
         "if(state_inv.length>0)drawSmooth(ctx,state_inv,60,false,null,'#ff9800',2.5);}"
-        "initGrid();loadAll();setInterval(runCycle,10000);"
+        "function fit(){var c=document.getElementById('dash-container');if(!c)return;"
+        "var bp=document.getElementById('batt-panel'),gc=document.getElementById('graph-col'),lg=document.getElementById('leg-h');"
+        "if(bp&&gc&&lg){var gh=bp.offsetHeight-lg.offsetHeight-10;if(gh<150)gh=150;gc.style.height=gh+'px';}"
+        "var w=c.offsetWidth||980,h=c.offsetHeight||700;var s=Math.min(window.innerWidth/w,window.innerHeight/h,1);var e=document.getElementById('scaler');var t='translate(-50%,-50%) scale('+s+')';e.style.webkitTransform=t;e.style.transform=t;}"
+        "initGrid();loadAll();setInterval(runCycle,10000);fit();window.onresize=fit;setTimeout(fit,300);"
         "</script></body></html>"
     );
     rtos_delay_milliseconds(1);
