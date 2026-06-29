@@ -92,9 +92,11 @@ int charger_c_auto = 1;
 #define GPIO_CHARGER_ENABLE     4        // charger enable (digital output, active HIGH)
 #define GPIO_CHARGER_PWM        2        // charger duty   (LEDC PWM, 8-bit, 1 kHz)
 #define GPIO_RELAY_ECON         0        // relay economiser (LEDC PWM, 8-bit)
+#define GPIO_INVERTER_LED       8        // onboard LED mirrors GPIO0 (inverted, active LOW)
 
 #define LEDC_CH_CHARGER         4        // LEDC channel for GPIO2
 #define LEDC_CH_RELAY           5        // LEDC channel for GPIO0
+#define LEDC_CH_LED             3        // LEDC channel for GPIO8 (inverted)
 #define LEDC_TIMER_ACTUATION    1        // LEDC timer index (0 may be used by OBK)
 #define LEDC_FREQ_HZ_ACT        1000
 #define LEDC_RES_ACT            LEDC_TIMER_8_BIT
@@ -430,6 +432,8 @@ static void ApplyDumpLoadGPIO(int state)
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
 
         charger_pwm         = duty;
         relay_economiser    = 0;
@@ -448,11 +452,15 @@ static void ApplyDumpLoadGPIO(int state)
             inverter_engage_tick = now;
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_FULL);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, RELAY_ECON_DUTY_FULL);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
             relay_economiser = RELAY_ECON_DUTY_FULL;
         } else if ((now - inverter_engage_tick) >= (RELAY_ECON_PULSE_MS / portTICK_PERIOD_MS)) {
             // 500 ms elapsed: drop to economiser hold duty
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_HOLD);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, RELAY_ECON_DUTY_HOLD);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
             relay_economiser = RELAY_ECON_DUTY_HOLD;
         }
         // else: still within 500 ms window — LEDC retains FULL duty, no write needed
@@ -468,6 +476,8 @@ static void ApplyDumpLoadGPIO(int state)
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
 
         charger_pwm         = 0;
         relay_economiser    = 0;
@@ -1217,6 +1227,21 @@ void BL_Shared_Init(void)
         ch_rel.hpoint     = 0;
         ch_rel.intr_type  = LEDC_INTR_DISABLE;
         ledc_channel_config(&ch_rel);
+
+        // GPIO8 — onboard LED mirrors relay economiser (LEDC channel 3, inverted)
+        // LED is active-LOW (wired to 3V3), so output_invert=1 maps duty 0→off,
+        // duty 255→full brightness without any logic inversion in software.
+        ledc_channel_config_t ch_led;
+        memset(&ch_led, 0, sizeof(ch_led));
+        ch_led.gpio_num          = GPIO_INVERTER_LED;
+        ch_led.speed_mode        = LEDC_LOW_SPEED_MODE;
+        ch_led.channel           = LEDC_CH_LED;
+        ch_led.timer_sel         = LEDC_TIMER_ACTUATION;
+        ch_led.duty              = 0;
+        ch_led.hpoint            = 0;
+        ch_led.intr_type         = LEDC_INTR_DISABLE;
+        ch_led.flags.output_invert = 1;
+        ledc_channel_config(&ch_led);
 
         addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
                   "GPIO actuation init: enable=GPIO%d, chargerPWM=GPIO%d ch%d, relay=GPIO%d ch%d\n",
