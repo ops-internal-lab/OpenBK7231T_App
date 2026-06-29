@@ -60,6 +60,16 @@ static unsigned short bl0942_baudRate = 4800;
 
 #define CF_CNT_INVALID (1 << 31)
 
+// How long to wait for a full response packet before giving up.
+// At 4800 baud a 23-byte packet takes ~48 ms to arrive, so 100 ms is a
+// comfortable ceiling that still catches a dead/missing device quickly.
+#define BL0942_RESPONSE_TIMEOUT_MS 100
+
+// Granularity of the poll loop — how often we check the buffer.
+// Small enough to return quickly when data arrives, large enough to yield
+// to other RTOS tasks between checks (delay_ms yields the scheduler).
+#define BL0942_POLL_INTERVAL_MS    5
+
 typedef struct {
     uint32_t i_rms;
     uint32_t v_rms;
@@ -69,6 +79,10 @@ typedef struct {
 } bl0942_data_t;
 
 static uint32_t PrevCfCnt = CF_CNT_INVALID;
+
+// Counts consecutive seconds with no valid response — used only for logging
+// "device offline" once and "device back online" when it recovers.
+static int g_offlineSec = 0;
 
 static int32_t Int24ToInt32(int32_t val) {
     return (val & (1 << 23) ? val | (0xFF << 24) : val);
@@ -291,6 +305,7 @@ static int SPI_WriteReg(uint8_t reg, uint32_t val) {
 
 static void Init(void) {
     PrevCfCnt = CF_CNT_INVALID;
+    g_offlineSec = 0;
 
     BL_Shared_Init();
 
@@ -312,16 +327,56 @@ void BL0942_UART_Init(void) {
     UART_WriteReg(BL0942_REG_MODE,
                   BL0942_MODE_DEFAULT | BL0942_MODE_RMS_UPDATE_SEL_800_MS);
     // Set the minimun power measurement
-    UART_WriteReg(BL0942_REG_WA_CREEP,DEFAULT_WA_CREEP_VAL);
+    UART_WriteReg(BL0942_REG_WA_CREEP, DEFAULT_WA_CREEP_VAL);
 }
 
 void BL0942_UART_RunEverySecond(void) {
-    UART_TryToGetNextPacket();
-
-    UART_InitUART(bl0942_baudRate, 0, false);
-
+    // Send the read request.
+    // UART_InitUART is NOT called here — it belongs in BL0942_UART_Init only.
+    // Calling it every second reinitialises the peripheral, drives TX low
+    // momentarily (which the BL0942 can interpret as a BREAK/reset), and
+    // was the root cause of crashes when no device was connected.
     UART_SendByte(BL0942_UART_CMD_READ(BL0942_UART_ADDR));
     UART_SendByte(BL0942_UART_REG_PACKET);
+
+    // Poll for response with timeout.
+    // Returns as soon as a full packet is in the buffer — don't wait the
+    // full timeout if data arrives in 8 ms. Each delay_ms() yields to the
+    // RTOS scheduler so other tasks run between checks.
+    // This is the standard rugged-serial pattern: poll + early exit + deadline.
+    int waited = 0;
+    while (waited < BL0942_RESPONSE_TIMEOUT_MS) {
+        if (UART_GetDataSize() >= BL0942_UART_PACKET_LEN) {
+            break;  // data is ready — no point waiting further
+        }
+        delay_ms(BL0942_POLL_INTERVAL_MS);
+        waited += BL0942_POLL_INTERVAL_MS;
+    }
+
+    // Try to collect the response
+    if (UART_TryToGetNextPacket() == BL0942_UART_PACKET_LEN) {
+        // Good packet — ScaleAndUpdate was already called inside TryToGetNextPacket
+        if (g_offlineSec > 0) {
+            ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
+                        "BL0942: device back online after %d s\n", g_offlineSec);
+            g_offlineSec = 0;
+        }
+        return;
+    }
+
+    // No valid response received.
+    // Push a zero reading so the downstream pipeline keeps running cleanly
+    // and doesn't see stale or garbage data. When the device reconnects,
+    // real readings resume automatically on the next successful packet.
+    if (g_offlineSec == 0) {
+        ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                    "BL0942: no response after %d ms — device offline, reporting zeros\n",
+                    BL0942_RESPONSE_WAIT_MS);
+    }
+    g_offlineSec++;
+
+    bl0942_data_t zeros = {0};
+    ScaleAndUpdate(&zeros);
 }
 
 void BL0942_SPI_Init(void) {
@@ -344,12 +399,32 @@ void BL0942_SPI_Init(void) {
 }
 
 void BL0942_SPI_RunEverySecond(void) {
-    bl0942_data_t data;
-    SPI_ReadReg(BL0942_REG_I_RMS, &data.i_rms);
-    SPI_ReadReg(BL0942_REG_V_RMS, &data.v_rms);
-    SPI_ReadReg(BL0942_REG_WATT, (uint32_t *)&data.watt);
+    bl0942_data_t data = {0};
+    int err = 0;
+
+    err |= SPI_ReadReg(BL0942_REG_I_RMS,  &data.i_rms);
+    err |= SPI_ReadReg(BL0942_REG_V_RMS,  &data.v_rms);
+    err |= SPI_ReadReg(BL0942_REG_WATT,   (uint32_t *)&data.watt);
+    err |= SPI_ReadReg(BL0942_REG_CF_CNT, &data.cf_cnt);
+    err |= SPI_ReadReg(BL0942_REG_FREQ,   &data.freq);
+
+    if (err != 0) {
+        g_offlineSec++;
+        if (g_offlineSec == 1) {
+            ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                        "BL0942 SPI: read error — device offline, reporting zeros\n");
+        }
+        bl0942_data_t zeros = {0};
+        ScaleAndUpdate(&zeros);
+        return;
+    }
+
+    if (g_offlineSec > 0) {
+        ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
+                    "BL0942 SPI: device back online after %d s\n", g_offlineSec);
+        g_offlineSec = 0;
+    }
+
     data.watt = Int24ToInt32(data.watt);
-    SPI_ReadReg(BL0942_REG_CF_CNT, &data.cf_cnt);
-    SPI_ReadReg(BL0942_REG_FREQ, &data.freq);
     ScaleAndUpdate(&data);
 }
