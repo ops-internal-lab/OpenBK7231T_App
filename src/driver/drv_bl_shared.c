@@ -109,7 +109,9 @@ static int relay_economiser = 0;   // 0 / RELAY_ECON_DUTY_HOLD / RELAY_ECON_DUTY
 
 // Economiser edge-detection state (persistent across ApplyDumpLoadGPIO calls)
 static int          inverter_was_active  = 0;
-static portTickType inverter_engage_tick = 0;
+// inverter_engage_tick declared as static local inside ApplyDumpLoadGPIO —
+// portTickType is only available after the FreeRTOS headers are pulled in
+// by the OpenBK include block below, so it cannot live here at file scope.
 
 #include "drv_bl_shared.h"
 
@@ -407,6 +409,10 @@ commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, 
 static void ApplyDumpLoadGPIO(int state)
 {
 #if PLATFORM_ESPIDF
+    // Declared static local so portTickType is resolved after the FreeRTOS
+    // headers are included above; retains value between calls like a file-
+    // scope static would.
+    static portTickType inverter_engage_tick = 0;
     int inverter_active = (state >= 3 && state <= 5);
     int charger_active  = (state >= 18);
     portTickType now    = xTaskGetTickCount();
