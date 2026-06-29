@@ -62,6 +62,23 @@ static void tcp_client_thread(beken_thread_arg_t arg)
 {
 	OSStatus err = kNoErr;
 	int fd = (int)arg;
+
+#if PLATFORM_ESPIDF
+	/* A blocking recv() with no timeout will hang this thread forever if the
+	   peer goes away without a clean FIN (half-open socket — common on WiFi)
+	   or opens a connection without sending a request. Because each client
+	   runs in its own thread and g_activeHttpClients is only decremented when
+	   the thread exits, a few such stuck threads exhaust the 3-client limit
+	   and the web UI locks up ("Too many connections. Limit is 3."). Bound
+	   recv() with a receive timeout so the thread always exits and frees its
+	   slot. 12 s is far longer than any legitimate request takes to arrive. */
+	{
+		struct timeval _rcv_to;
+		_rcv_to.tv_sec = 12;
+		_rcv_to.tv_usec = 0;
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &_rcv_to, sizeof(_rcv_to));
+	}
+#endif
 	//fd_set readfds, errfds, readfds2;
 	char* buf = NULL;
 	char* reply = NULL;
