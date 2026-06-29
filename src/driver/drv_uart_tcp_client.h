@@ -14,8 +14,13 @@
 #define UART_TCP_SERIAL_MAX    4
 #define UART_TCP_CHARGER_MAX   2
 #define UART_TCP_PORT          8888
-/* 500ms — 4 dead devices × 500ms = 2s worst case, safe under 5s watchdog */
-#define UART_TCP_TIMEOUT_MS    500
+/* 50ms — 4 dead devices × 50ms = 200ms worst case, well under 5s watchdog.
+   Aggressive but safe: a live host on a local LAN responds to TCP SYN
+   in under 5ms, so 50ms is still generous for real devices.
+   Applies to both SO_RCVTIMEO (data wait) and SO_SNDTIMEO (connect).
+   lwIP honours SO_SNDTIMEO during blocking connect() when
+   LWIP_SO_SNDTIMEO=1 (default on ESP-IDF). */
+#define UART_TCP_TIMEOUT_MS    50
 
 /* Boot init — loads NVS, registers console commands */
 void        UART_TCP_ClientInit(void);
@@ -27,7 +32,7 @@ void        UART_TCP_AdvanceTarget(void);
 /* Returns slot index 0-3 of last connection, -1 if hardware UART */
 int         UART_TCP_GetLastSlot(void);
 
-/* Open TCP connection to ip:UART_TCP_PORT with 500ms timeout.
+/* Open TCP connection to ip:UART_TCP_PORT with 50ms timeout.
    Returns socket fd or -1 on failure. */
 int         UART_TCP_Connect(const char *ip, int port);
 

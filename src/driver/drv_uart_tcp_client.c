@@ -170,7 +170,11 @@ void UART_TCP_SendChargerCmd(const char *path)
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) return;
 
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    /* Use the same 250ms timeout as serial targets.
+       The old hardcoded 2s blocked the caller (main task) for 2 full seconds
+       on every failed charger command, which added directly to HTTP latency. */
+    struct timeval tv = { .tv_sec  = UART_TCP_TIMEOUT_MS / 1000,
+                          .tv_usec = (UART_TCP_TIMEOUT_MS % 1000) * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
