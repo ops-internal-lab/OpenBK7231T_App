@@ -60,6 +60,24 @@ static unsigned short bl0942_baudRate = 4800;
 
 #define CF_CNT_INVALID (1 << 31)
 
+// -----------------------------------------------------------------------
+// Offline / timeout tracking
+//
+// Both the UART and SPI interfaces use the same counter — only one is
+// active at a time.
+//
+//  - After BL0942_OFFLINE_TIMEOUT_SEC consecutive "bad" seconds the
+//    driver stops hammering the bus and logs a single warning.
+//  - Every BL0942_RECONNECT_INTERVAL_SEC it sends one probe so that a
+//    reconnected device is picked up automatically without a reboot.
+// -----------------------------------------------------------------------
+#define BL0942_OFFLINE_TIMEOUT_SEC    5   // consecutive bad seconds → offline
+#define BL0942_RECONNECT_INTERVAL_SEC 30  // probe period while offline
+
+// Counts consecutive seconds with no valid data.
+// Reset to 0 in Init() and whenever a good reading is received.
+static int g_offlineSec = 0;
+
 typedef struct {
     uint32_t i_rms;
     uint32_t v_rms;
@@ -291,6 +309,7 @@ static int SPI_WriteReg(uint8_t reg, uint32_t val) {
 
 static void Init(void) {
     PrevCfCnt = CF_CNT_INVALID;
+    g_offlineSec = 0;   // reset timeout state on every (re-)init
 
     BL_Shared_Init();
 
@@ -316,10 +335,40 @@ void BL0942_UART_Init(void) {
 }
 
 void BL0942_UART_RunEverySecond(void) {
-    UART_TryToGetNextPacket();
+    int got = UART_TryToGetNextPacket();
+
+    if (got == BL0942_UART_PACKET_LEN) {
+        // Valid packet received — device is healthy.
+        if (g_offlineSec >= BL0942_OFFLINE_TIMEOUT_SEC) {
+            ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
+                        "BL0942 UART: device back online after %d s offline\n",
+                        g_offlineSec);
+        }
+        g_offlineSec = 0;
+    } else {
+        g_offlineSec++;
+
+        // Log once when we first cross the threshold.
+        if (g_offlineSec == BL0942_OFFLINE_TIMEOUT_SEC) {
+            ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                        "BL0942 UART: no valid packet for %d s — device offline?\n",
+                        BL0942_OFFLINE_TIMEOUT_SEC);
+        }
+
+        if (g_offlineSec >= BL0942_OFFLINE_TIMEOUT_SEC) {
+            // Device is offline.  Avoid hammering a dead port every second.
+            // Send one probe every BL0942_RECONNECT_INTERVAL_SEC so that a
+            // reconnected device is picked up automatically without a reboot.
+            if ((g_offlineSec % BL0942_RECONNECT_INTERVAL_SEC) != 0) {
+                return;
+            }
+            ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
+                        "BL0942 UART: probing for reconnection (offline %d s)\n",
+                        g_offlineSec);
+        }
+    }
 
     UART_InitUART(bl0942_baudRate, 0, false);
-
     UART_SendByte(BL0942_UART_CMD_READ(BL0942_UART_ADDR));
     UART_SendByte(BL0942_UART_REG_PACKET);
 }
@@ -344,12 +393,38 @@ void BL0942_SPI_Init(void) {
 }
 
 void BL0942_SPI_RunEverySecond(void) {
-    bl0942_data_t data;
-    SPI_ReadReg(BL0942_REG_I_RMS, &data.i_rms);
-    SPI_ReadReg(BL0942_REG_V_RMS, &data.v_rms);
-    SPI_ReadReg(BL0942_REG_WATT, (uint32_t *)&data.watt);
+    // Zero-init so that a partial read never feeds uninitialized garbage
+    // into ScaleAndUpdate — critical when the device is offline and all
+    // SPI_ReadReg calls fail their checksum.
+    bl0942_data_t data = {0};
+    int err = 0;
+
+    err |= SPI_ReadReg(BL0942_REG_I_RMS,  &data.i_rms);
+    err |= SPI_ReadReg(BL0942_REG_V_RMS,  &data.v_rms);
+    err |= SPI_ReadReg(BL0942_REG_WATT,   (uint32_t *)&data.watt);
+    err |= SPI_ReadReg(BL0942_REG_CF_CNT, &data.cf_cnt);
+    err |= SPI_ReadReg(BL0942_REG_FREQ,   &data.freq);
+
+    if (err != 0) {
+        // One or more register reads failed — do NOT feed partial/garbage
+        // data into ScaleAndUpdate; a bad float→int cast there can crash.
+        g_offlineSec++;
+        if (g_offlineSec == BL0942_OFFLINE_TIMEOUT_SEC) {
+            ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                        "BL0942 SPI: %d consecutive read errors — device offline?\n",
+                        BL0942_OFFLINE_TIMEOUT_SEC);
+        }
+        return;
+    }
+
+    // All reads succeeded — device is healthy.
+    if (g_offlineSec >= BL0942_OFFLINE_TIMEOUT_SEC) {
+        ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
+                    "BL0942 SPI: device back online after %d s offline\n",
+                    g_offlineSec);
+    }
+    g_offlineSec = 0;
+
     data.watt = Int24ToInt32(data.watt);
-    SPI_ReadReg(BL0942_REG_CF_CNT, &data.cf_cnt);
-    SPI_ReadReg(BL0942_REG_FREQ, &data.freq);
     ScaleAndUpdate(&data);
 }
