@@ -186,7 +186,7 @@ static void divert_send(int on) {
     snprintf(cmd, sizeof(cmd),
              "SendGet http://%s.22/cm?cmnd=Power%%20%s",
              ip, on ? "ON" : "OFF");
-    CMD_ExecuteCommand(cmd, 0);
+    //CMD_ExecuteCommand(cmd, 0);
 }
 
 // Evaluated every loop. Hysteresis band: turn ON at >= divert_threshold Wh of
@@ -379,7 +379,7 @@ commandResult_t BL09XX_SetDumpLoad(const void *context, const char *cmd, const c
             snprintf(fallback_cmd, sizeof(fallback_cmd),
                      "SendGet http://%s/cm?cmnd=Channel3%%20%d",
                      _cip, dump_load_relay[5]);
-            CMD_ExecuteCommand(fallback_cmd, 0);
+            //CMD_ExecuteCommand(fallback_cmd, 0);
         }}
     }
     return CMD_RES_OK;
@@ -411,7 +411,7 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
                 snprintf(fallback_cmd, sizeof(fallback_cmd),
                          "SendGet http://%s/cm?cmnd=Channel3%%20%d",
                          _cip, dump_load_relay[5]);
-                CMD_ExecuteCommand(fallback_cmd, 0);
+               // CMD_ExecuteCommand(fallback_cmd, 0);
             }}
         }
     }
@@ -868,7 +868,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     snprintf(fallback_cmd, sizeof(fallback_cmd),
                              "SendGet http://%s/cm?cmnd=Channel3%%20%d",
                              _cip, dump_load_relay[5]);
-                    CMD_ExecuteCommand(fallback_cmd, 0);
+                  //  CMD_ExecuteCommand(fallback_cmd, 0);
                 }}
             } // END OF AUTO BLOCK
         }
