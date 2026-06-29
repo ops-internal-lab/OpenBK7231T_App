@@ -371,7 +371,7 @@ void BL0942_UART_RunEverySecond(void) {
     if (g_offlineSec == 0) {
         ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
                     "BL0942: no response after %d ms — device offline, reporting zeros\n",
-                    BL0942_RESPONSE_WAIT_MS);
+                    BL0942_RESPONSE_TIMEOUT_MS);
     }
     g_offlineSec++;
 
