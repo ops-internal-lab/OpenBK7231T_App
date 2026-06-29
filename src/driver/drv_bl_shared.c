@@ -99,6 +99,7 @@ int charger_c_auto = 1;
 #endif
 #include "drv_local.h"
 #include "drv_ntp.h"
+#include "drv_deviceclock.h"   // TIME_* (live device clock) — used instead of stale NTP_*
 #include "drv_public.h"
 #include "drv_uart.h"
 #include "../hal/hal_wifi.h"     // HAL_GetMyIPString (for the .22 diversion target)
@@ -343,7 +344,7 @@ commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, 
         value = atof(args);
         sensors[OBK_CONSUMPTION_TOTAL].lastReading = value;
     }
-    ConsumptionResetTime = (time_t)NTP_GetCurrentTime();
+    ConsumptionResetTime = (time_t)TIME_GetCurrentTime();
 #if WINDOWS
 #elif PLATFORM_BL602
 #elif PLATFORM_W600 || PLATFORM_W800
@@ -598,10 +599,10 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     }
     last_processupdate_tick = now_tick;
 
-    if (NTP_IsTimeSynced())
+    if (TIME_IsTimeSynced())
     {                                          
-        check_time = NTP_GetMinute();
-        check_hour = NTP_GetHour();
+        check_time = TIME_GetMinute();
+        check_hour = TIME_GetHour();
 
         // ======================================================================================================
         // 30-SECOND SAMPLER (Charger & Inverter Averages)
@@ -722,7 +723,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
                                                    charger_c_matrix, inverter_matrix,
                                                    MATRIX_SIZE, last_matrix_index,
-                                                   (unsigned int)NTP_GetCurrentTime());
+                                                   (unsigned int)TIME_GetCurrentTime());
 #endif
                 }
 
@@ -905,8 +906,8 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     }
 //---------------------------------------
 
-    if (NTP_IsTimeSynced()) {
-        ntpTime = (time_t)NTP_GetCurrentTime();
+    if (TIME_IsTimeSynced()) {
+        ntpTime = (time_t)TIME_GetCurrentTime();
         ltm = gmtime(&ntpTime);
         if (ConsumptionResetTime == 0)
             ConsumptionResetTime = (time_t)ntpTime;
@@ -1086,7 +1087,7 @@ int http_fn_api_dash(http_request_t *request) {
 
     char buf[512];
     int  pos     = 0;
-    int  has_ntp = CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE) && NTP_IsTimeSynced();
+    int  has_ntp = CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE) && TIME_IsTimeSynced();
 
 #define B(...) pos += snprintf(buf + pos, sizeof(buf) - pos, __VA_ARGS__)
 
@@ -1158,8 +1159,8 @@ int http_fn_api_dash(http_request_t *request) {
         raw[13] = (unsigned char)mode_v;
         raw[14] = (unsigned char)(target_power_auto   < 0 ? 0 : target_power_auto   > 255 ? 255 : target_power_auto);
         raw[15] = (unsigned char)(target_export       < 0 ? 0 : target_export       > 255 ? 255 : target_export);
-        raw[16] = (unsigned char)NTP_GetHour();
-        raw[17] = (unsigned char)NTP_GetMinute();
+        raw[16] = (unsigned char)TIME_GetHour();
+        raw[17] = (unsigned char)TIME_GetMinute();
         raw[18] = (unsigned char)(lms_v  & 0xFF);
         raw[19] = (unsigned char)((lms_v  >> 8) & 0xFF);
         raw[20] = (unsigned char)(ev_v   & 0xFF);
@@ -1347,7 +1348,7 @@ int http_fn_api_dash(http_request_t *request) {
     // req=chginv: {"chginv":"b64_48"}
     //   int8 signed: +v=charger at v%, -v=inverter at v%, 0=neither.
     else if (has_ntp && req_param) {
-        unsigned int msm = NTP_GetHour() * 60 + NTP_GetMinute();
+        unsigned int msm = TIME_GetHour() * 60 + TIME_GetMinute();
 
         if (strncmp(req_param, "req=net", 7) == 0) {
             unsigned char raw[MATRIX_SIZE];
