@@ -15,8 +15,10 @@
 
 /* Active TCP socket (-1 = hardware UART mode) */
 static int s_tcp_sock = -1;
-/* Guard against spawning uart_event_task more than once */
-static int s_task_started = 0;
+/* Guard against spawning uart_event_task more than once.
+   Guarded by a portENTER_CRITICAL section on every write; reads are
+   in the same critical section so no torn read on dual-core ESP32. */
+static volatile int s_task_started = 0;
 
 #ifdef CONFIG_IDF_TARGET_ESP32C6
 #define RX1_PIN GPIO_NUM_7
@@ -151,10 +153,18 @@ int HAL_UART_Init(int baud, int parity, bool hwflowc, int txOverride, int rxOver
 		/* Connect to current target, advance round-robin */
 		s_tcp_sock = UART_TCP_Connect(target, UART_TCP_PORT);
 		UART_TCP_AdvanceTarget();
-		/* Start the shared task once (it checks s_tcp_sock each loop) */
+		/* Start the shared task once (it checks s_tcp_sock each loop).
+		   Critical section prevents a dual-core race on s_task_started.
+		   Stack 4096 bytes — 1024 was too small and caused stack overflow
+		   panics (ESP_RST_PANIC=4) once logging ran inside the task.
+		   Priority 5 — was 16 which starved HTTP threads (slow web UI). */
+		taskENTER_CRITICAL();
 		if (!s_task_started) {
 			s_task_started = 1;
-			xTaskCreate(uart_event_task, "uart_event_task", 1024, NULL, 16, NULL);
+			taskEXIT_CRITICAL();
+			xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 5, NULL);
+		} else {
+			taskEXIT_CRITICAL();
 		}
 		return 1;
 	}
@@ -203,8 +213,15 @@ int HAL_UART_Init(int baud, int parity, bool hwflowc, int txOverride, int rxOver
 	}
 #endif
 	if (!s_task_started) {
-		s_task_started = 1;
-		xTaskCreate(uart_event_task, "uart_event_task", 1024, NULL, 16, NULL);
+		/* Same rationale as TCP path: 4096 bytes stack, priority 5. */
+		taskENTER_CRITICAL();
+		if (!s_task_started) {
+			s_task_started = 1;
+			taskEXIT_CRITICAL();
+			xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 5, NULL);
+		} else {
+			taskEXIT_CRITICAL();
+		}
 	}
 	return 1;
 }

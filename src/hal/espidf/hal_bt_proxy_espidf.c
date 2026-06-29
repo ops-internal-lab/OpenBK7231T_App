@@ -62,8 +62,16 @@ static const esp_ble_scan_params_t s_ble_scan_params = {
 	.own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
 	.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
 	.scan_interval      = 0x50,
-	.scan_window        = 0x30,
-	.scan_duplicate     = BLE_SCAN_DUPLICATE_DISABLE
+	/* scan_window reduced from 0x30 → 0x10 (10ms/50ms = 20% duty cycle).
+	   BLE and WiFi share the radio on ESP32; a 60% duty cycle (0x30/0x50)
+	   caused significant WiFi packet loss and made the web UI sluggish.
+	   20% is more than enough to catch nearby advertisements. */
+	.scan_window        = 0x10,
+	/* DUPLICATE_ENABLE: only report each peer once per scan period instead
+	   of every advertisement packet. With DUPLICATE_DISABLE the GAP callback
+	   fires thousands of times/sec in a populated BLE environment, eating CPU
+	   time and contributing to watchdog panics. */
+	.scan_duplicate     = BLE_SCAN_DUPLICATE_ENABLE
 };
 
 static void HAL_BTProxy_LogHealth(const char *stage)
