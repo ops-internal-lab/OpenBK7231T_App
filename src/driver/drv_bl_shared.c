@@ -83,7 +83,7 @@ static int          divert_user          = 0;
 static int          divert_is_on         = 0;   // last state commanded to the .22 load
 static int          divert_threshold     = 60;  // ON point (Wh), kept >= target_export+10
 static int          charger_was_running  = 0;
-// charger_on_tick (portTickType) is declared after the FreeRTOS headers below.
+// charger_on_tick (TickType_t) is declared after the FreeRTOS headers below.
 
 #define dump_load_relay_number 6
 /* charger_c_ip removed — charger IPs now configured via setChargerIP1/2 */
@@ -135,7 +135,7 @@ static int   inverter_gated    = 0;      // 1 = inverter latched off by BMS
 #define INVERTER_HYST_V  0.100f          // 100 mV
 
 // inverter_engage_tick declared as static local inside ApplyDumpLoadGPIO —
-// portTickType is only available after the FreeRTOS headers are pulled in
+// TickType_t is only available after the FreeRTOS headers are pulled in
 // by the OpenBK include block below, so it cannot live here at file scope.
 
 // ---- Dashboard "System Configuration" settings ----
@@ -164,14 +164,14 @@ static void SETTINGS_Save(void);             // defined after the NVS includes b
 // failures so we can hold the last-good value); last_ok = tick of the most
 // recent successful read. Display/integration freshness is derived from the
 // age of last_ok, not from online alone (see BL_MeterOnlineState).
-typedef struct { float v, a, w, freq; int online; portTickType last_ok; } meter_slot_t;
+typedef struct { float v, a, w, freq; int online; TickType_t last_ok; } meter_slot_t;
 static meter_slot_t g_meter[6];
 
 // Read freshness windows. A slot is polled ~every 6 s, so within 9 s a good
 // read is "fresh"; up to 30 s we keep showing/integrating the last-good value
 // but flag it as "stale" (comms hiccup); beyond 30 s it's treated as offline.
-#define METER_FRESH_TICKS ((portTickType)( 9000 / portTICK_PERIOD_MS))
-#define METER_HOLD_TICKS  ((portTickType)(30000 / portTICK_PERIOD_MS))
+#define METER_FRESH_TICKS ((TickType_t)( 9000 / portTICK_PERIOD_MS))
+#define METER_HOLD_TICKS  ((TickType_t)(30000 / portTICK_PERIOD_MS))
 
 // ---- Solar / ESS energy counters (Wh) ----
 // Today resets at local midnight; total is lifetime. Accumulated by
@@ -293,10 +293,10 @@ static void divert_send(int on) {
 // export, OFF at <= target_export Wh. AUTO mode additionally requires the
 // charger to be running and 5 s to have elapsed since it went off->on. A user
 // force-on (divert_user 1/2) ignores the charger gate.
-static portTickType charger_on_tick = 0;   // tick the charger last went off->on
+static TickType_t charger_on_tick = 0;   // tick the charger last went off->on
 static void evaluate_diversion(void) {
     int charger_running = (dump_load_relay[5] >= 18);
-    portTickType now = xTaskGetTickCount();
+    TickType_t now = xTaskGetTickCount();
     int want_on;
 
     if (charger_running && !charger_was_running) charger_on_tick = now;
@@ -341,14 +341,14 @@ static float         calc_power_w     = 0.0f;
 // Tracks the wall-clock time between successive BL_ProcessUpdate calls.
 // Replaces the old worst-case execution-time metric with a value that
 // tells us the actual cadence at which the meter pushes readings.
-static portTickType  last_processupdate_tick = 0;
+static TickType_t  last_processupdate_tick = 0;
 static unsigned int  loop_interval_ms        = 0;
 
 int actual_mday = -1;
 float lastSavedEnergyCounterValue = 0.0f;
 float lastSavedGenerationCounterValue = 0.0f;
 long ConsumptionSaveCounter = 0;
-portTickType lastConsumptionSaveStamp;
+TickType_t lastConsumptionSaveStamp;
 time_t ConsumptionResetTime = 0;
 
 int changeSendAlwaysFrames = 300;
@@ -478,10 +478,10 @@ commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, 
 static void ApplyDumpLoadGPIO(int state)
 {
 #if PLATFORM_ESPIDF
-    // Declared static local so portTickType is resolved after the FreeRTOS
+    // Declared static local so TickType_t is resolved after the FreeRTOS
     // headers are included above; retains value between calls like a file-
     // scope static would.
-    static portTickType inverter_engage_tick = 0;
+    static TickType_t inverter_engage_tick = 0;
 
     // ---- BMS voltage gate (skipped entirely if BMS offline) ----
     // Re-evaluates the hysteresis latches from live cell voltages, then forces
@@ -514,7 +514,7 @@ static void ApplyDumpLoadGPIO(int state)
 
     int inverter_active = (state >= 3 && state <= 5);
     int charger_active  = (state >= 18);
-    portTickType now    = xTaskGetTickCount();
+    TickType_t now    = xTaskGetTickCount();
 
     if (charger_active) {
         // ----- CHARGER MODE -----
@@ -1002,7 +1002,7 @@ void BL_MeterReadFailed(int slot) {
 // last good read older than the hold window), 1 = fresh, 2 = stale-but-holding
 // (within the hold window — show the value but flag a comms problem).
 int BL_MeterOnlineState(int slot) {
-    portTickType age;
+    TickType_t age;
     if (slot < 0 || slot >= 6) return 0;
     if (!g_meter[slot].online)  return 0;
     age = xTaskGetTickCount() - g_meter[slot].last_ok;
@@ -1032,8 +1032,8 @@ int BL_GetMeter(int slot, float *v, float *a, float *w, int *online) {
 // phases into the existing net pipeline (sign = import/export), and integrates
 // the Solar and ESS energy counters from power * actual elapsed time.
 void BL_ProcessSweep(void) {
-    static portTickType last_tick = 0;
-    portTickType now = xTaskGetTickCount();
+    static TickType_t last_tick = 0;
+    TickType_t now = xTaskGetTickCount();
     float dt_h;
 
     if (last_tick == 0) { last_tick = now; return; }   // seed timestamp, no integ yet
@@ -1101,7 +1101,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     //   1. loop_interval_ms  – the wall-clock gap between successive calls
     //      (replaces the old worst-case execution-time metric).
     //   2. Instantaneous power – Wh delta / elapsed time → Watts.
-    portTickType now_tick = xTaskGetTickCount();
+    TickType_t now_tick = xTaskGetTickCount();
 
     // ====================================================================
     // LOOP INTERVAL + INSTANTANEOUS POWER CALCULATION
@@ -1150,8 +1150,8 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
         // ======================================================================================================
         // 30-SECOND SAMPLER (Battery power + Solar power averages)
         // ======================================================================================================
-        static portTickType last_30s_tick = 0;
-        portTickType current_sys_tick = xTaskGetTickCount();
+        static TickType_t last_30s_tick = 0;
+        TickType_t current_sys_tick = xTaskGetTickCount();
         if ((current_sys_tick - last_30s_tick) >= (30000 / portTICK_PERIOD_MS) || last_30s_tick == 0) {
             last_30s_tick = current_sys_tick;
 
@@ -1330,8 +1330,8 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
         // ======================================================================================================
         // CONTROL LOGIC (Target Export, Proportional-Integral Control)
         // ======================================================================================================
-        static portTickType last_control_tick = 0;
-        portTickType current_tick = xTaskGetTickCount();
+        static TickType_t last_control_tick = 0;
+        TickType_t current_tick = xTaskGetTickCount();
         
         if ((current_tick - last_control_tick) >= (30000 / portTICK_PERIOD_MS) || last_control_tick == 0) 
         {
