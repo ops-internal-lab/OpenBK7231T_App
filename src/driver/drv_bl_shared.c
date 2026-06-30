@@ -68,6 +68,16 @@ static int rollover_just_happened = 0;
    at midnight via NTP. Index: [0]=today, [1]=yesterday, [2]=2d ago, [3]=3d ago */
 static float export_daily[4] = {0.0f};
 
+/* Daily Solar generation history (Wh). [0]=today (mirrors gen_today at each
+   save), [1]=yesterday, [2]=2d ago, [3]=3d ago. Rolled at midnight and
+   flash-persisted on every 15-min boundary, identical cadence to export_daily. */
+static float solar_daily[4]   = {0.0f};
+
+/* Daily ESS (battery) import and export history (Wh). Same index convention.
+   [0] mirrors ess_imp_today / ess_exp_today at save time. */
+static float ess_imp_daily[4] = {0.0f};
+static float ess_exp_daily[4] = {0.0f};
+
 int estimated_energy_period = 0;
 
 // NEW GLOBAL TARGETS
@@ -766,13 +776,31 @@ static void SETTINGS_Load(void)
 static void COUNTERS_Save(void)
 {
     nvs_handle_t h = 0;
+    int i;
+    char key[8];
     if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+
+    /* Existing today / lifetime counters */
     nvs_set_i32(h, "gtod",  (int)(gen_today     + 0.5f));
     nvs_set_i32(h, "gtot",  (int)(gen_total     + 0.5f));
     nvs_set_i32(h, "eitod", (int)(ess_imp_today + 0.5f));
     nvs_set_i32(h, "eitot", (int)(ess_imp_total + 0.5f));
     nvs_set_i32(h, "eetod", (int)(ess_exp_today + 0.5f));
     nvs_set_i32(h, "eetot", (int)(ess_exp_total + 0.5f));
+
+    /* Sync daily[0] from the live accumulators so the history stays current
+       between midnight rollovers (15-min saves keep it fresh). */
+    solar_daily[0]   = gen_today;
+    ess_imp_daily[0] = ess_imp_today;
+    ess_exp_daily[0] = ess_exp_today;
+
+    /* Daily history arrays: gd0-gd3 = solar, eid0-eid3 = ESS imp, eed0-eed3 = ESS exp */
+    for (i = 0; i < 4; i++) {
+        snprintf(key, sizeof(key), "gd%d",  i); nvs_set_i32(h, key, (int)(solar_daily[i]   + 0.5f));
+        snprintf(key, sizeof(key), "eid%d", i); nvs_set_i32(h, key, (int)(ess_imp_daily[i] + 0.5f));
+        snprintf(key, sizeof(key), "eed%d", i); nvs_set_i32(h, key, (int)(ess_exp_daily[i] + 0.5f));
+    }
+
     nvs_commit(h);
     nvs_close(h);
 }
@@ -781,13 +809,34 @@ static void COUNTERS_Load(void)
 {
     nvs_handle_t h = 0;
     int32_t v;
+    int i;
+    char key[8];
     if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return;
+
+    /* Existing today / lifetime counters */
     if (nvs_get_i32(h, "gtod",  &v) == ESP_OK) gen_today     = (float)v;
     if (nvs_get_i32(h, "gtot",  &v) == ESP_OK) gen_total     = (float)v;
     if (nvs_get_i32(h, "eitod", &v) == ESP_OK) ess_imp_today = (float)v;
     if (nvs_get_i32(h, "eitot", &v) == ESP_OK) ess_imp_total = (float)v;
     if (nvs_get_i32(h, "eetod", &v) == ESP_OK) ess_exp_today = (float)v;
     if (nvs_get_i32(h, "eetot", &v) == ESP_OK) ess_exp_total = (float)v;
+
+    /* Daily history arrays */
+    for (i = 0; i < 4; i++) {
+        snprintf(key, sizeof(key), "gd%d",  i);
+        if (nvs_get_i32(h, key, &v) == ESP_OK) solar_daily[i]   = (float)v;
+        snprintf(key, sizeof(key), "eid%d", i);
+        if (nvs_get_i32(h, key, &v) == ESP_OK) ess_imp_daily[i] = (float)v;
+        snprintf(key, sizeof(key), "eed%d", i);
+        if (nvs_get_i32(h, key, &v) == ESP_OK) ess_exp_daily[i] = (float)v;
+    }
+    /* Ensure [0] is consistent with the live today accumulators loaded above.
+       If the "gd0" key doesn't exist yet (first boot after upgrade) this
+       falls back to the value loaded from "gtod". */
+    solar_daily[0]   = gen_today;
+    ess_imp_daily[0] = ess_imp_today;
+    ess_exp_daily[0] = ess_exp_today;
+
     nvs_close(h);
 }
 #else
@@ -1086,6 +1135,23 @@ void BL_ProcessSweep(void) {
         int qhr = msm / 15;                         // 15-min interval of the day
 
         if (last_msm >= 0 && msm < last_msm) {      // midnight wrap
+            /* Roll daily history arrays before zeroing today counters.
+               [1]=yesterday gets today's final value; older slots shift down. */
+            solar_daily[3]   = solar_daily[2];
+            solar_daily[2]   = solar_daily[1];
+            solar_daily[1]   = gen_today;
+            solar_daily[0]   = 0.0f;
+
+            ess_imp_daily[3] = ess_imp_daily[2];
+            ess_imp_daily[2] = ess_imp_daily[1];
+            ess_imp_daily[1] = ess_imp_today;
+            ess_imp_daily[0] = 0.0f;
+
+            ess_exp_daily[3] = ess_exp_daily[2];
+            ess_exp_daily[2] = ess_exp_daily[1];
+            ess_exp_daily[1] = ess_exp_today;
+            ess_exp_daily[0] = 0.0f;
+
             gen_today = 0; ess_imp_today = 0; ess_exp_today = 0;
             COUNTERS_Save();
         } else if (last_qhr >= 0 && qhr != last_qhr) {
@@ -2025,10 +2091,18 @@ int http_fn_api_dash(http_request_t *request) {
             B("%s{\"v\":%d,\"w\":%d,\"o\":%d}",
               i ? "," : "", (int)(v * 10.0f + 0.5f), (int)w, on);
         }
-        B("],\"gen\":{\"d\":%d,\"t\":%d},\"imp\":{\"d\":%d,\"t\":%d},\"exp\":{\"d\":%d,\"t\":%d}",
-          (int)(gen_today + 0.5f),     (int)(gen_total + 0.5f),
-          (int)(ess_imp_today + 0.5f), (int)(ess_imp_total + 0.5f),
-          (int)(ess_exp_today + 0.5f), (int)(ess_exp_total + 0.5f));
+        B("],\"gen\":{\"d\":%d,\"t\":%d,\"h\":[%d,%d,%d]}"
+          ",\"imp\":{\"d\":%d,\"t\":%d,\"h\":[%d,%d,%d]}"
+          ",\"exp\":{\"d\":%d,\"t\":%d,\"h\":[%d,%d,%d]}",
+          /* Solar: today, lifetime, history [yest, 2d, 3d] */
+          (int)(gen_today      + 0.5f), (int)(gen_total      + 0.5f),
+          (int)(solar_daily[1] + 0.5f), (int)(solar_daily[2] + 0.5f), (int)(solar_daily[3] + 0.5f),
+          /* ESS import: today, lifetime, history */
+          (int)(ess_imp_today    + 0.5f), (int)(ess_imp_total    + 0.5f),
+          (int)(ess_imp_daily[1] + 0.5f), (int)(ess_imp_daily[2] + 0.5f), (int)(ess_imp_daily[3] + 0.5f),
+          /* ESS export: today, lifetime, history */
+          (int)(ess_exp_today    + 0.5f), (int)(ess_exp_total    + 0.5f),
+          (int)(ess_exp_daily[1] + 0.5f), (int)(ess_exp_daily[2] + 0.5f), (int)(ess_exp_daily[3] + 0.5f));
     }
 
     // ---- GRAPH ARRAYS (req=net | req=batt) ----
