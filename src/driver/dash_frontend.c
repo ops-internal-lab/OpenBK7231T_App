@@ -666,7 +666,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "for(i=0;i<6;i++){el=document.getElementById('sd-m'+i);m=d.mt[i];on=m?m.o:0;"
         "if(el){if(!on){el.innerHTML='--';el.style.color='#5a6470';}"
         "else{var stale=(on===2);el.style.color=stale?'#caa24a':((i===5)?((m.w<0)?'#37d67a':'#9aa0a8'):'#cfd3d8');"
-        "el.innerHTML=(m.v/10).toFixed(1)+'V<br>'+m.w+'W'+(stale?' <span style=\\"color:#caa24a\\">&#9888;</span>':'')+'}'}"
+        "el.innerHTML=(m.v/10).toFixed(1)+'V<br>'+m.w+'W'+(stale?' <span style=\"color:#caa24a\">&#9888;</span>':'')+'}'}"
         "if(on){if(i>=3&&i<5){ts+=m.w;tso=1;}else if(i===5){te=m.w;teo=1;}}}"
         "setV('sd-sol-now',tso?(ts+'W'):'--');"
         "setV('sd-ess-now',teo?(te+'W'):'--');"
