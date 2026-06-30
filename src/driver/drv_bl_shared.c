@@ -30,12 +30,20 @@ static float net_matrix[MATRIX_SIZE] = {0};
 // small (1 byte/sample) while internal calculations keep full accuracy.
 static unsigned char net_graph_matrix[MATRIX_SIZE] = {0};
 
-// New Averages matrices
-static int charger_c_matrix[MATRIX_SIZE] = {0};
-static int inverter_matrix[MATRIX_SIZE] = {0};
-static int current_charger_c_accum = 0;
-static int current_inverter_accum = 0;
-static int sample_count_30s = 0;
+// --- Graph series for the two-panel dashboard chart, one value per 15-min slot ---
+// TOP panel: average BATTERY power over the period, signed (+ = charge,
+//   - = discharge), in W, clamped to +/-500. Served as 10-bit sign+magnitude
+//   (2 bytes/slot) and split into charge/discharge traces by the browser.
+// BOTTOM panel: SOLAR energy generated over the period, in Wh magnitude,
+//   clamped 0..150. Always drawn as a negative (downward) yellow overlay.
+static int           ess_pwr_matrix[MATRIX_SIZE]    = {0};   // avg battery W, signed
+static unsigned char solar_graph_matrix[MATRIX_SIZE] = {0};  // solar Wh/period, 0..150
+
+// Per-period sample accumulators (sampled by the 30 s sampler below). Battery
+// power is signed; solar power is the (>=0) instantaneous generation in W.
+static int current_ess_pwr_accum   = 0;   // sum of signed battery W samples
+static int current_solar_pwr_accum = 0;   // sum of solar W samples (>=0)
+static int sample_count_30s        = 0;
 
 int solar_available = 0;
 
@@ -152,8 +160,18 @@ static void SETTINGS_Save(void);             // defined after the NVS includes b
 // ---- Remote meter slots (filled once per read by the BL0942 TCP poller) ----
 // Slot roles match g_meter_ip[]: [0..2]=L1/L2/L3 (bidirectional grid phases,
 // signed power: +import / -export), [3..4]=Solar A/B, [5]=ESS (bidir).
-typedef struct { float v, a, w, freq; int online; } meter_slot_t;
+// online = 1 once a good reading has ever landed (stays 1 across brief read
+// failures so we can hold the last-good value); last_ok = tick of the most
+// recent successful read. Display/integration freshness is derived from the
+// age of last_ok, not from online alone (see BL_MeterOnlineState).
+typedef struct { float v, a, w, freq; int online; portTickType last_ok; } meter_slot_t;
 static meter_slot_t g_meter[6];
+
+// Read freshness windows. A slot is polled ~every 6 s, so within 9 s a good
+// read is "fresh"; up to 30 s we keep showing/integrating the last-good value
+// but flag it as "stale" (comms hiccup); beyond 30 s it's treated as offline.
+#define METER_FRESH_TICKS ((portTickType)( 9000 / portTICK_PERIOD_MS))
+#define METER_HOLD_TICKS  ((portTickType)(30000 / portTICK_PERIOD_MS))
 
 // ---- Solar / ESS energy counters (Wh) ----
 // Today resets at local midnight; total is lifetime. Accumulated by
@@ -954,28 +972,59 @@ int BL_GetMeterOctet(int slot) {
     return g_meter_ip[slot];
 }
 
-// Store one freshly-read meter reading into its slot. online=0 writes zeros
-// (zero-IP or failed read) so the panel shows the meter as absent/offline.
+// Store one freshly-read GOOD reading: latch values and timestamp it.
+// online=0 means a hard offline (unset IP) — clear the slot completely so it
+// shows as absent. A *failed read* must NOT come through here as online=0
+// (that would wipe the last-good value); use BL_MeterReadFailed instead.
 void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online) {
     if (slot < 0 || slot >= 6) return;
     if (online) {
         g_meter[slot].v = v; g_meter[slot].a = a;
         g_meter[slot].w = w; g_meter[slot].freq = freq;
         g_meter[slot].online = 1;
+        g_meter[slot].last_ok = xTaskGetTickCount();
     } else {
         g_meter[slot].v = 0; g_meter[slot].a = 0;
         g_meter[slot].w = 0; g_meter[slot].freq = 0;
         g_meter[slot].online = 0;
+        g_meter[slot].last_ok = 0;
     }
 }
 
-// Read back a slot for the /api_dash?req=meters payload.
+// A read attempt failed but the meter may just have a comms hiccup: keep the
+// last-good value and let it age out via last_ok. No store change needed —
+// after METER_HOLD_TICKS the slot is reported offline automatically.
+void BL_MeterReadFailed(int slot) {
+    (void)slot;   // intentionally a no-op: do NOT overwrite last-good values
+}
+
+// Tri-state freshness for a slot: 0 = offline (never read, hard-offline, or
+// last good read older than the hold window), 1 = fresh, 2 = stale-but-holding
+// (within the hold window — show the value but flag a comms problem).
+int BL_MeterOnlineState(int slot) {
+    portTickType age;
+    if (slot < 0 || slot >= 6) return 0;
+    if (!g_meter[slot].online)  return 0;
+    age = xTaskGetTickCount() - g_meter[slot].last_ok;
+    if (age <= METER_FRESH_TICKS) return 1;
+    if (age <= METER_HOLD_TICKS)  return 2;
+    return 0;
+}
+
+// Power for energy integration: last-good W while online (fresh or stale),
+// else 0 so a >30 s dropout can't keep injecting phantom energy.
+static float BL_MeterIntegW(int slot) {
+    return BL_MeterOnlineState(slot) ? g_meter[slot].w : 0.0f;
+}
+
+// Read back a slot for the /api_dash?req=meters payload. *online returns the
+// tri-state (0 offline / 1 fresh / 2 stale-holding).
 int BL_GetMeter(int slot, float *v, float *a, float *w, int *online) {
     if (slot < 0 || slot >= 6) return 0;
     if (v)      *v      = g_meter[slot].v;
     if (a)      *a      = g_meter[slot].a;
     if (w)      *w      = g_meter[slot].w;
-    if (online) *online = g_meter[slot].online;
+    if (online) *online = BL_MeterOnlineState(slot);
     return 1;
 }
 
@@ -995,22 +1044,24 @@ void BL_ProcessSweep(void) {
     if (!(dt_h > 0.0f) || dt_h > 0.02f) dt_h = 0.0f;
 
     // --- Consumption: L1+L2+L3 (signed net) -> existing pipeline ---
+    // Stale/offline phases contribute 0 W (BL_MeterIntegW) so a dropout can't
+    // freeze a phantom load into the net. Voltage/freq still come from slot 0.
     {
-        float cons_w  = g_meter[0].w + g_meter[1].w + g_meter[2].w;
+        float cons_w  = BL_MeterIntegW(0) + BL_MeterIntegW(1) + BL_MeterIntegW(2);
         float cons_wh = (cons_w < 0.0f ? -cons_w : cons_w) * dt_h;   // magnitude
         BL_ProcessUpdate(g_meter[0].v, g_meter[0].a, cons_w, g_meter[0].freq, cons_wh);
     }
 
     // --- Solar generation: Solar A + Solar B ---
     {
-        float gen_w  = g_meter[3].w + g_meter[4].w;
+        float gen_w  = BL_MeterIntegW(3) + BL_MeterIntegW(4);
         float gen_wh = (gen_w > 0.0f ? gen_w : 0.0f) * dt_h;
         gen_today += gen_wh; gen_total += gen_wh;
     }
 
     // --- ESS (m6) signed: import/charge (>=0) vs export/discharge (<0) ---
     {
-        float ess_w  = g_meter[5].w;
+        float ess_w  = BL_MeterIntegW(5);
         float ess_wh = (ess_w < 0.0f ? -ess_w : ess_w) * dt_h;
         if (ess_w >= 0.0f) { ess_imp_today += ess_wh; ess_imp_total += ess_wh; }
         else               { ess_exp_today += ess_wh; ess_exp_total += ess_wh; }
@@ -1097,18 +1148,21 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
         check_hour = TIME_GetHour();
 
         // ======================================================================================================
-        // 30-SECOND SAMPLER (Charger & Inverter Averages)
+        // 30-SECOND SAMPLER (Battery power + Solar power averages)
         // ======================================================================================================
         static portTickType last_30s_tick = 0;
         portTickType current_sys_tick = xTaskGetTickCount();
         if ((current_sys_tick - last_30s_tick) >= (30000 / portTICK_PERIOD_MS) || last_30s_tick == 0) {
             last_30s_tick = current_sys_tick;
-            int current_dmp = dump_load_relay[5];
-            
-            if (current_dmp >= 18 && current_dmp <= 100) {
-                current_charger_c_accum += current_dmp;
-            } else if (current_dmp == 5) {
-                current_inverter_accum += 100; // Represent directly as full percentage state
+
+            // Battery (ESS = meter slot 5): signed power, + charge / - discharge.
+            current_ess_pwr_accum += safe_int(BL_MeterIntegW(5));
+
+            // Solar = meter slots 3 + 4, generation only (clamp negatives to 0).
+            {
+                int solar_w = safe_int(BL_MeterIntegW(3)) + safe_int(BL_MeterIntegW(4));
+                if (solar_w < 0) solar_w = 0;
+                current_solar_pwr_accum += solar_w;
             }
             sample_count_30s++;
         }
@@ -1127,7 +1181,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
 
             if (current_matrix_index != last_matrix_index) {
                 float period_net;
-                int chg_val, inv_val;
+                int ess_avg_w, solar_period_wh;
 
                 consumption_matrix[last_matrix_index] = safe_int(real_consumption);
                 export_matrix[last_matrix_index] = safe_int(real_export);
@@ -1172,16 +1226,22 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = lh_sum;
                 }
 
-                // Write averages for the interval, clamped to 0..127 so the
-                // graph payload can be packed as a single byte each.
-                chg_val = sample_count_30s ? (current_charger_c_accum / sample_count_30s) : 0;
-                inv_val = sample_count_30s ? (current_inverter_accum / sample_count_30s) : 0;
-                if (chg_val > 127) chg_val = 127;
-                if (chg_val < 0)   chg_val = 0;
-                if (inv_val > 127) inv_val = 127;
-                if (inv_val < 0)   inv_val = 0;
-                charger_c_matrix[last_matrix_index] = chg_val;
-                inverter_matrix[last_matrix_index] = inv_val;
+                // TOP panel: average battery power for the interval, signed
+                // (+ charge / - discharge), clamped to +/-500 W.
+                ess_avg_w = sample_count_30s ? (current_ess_pwr_accum / sample_count_30s) : 0;
+                if (ess_avg_w >  500) ess_avg_w =  500;
+                if (ess_avg_w < -500) ess_avg_w = -500;
+                ess_pwr_matrix[last_matrix_index] = ess_avg_w;
+
+                // BOTTOM panel: solar ENERGY generated this period (Wh) =
+                // average solar power (W) * 0.25 h. Clamped 0..150 to match the
+                // chart's -150..+150 band; drawn as a negative yellow overlay.
+                solar_period_wh = sample_count_30s
+                    ? ((current_solar_pwr_accum / sample_count_30s) / 4)
+                    : 0;
+                if (solar_period_wh > 150) solar_period_wh = 150;
+                if (solar_period_wh < 0)   solar_period_wh = 0;
+                solar_graph_matrix[last_matrix_index] = (unsigned char)solar_period_wh;
 
                 // Apply the period's net energy to the running totals.
                 if (period_net > 0) {
@@ -1209,11 +1269,11 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     BL09XX_SaveEmeteringStatistics();
                     lastConsumptionSaveStamp = xTaskGetTickCount();
 #if PLATFORM_ESPIDF
-                    /* Persist the 48-byte net_graph_matrix so the graph
-                       survives power cuts. Charger/inverter arrays also
-                       saved. Total NVS write: ~150 bytes every 15 min. */
+                    /* Persist the graph matrices so the chart survives power
+                       cuts: net (48 B) + solar (48 B) + battery power
+                       (48 ints). Total NVS write: ~290 bytes every 15 min. */
                     HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
-                                                   charger_c_matrix, inverter_matrix,
+                                                   solar_graph_matrix, ess_pwr_matrix,
                                                    MATRIX_SIZE, last_matrix_index,
                                                    (unsigned int)TIME_GetCurrentTime());
 #endif
@@ -1249,11 +1309,11 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 export_matrix[current_matrix_index] = 0;
                 net_matrix[current_matrix_index] = 0;
                 net_graph_matrix[current_matrix_index] = (unsigned char)((0 + 150) / 2); // encodes 0 Wh
-                charger_c_matrix[current_matrix_index] = 0;
-                inverter_matrix[current_matrix_index] = 0;
+                ess_pwr_matrix[current_matrix_index] = 0;
+                solar_graph_matrix[current_matrix_index] = 0;
 
-                current_charger_c_accum = 0;
-                current_inverter_accum = 0;
+                current_ess_pwr_accum   = 0;
+                current_solar_pwr_accum = 0;
                 sample_count_30s = 0;
 
                 last_matrix_index = current_matrix_index;
@@ -1543,7 +1603,7 @@ void BL_Shared_Init(void)
         int saved_idx = 0;
         unsigned int saved_ts = 0;
         if (HAL_FlashVars_LoadGraphMatrices(net_graph_matrix,
-                                            charger_c_matrix, inverter_matrix,
+                                            solar_graph_matrix, ess_pwr_matrix,
                                             MATRIX_SIZE, &saved_idx, &saved_ts)) {
             last_matrix_index = saved_idx;
             addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
@@ -1964,21 +2024,27 @@ int http_fn_api_dash(http_request_t *request) {
           (int)(ess_exp_today + 0.5f), (int)(ess_exp_total + 0.5f));
     }
 
-    // ---- GRAPH ARRAYS (req=net | req=chginv) ----
-    // req=net:    {"net":"b64_48"} — original signed packing kept:
-    //   1 byte per slot = (clamp(net_Wh,-150,300)+150)/2.
-    //   JS splits by sign at render time: positive=import(red up),
-    //   negative=export(green down). No extra bytes needed.
-    // req=chginv: {"chginv":"b64_48"}
-    //   int8 signed: +v=charger at v%, -v=inverter at v%, 0=neither.
+    // ---- GRAPH ARRAYS (req=net | req=batt) ----
+    // req=net: {"net":"b64_48","sol":"b64_48"} — bottom panel, bundled.
+    //   net: 1 byte/slot = (clamp(net_Wh,-150,300)+150)/2. JS splits by sign:
+    //        positive=total energy import (red up), negative=export (green down).
+    //   sol: 1 byte/slot = solar Wh this period, 0..150. JS draws it negated
+    //        (yellow, downward) as a semi-transparent overlay.
+    // req=batt: {"batt":"b64_96"} — top panel, battery power.
+    //   2 bytes/slot, little-endian 10-bit sign+magnitude:
+    //   enc = (|W| & 0x1FF) | (W<0 ? 0x200 : 0), |W| clamped to 500.
+    //   JS: mag = enc & 0x1FF; if (enc & 0x200) mag = -mag.  + = charge, - = discharge.
     else if (has_ntp && req_param) {
         unsigned int msm = TIME_GetHour() * 60 + TIME_GetMinute();
 
         if (strncmp(req_param, "req=net", 7) == 0) {
-            unsigned char raw[MATRIX_SIZE];
-            char          b64[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
-            int           raw_len = 0, b64l;
-            int           net_live = safe_int(real_consumption - real_export);
+            unsigned char rn[MATRIX_SIZE], rs[MATRIX_SIZE];
+            char          bn[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            char          bs[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            int           rn_len = 0, rs_len = 0, l;
+            int           net_live   = safe_int(real_consumption - real_export);
+            int           solar_live = sample_count_30s
+                                       ? ((current_solar_pwr_accum / sample_count_30s) / 4) : 0;
 
             for (int i = 47; i >= 0; i--) {
                 int idx  = (msm / net_metering_period - i + 96) % 96;
@@ -1987,40 +2053,41 @@ int http_fn_api_dash(http_request_t *request) {
                     int val = net_live;
                     if (val > 300)  val = 300;
                     if (val < -150) val = -150;
-                    raw[raw_len++] = (unsigned char)((val + 150) / 2);
+                    rn[rn_len++] = (unsigned char)((val + 150) / 2);
+                    if (solar_live > 150) solar_live = 150;
+                    if (solar_live < 0)   solar_live = 0;
+                    rs[rs_len++] = (unsigned char)solar_live;
                 } else {
-                    raw[raw_len++] = net_graph_matrix[slot];
+                    rn[rn_len++] = net_graph_matrix[slot];
+                    rs[rs_len++] = solar_graph_matrix[slot];
                 }
             }
-            b64l = base64_encode(raw, raw_len, b64); b64[b64l] = '\0';
-            B("\"net\":\"%s\"", b64);
+            l = base64_encode(rn, rn_len, bn); bn[l] = '\0';
+            l = base64_encode(rs, rs_len, bs); bs[l] = '\0';
+            B("\"net\":\"%s\",\"sol\":\"%s\"", bn, bs);
 
-        } else if (strncmp(req_param, "req=chginv", 10) == 0) {
-            unsigned char raw[MATRIX_SIZE];
-            char          b64[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+        } else if (strncmp(req_param, "req=batt", 8) == 0) {
+            unsigned char raw[MATRIX_SIZE * 2];
+            char          b64[((MATRIX_SIZE * 2) + 2) / 3 * 4 + 1];
             int           raw_len = 0, b64_len;
             int           has_live = (sample_count_30s > 0);
-            int           chg_live = 0, inv_live = 0;
-            if (has_live) {
-                chg_live = current_charger_c_accum / sample_count_30s;
-                inv_live = current_inverter_accum / sample_count_30s;
-            }
+            int           batt_live = has_live ? (current_ess_pwr_accum / sample_count_30s) : 0;
+
             for (int i = 47; i >= 0; i--) {
                 int idx  = (msm / net_metering_period - i + 96) % 96;
                 int slot = idx % MATRIX_SIZE;
-                int chg_v = (i == 0 && has_live) ? chg_live : charger_c_matrix[slot];
-                int inv_v = (i == 0 && has_live) ? inv_live : inverter_matrix[slot];
-                int combined;
-                if (chg_v > 0)      combined = chg_v;
-                else if (inv_v > 0) combined = -inv_v;
-                else                combined = 0;
-                if (combined > 127)  combined = 127;
-                if (combined < -127) combined = -127;
-                raw[raw_len++] = (unsigned char)((signed char)combined);
+                int w    = (i == 0 && has_live) ? batt_live : ess_pwr_matrix[slot];
+                int mag, enc;
+                if (w >  500) w =  500;
+                if (w < -500) w = -500;
+                mag = (w < 0) ? -w : w;
+                enc = (mag & 0x1FF) | ((w < 0) ? 0x200 : 0);
+                raw[raw_len++] = (unsigned char)(enc & 0xFF);
+                raw[raw_len++] = (unsigned char)((enc >> 8) & 0x03);
             }
             b64_len = base64_encode(raw, raw_len, b64);
             b64[b64_len] = '\0';
-            B("\"chginv\":\"%s\"", b64);
+            B("\"batt\":\"%s\"", b64);
         }
     }
 

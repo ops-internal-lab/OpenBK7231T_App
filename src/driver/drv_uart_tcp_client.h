@@ -20,7 +20,7 @@
    Applies to both SO_RCVTIMEO (data wait) and SO_SNDTIMEO (connect).
    lwIP honours SO_SNDTIMEO during blocking connect() when
    LWIP_SO_SNDTIMEO=1 (default on ESP-IDF). */
-#define UART_TCP_TIMEOUT_MS    50
+#define UART_TCP_TIMEOUT_MS    100
 
 /* Boot init — loads NVS, registers console commands */
 void        UART_TCP_ClientInit(void);

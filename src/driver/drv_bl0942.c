@@ -378,16 +378,24 @@ static void BL0942_PollRemoteMeters(void) {
     int  oct  = BL_GetMeterOctet(slot);
 
     if (oct == 0) {
-        BL_SetMeterReading(slot, 0, 0, 0, 0, 0);   // unset -> offline, no socket
+        BL_SetMeterReading(slot, 0, 0, 0, 0, 0);   // unset -> hard offline, no socket
     } else {
         char ip[24];
         byte buf[BL0942_UART_PACKET_LEN];
-        int  got;
+        int  got, attempt, ok = 0;
         UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
-        got = UART_TCP_PollMeter(ip, UART_TCP_PORT, buf, BL0942_UART_PACKET_LEN);
-        if (got < BL0942_UART_PACKET_LEN || !BL0942_ParseScaleStore(buf, got, slot)) {
-            BL_SetMeterReading(slot, 0, 0, 0, 0, 0);   // failed read -> offline
+
+        // Up to 3 attempts, but only retry a connected-but-garbage read. A
+        // connect/send failure (got < 0) means the meter is down — bail out
+        // immediately rather than burn another full timeout on a dead host.
+        for (attempt = 0; attempt < 3 && !ok; attempt++) {
+            got = UART_TCP_PollMeter(ip, UART_TCP_PORT, buf, BL0942_UART_PACKET_LEN);
+            if (got < 0) break;   // connect/send failed -> meter down, no retry
+            if (got >= BL0942_UART_PACKET_LEN && BL0942_ParseScaleStore(buf, got, slot))
+                ok = 1;           // good frame stored (sets slot online + timestamp)
+            // else: connected but short/garbled frame -> loop and retry
         }
+        if (!ok) BL_MeterReadFailed(slot);   // keep last-good, let it age out (30 s)
     }
 
     s_meter_idx = (s_meter_idx + 1) % 6;
