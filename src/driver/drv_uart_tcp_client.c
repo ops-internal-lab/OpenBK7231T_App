@@ -69,6 +69,12 @@ static void build_ip(char *out, int outsz, uint8_t octet)
     snprintf(out, outsz, "%s.%d", prefix, (int)octet);
 }
 
+/* Public: build "<our-subnet>.<octet>" into out. */
+void UART_TCP_BuildIP(char *out, int outsz, unsigned char octet)
+{
+    build_ip(out, outsz, (uint8_t)octet);
+}
+
 /* ---- NVS helpers ---- */
 static void nvs_load_all(void)
 {
@@ -149,6 +155,34 @@ int UART_TCP_Connect(const char *ip, int port)
     ADDLOG_INFO(LOG_FEATURE_DRV, "UART_TCP: connected to %s:%d (slot %d)",
                 ip, port, s_last_slot);
     return fd;
+}
+
+/* Poll one BL0942 meter over serial-over-TCP.
+   Connects to ip:port, sends the BL0942 read request, then accumulates up to
+   outlen response bytes (each recv bounded by the 50 ms SO_RCVTIMEO set in
+   Connect). The socket is ALWAYS closed before returning — one read, no
+   lingering connection, nothing held between cycles. Returns the number of
+   bytes received (the caller validates/parses the 23-byte 0x55 frame), or -1
+   on connect/send failure. */
+int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
+{
+    int got = 0;
+    int fd  = UART_TCP_Connect(ip, port);
+    if (fd < 0) return -1;
+
+    /* BL0942 UART read request: CMD_READ(addr=0)=0x58, then REG_PACKET=0xAA. */
+    {
+        uint8_t req[2] = { 0x58, 0xAA };
+        if (send(fd, req, sizeof(req), 0) < 0) { close(fd); return -1; }
+    }
+
+    while (got < outlen) {
+        int n = recv(fd, out + got, outlen - got, 0);   /* 50 ms budget */
+        if (n <= 0) break;                              /* timeout / close / error */
+        got += n;
+    }
+    close(fd);
+    return got;
 }
 
 /* ---- public: charger targets ---- */

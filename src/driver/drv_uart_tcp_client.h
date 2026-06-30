@@ -36,6 +36,13 @@ int         UART_TCP_GetLastSlot(void);
    Returns socket fd or -1 on failure. */
 int         UART_TCP_Connect(const char *ip, int port);
 
+/* Poll one BL0942 meter: connect, send read request, recv up to outlen bytes
+   (50ms budget), close. Returns bytes received, or -1 on connect/send failure. */
+int         UART_TCP_PollMeter(const char *ip, int port, unsigned char *out, int outlen);
+
+/* Build "<our-subnet>.<octet>" (e.g. "192.168.8.156") into out. */
+void        UART_TCP_BuildIP(char *out, int outsz, unsigned char octet);
+
 /* ---- Charger targets ---- */
 /* Returns full IP of charger slot (0=placeholder, 1=active), NULL if unset */
 const char *UART_TCP_GetChargerIP(int slot);

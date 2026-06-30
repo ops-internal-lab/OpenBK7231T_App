@@ -9,6 +9,13 @@
 void BL_Shared_Init(void);
 void BL_ProcessUpdate(float voltage, float current, float power,
                       float frequency, float energyWh);
+
+/* Remote multi-meter interface (BL0942 TCP poller <-> shared accounting). */
+int  BL_GetMeterOctet(int slot);                                  /* 0 = unset */
+void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online);
+int  BL_GetMeter(int slot, float *v, float *a, float *w, int *online);
+void BL_ProcessSweep(void);                                       /* once per full sweep */
+
 void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState);
 void BL09XX_SaveEmeteringStatistics();
 

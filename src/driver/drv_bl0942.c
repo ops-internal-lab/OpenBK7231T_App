@@ -330,7 +330,80 @@ void BL0942_UART_Init(void) {
     UART_WriteReg(BL0942_REG_WA_CREEP, DEFAULT_WA_CREEP_VAL);
 }
 
+#if PLATFORM_ESPIDF
+// ====================================================================
+// REMOTE MULTI-METER POLLER (serial-over-TCP, 6 meters)
+// ====================================================================
+// One meter is polled per call (per second); a full 6-meter sweep takes ~6 s.
+// Each meter: zero-octet -> mark offline and skip instantly; otherwise open a
+// short-lived socket, read one BL0942 frame (50 ms budget), parse + scale, and
+// store to its slot. On sweep completion the shared layer integrates energy and
+// feeds the consumption phases into the existing pipeline.
+static int s_meter_idx = 0;
+
+// Validate + parse a 23-byte 0x55 frame from a flat buffer, scale it, and store
+// to meter `slot`. Returns 1 on a good frame, 0 otherwise. Checksum matches the
+// local parser: (CMD_READ + sum(bytes[0..len-2])) ^ 0xFF == last byte.
+static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
+    int i;
+    byte checksum;
+    bl0942_data_t d;
+    float voltage, current, power, frequency, signedPower;
+
+    if (len < BL0942_UART_PACKET_LEN)        return 0;
+    if (b[0] != BL0942_UART_PACKET_HEAD)     return 0;
+
+    checksum = BL0942_UART_CMD_READ(BL0942_UART_ADDR);
+    for (i = 0; i < BL0942_UART_PACKET_LEN - 1; i++) checksum += b[i];
+    checksum ^= 0xFF;
+    if (checksum != b[BL0942_UART_PACKET_LEN - 1]) return 0;
+
+    d.i_rms  = (b[3] << 16) | (b[2] << 8) | b[1];
+    d.v_rms  = (b[6] << 16) | (b[5] << 8) | b[4];
+    d.watt   = Int24ToInt32((b[12] << 16) | (b[11] << 8) | b[10]);
+    d.cf_cnt = (b[15] << 16) | (b[14] << 8) | b[13];
+    d.freq   = (b[17] << 8) | b[16];
+
+    PwrCal_Scale(d.v_rms, d.i_rms, d.watt, &voltage, &current, &power);
+    if (!isfinite(power)) power = 0.0f;
+    frequency   = (d.freq != 0) ? (2 * 500000.0f / d.freq) : 0.0f;
+    signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
+
+    BL_SetMeterReading(slot, voltage, current, signedPower, frequency, 1);
+    return 1;
+}
+
+static void BL0942_PollRemoteMeters(void) {
+    int  slot = s_meter_idx;
+    int  oct  = BL_GetMeterOctet(slot);
+
+    if (oct == 0) {
+        BL_SetMeterReading(slot, 0, 0, 0, 0, 0);   // unset -> offline, no socket
+    } else {
+        char ip[24];
+        byte buf[BL0942_UART_PACKET_LEN];
+        int  got;
+        UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
+        got = UART_TCP_PollMeter(ip, UART_TCP_PORT, buf, BL0942_UART_PACKET_LEN);
+        if (got < BL0942_UART_PACKET_LEN || !BL0942_ParseScaleStore(buf, got, slot)) {
+            BL_SetMeterReading(slot, 0, 0, 0, 0, 0);   // failed read -> offline
+        }
+    }
+
+    s_meter_idx = (s_meter_idx + 1) % 6;
+    if (s_meter_idx == 0) {
+        BL_ProcessSweep();   // full sweep complete
+    }
+}
+#endif // PLATFORM_ESPIDF
+
 void BL0942_UART_RunEverySecond(void) {
+#if PLATFORM_ESPIDF
+    // No local hardware meter on this build — all six meters are remote
+    // (serial-over-TCP). Rotate the remote poll instead of reading a local UART.
+    BL0942_PollRemoteMeters();
+    return;
+#endif
     // Send the read request.
     // UART_InitUART is NOT called here — it belongs in BL0942_UART_Init only.
     // Calling it every second reinitialises the peripheral, drives TX low
