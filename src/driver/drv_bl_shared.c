@@ -3,6 +3,13 @@
 #include <stdlib.h>   // atof, abs
 #include <stdio.h>    // snprintf
 #include <string.h>   // memset, strlen
+#if PLATFORM_ESPIDF
+// ESP-IDF does not transitively pull FreeRTOS in via the local headers below,
+// and TickType_t / xTaskGetTickCount are used before those includes (line ~167).
+// Pull them in up front so the type is defined at first use.
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 #include "dash_frontend.h"
 
 // Charger C mapping constants
