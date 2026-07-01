@@ -90,7 +90,7 @@ static uint32_t PrevCfCnt = CF_CNT_INVALID;
 static int g_offlineSec = 0;
 
 static int32_t Int24ToInt32(int32_t val) {
-    return (val & (1 << 23) ? val | (0xFF << 24) : val);
+    return (val & (1 << 23) ? val | 0xFF000000u : val);
 }
 
 // ============================================================================
@@ -171,7 +171,7 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     // ====================================================================
     // 10-SECOND TICK LOGIC (INSTANTANEOUS SENSORS + ACCUMULATED ENERGY)
     // ====================================================================
-    #define SAMPLES_PER_UPDATE 5
+    #define SAMPLES_PER_UPDATE 2
 
     static int   sampleCount = 0;
     static float energyAccum = 0.0f;
@@ -181,11 +181,9 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     sampleCount++;
 
     if (sampleCount < SAMPLES_PER_UPDATE) {
-        return; // Do nothing else until the 10th call
+        return; // Do nothing else until the 2nd call
     }
 
-    // On the 10th call, pass instantaneous readings from THIS exact sample,
-    // alongside the total energy accumulated over the last 10 samples.
     float totalEnergyWh = energyAccum;
 
     BL_ProcessUpdate(voltage, current, signedPower, frequency, totalEnergyWh);
