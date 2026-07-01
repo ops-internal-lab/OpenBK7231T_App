@@ -1,19 +1,25 @@
 /* ==========================================================================
-   drv_uart_tcp_client.c  --  Remote UART-over-TCP + charger HTTP client
+   drv_uart_tcp_client.c  --  Remote UART-over-TCP client (MASTER side)
 
-   Serial targets (UART_TCP_SERIAL_MAX = 4):
-     setUartTarget1..4 <last_octet>   — set/clear (0 = clear)
-     listUartTargets                  — show all slots
+   What changed vs the old file:
+   The old 6-meter poller (BL0942_PollRemoteMeters in drv_bl0942.c) opened a
+   BRAND-NEW TCP connection every poll and closed it. On lwIP each closed
+   connection sits in TIME_WAIT for ~2*MSL (~120 s on ESP-IDF), so polling 6
+   meters churned the socket pool dry and most polls failed to connect.
 
-   Charger targets (UART_TCP_CHARGER_MAX = 2):
-     setChargerIP1 <last_octet>       — placeholder charger IP
-     setChargerIP2 <last_octet>       — active charger (receives HTTP cmds)
-     sendChargerCmd <path>            — GET /path on active charger IP
-     listChargerIPs                   — show charger slots
+   This file now runs ONE long-lived task (MeterPoll_Task) that keeps a
+   PERSISTENT socket open to each configured meter and reuses it every sweep.
+   Connections are created once (or re-created on failure, throttled), never
+   per poll. Every socket has a single owner (the task) and a single close
+   site (mc_close) that nulls the fd, so nothing leaks and nothing double-closes.
 
-   Full IP is built at connect time:
-     prefix = first 3 octets of device's own WiFi IP
-     full   = prefix + "." + stored_octet
+   The original HAL-level mechanism (setUartTarget1..4 / s_serial[] /
+   UART_TCP_GetCurrentTarget / UART_TCP_AdvanceTarget / UART_TCP_PollMeter) is
+   left fully intact below — hal_uart_espidf.c depends on those symbols.
+
+   Console commands (unchanged):
+     setUartTarget1..4 <octet>     setChargerIP1/2 <octet>
+     listUartTargets               listChargerIPs / sendChargerCmd <path>
    ========================================================================== */
 
 #include "../new_common.h"
@@ -21,14 +27,20 @@
 #include "../cmnds/cmd_local.h"
 #include "../hal/hal_wifi.h"
 #include "drv_uart_tcp_client.h"
+#include "drv_bl0942.h"      /* BL0942_TCP_ScanStore */
+#include "drv_bl_shared.h"   /* BL_GetMeterOctet / BL_SetMeterReading / ... */
 
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+
+#define INVALID_SOCK   -1
 
 /* ---- storage: last octet only (0 = unset) ---- */
 static uint8_t s_serial[UART_TCP_SERIAL_MAX]  = {0};
@@ -36,7 +48,6 @@ static uint8_t s_charger[UART_TCP_CHARGER_MAX] = {0};
 static int     s_current   = 0;
 static int     s_last_slot = -1;
 
-/* assembled full IPs (rebuilt each connect from HAL_GetMyIPString) */
 static char s_serial_ip [UART_TCP_SERIAL_MAX] [24];
 static char s_charger_ip[UART_TCP_CHARGER_MAX][24];
 
@@ -48,15 +59,12 @@ static const char * const s_charger_keys[UART_TCP_CHARGER_MAX] = {
 };
 
 /* ---- IP prefix helper ---- */
-/* Builds "192.168.5" from "192.168.5.45" into buf (must be >=16 bytes).
-   Returns buf, or empty string if IP not yet available. */
 static const char *get_ip_prefix(char *buf, int bufsz)
 {
     const char *myip = HAL_GetMyIPString();
     if (!myip || !*myip) { buf[0] = '\0'; return buf; }
     strncpy(buf, myip, bufsz - 1);
     buf[bufsz - 1] = '\0';
-    /* Remove last octet */
     char *last_dot = strrchr(buf, '.');
     if (last_dot) *last_dot = '\0';
     return buf;
@@ -69,7 +77,6 @@ static void build_ip(char *out, int outsz, uint8_t octet)
     snprintf(out, outsz, "%s.%d", prefix, (int)octet);
 }
 
-/* Public: build "<our-subnet>.<octet>" into out. */
 void UART_TCP_BuildIP(char *out, int outsz, unsigned char octet)
 {
     build_ip(out, outsz, (uint8_t)octet);
@@ -81,14 +88,10 @@ static void nvs_load_all(void)
     nvs_handle_t h = 0;
     nvs_open("config", NVS_READONLY, &h);
     for (int i = 0; i < UART_TCP_SERIAL_MAX; i++) {
-        uint8_t v = 0;
-        nvs_get_u8(h, s_serial_keys[i], &v);
-        s_serial[i] = v;
+        uint8_t v = 0; nvs_get_u8(h, s_serial_keys[i], &v); s_serial[i] = v;
     }
     for (int i = 0; i < UART_TCP_CHARGER_MAX; i++) {
-        uint8_t v = 0;
-        nvs_get_u8(h, s_charger_keys[i], &v);
-        s_charger[i] = v;
+        uint8_t v = 0; nvs_get_u8(h, s_charger_keys[i], &v); s_charger[i] = v;
     }
     nvs_close(h);
 }
@@ -107,7 +110,9 @@ static void nvs_save_charger(int slot) {
     nvs_commit(h); nvs_close(h);
 }
 
-/* ---- public: serial targets ---- */
+/* ===========================================================================
+   LEGACY HAL-level target API (used by hal_uart_espidf.c) — unchanged.
+   =========================================================================== */
 const char *UART_TCP_GetCurrentTarget(void)
 {
     for (int n = 0; n < UART_TCP_SERIAL_MAX; n++) {
@@ -123,12 +128,8 @@ const char *UART_TCP_GetCurrentTarget(void)
     return NULL;
 }
 
-int UART_TCP_GetLastSlot(void) { return s_last_slot; }
-
-void UART_TCP_AdvanceTarget(void)
-{
-    s_current = (s_current + 1) % UART_TCP_SERIAL_MAX;
-}
+int  UART_TCP_GetLastSlot(void) { return s_last_slot; }
+void UART_TCP_AdvanceTarget(void) { s_current = (s_current + 1) % UART_TCP_SERIAL_MAX; }
 
 int UART_TCP_Connect(const char *ip, int port)
 {
@@ -152,40 +153,240 @@ int UART_TCP_Connect(const char *ip, int port)
         close(fd);
         return -1;
     }
-    ADDLOG_INFO(LOG_FEATURE_DRV, "UART_TCP: connected to %s:%d (slot %d)",
-                ip, port, s_last_slot);
     return fd;
 }
 
-/* Poll one BL0942 meter over serial-over-TCP.
-   Connects to ip:port, sends the BL0942 read request, then accumulates up to
-   outlen response bytes (each recv bounded by the 50 ms SO_RCVTIMEO set in
-   Connect). The socket is ALWAYS closed before returning — one read, no
-   lingering connection, nothing held between cycles. Returns the number of
-   bytes received (the caller validates/parses the 23-byte 0x55 frame), or -1
-   on connect/send failure. */
+/* Legacy transient poll — kept for compatibility; the new task does not use it */
 int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 {
     int got = 0;
     int fd  = UART_TCP_Connect(ip, port);
     if (fd < 0) return -1;
-
-    /* BL0942 UART read request: CMD_READ(addr=0)=0x58, then REG_PACKET=0xAA. */
-    {
-        uint8_t req[2] = { 0x58, 0xAA };
-        if (send(fd, req, sizeof(req), 0) < 0) { close(fd); return -1; }
-    }
-
+    { uint8_t req[2] = { 0x58, 0xAA };
+      if (send(fd, req, sizeof(req), 0) < 0) { close(fd); return -1; } }
     while (got < outlen) {
-        int n = recv(fd, out + got, outlen - got, 0);   /* 50 ms budget */
-        if (n <= 0) break;                              /* timeout / close / error */
+        int n = recv(fd, out + got, outlen - got, 0);
+        if (n <= 0) break;
         got += n;
     }
     close(fd);
     return got;
 }
 
-/* ---- public: charger targets ---- */
+/* ===========================================================================
+   PERSISTENT 6-METER POLLER  (the actual fix)
+   =========================================================================== */
+
+#define MP_PORT          UART_TCP_PORT     /* 8888 */
+#define MP_CONNECT_MS    250               /* bounded non-blocking connect wait */
+#define MP_READ_MS       250               /* per-slot response deadline        */
+#define MP_SWEEP_GAP_MS  300               /* pause between full sweeps         */
+#define MP_RETRY_GAP_MS  3000              /* backoff before reconnecting a slot */
+#define MP_MAX_TIMEOUTS  3                 /* consecutive timeouts -> reconnect  */
+#define MP_RXCAP         64                /* per-slot resync buffer            */
+#define MP_SLOTS         6
+
+typedef struct {
+    int           fd;
+    int           rxlen;
+    unsigned      timeouts;
+    uint32_t      next_retry_ms;
+    unsigned char rx[MP_RXCAP];
+} meter_conn_t;
+
+static meter_conn_t g_mc[MP_SLOTS];
+static TaskHandle_t  g_pollTask = NULL;
+static volatile bool g_pollRun = false;
+static volatile bool g_pollDone = false;
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+/* the ONLY close site for a meter socket */
+static void mc_close(int slot)
+{
+    if (g_mc[slot].fd != INVALID_SOCK) {
+        struct linger lg = { 1, 0 };   /* RST close: no TIME_WAIT churn */
+        setsockopt(g_mc[slot].fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        close(g_mc[slot].fd);
+        g_mc[slot].fd = INVALID_SOCK;
+    }
+    g_mc[slot].rxlen    = 0;
+    g_mc[slot].timeouts = 0;
+}
+
+/* bounded non-blocking connect so a dead slave never stalls the sweep */
+static int mc_connect(int slot, const char *ip)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return -1;
+
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons(MP_PORT);
+    a.sin_addr.s_addr = inet_addr(ip);
+
+    int rc = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    if (rc != 0 && errno != EINPROGRESS) { close(fd); return -1; }
+    if (rc != 0) {
+        fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
+        struct timeval tv = { 0, MP_CONNECT_MS * 1000 };
+        if (select(fd + 1, NULL, &w, NULL, &tv) <= 0) { close(fd); return -1; }
+        int err = 0; socklen_t l = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l);
+        if (err != 0) { close(fd); return -1; }
+    }
+    g_mc[slot].fd       = fd;   /* stays non-blocking for reads */
+    g_mc[slot].rxlen    = 0;
+    g_mc[slot].timeouts = 0;
+    ADDLOG_INFO(LOG_FEATURE_DRV, "Meter %d connected (%s)", slot + 1, ip);
+    return fd;
+}
+
+/* Poll one connected slot. Returns: 1 good frame stored, 0 timeout/no frame,
+   -1 hard error (caller closes the socket). */
+static int mc_poll(int slot)
+{
+    meter_conn_t *m = &g_mc[slot];
+    unsigned char req[2] = { 0x58, 0xAA };
+    uint32_t deadline;
+
+    if (send(m->fd, req, 2, 0) < 0 &&
+        errno != EWOULDBLOCK && errno != EAGAIN) return -1;
+
+    deadline = now_ms() + MP_READ_MS;
+    while ((int32_t)(now_ms() - deadline) < 0) {
+        int n;
+        if (m->rxlen >= MP_RXCAP) m->rxlen = 0;          /* overflow -> resync */
+        n = recv(m->fd, m->rx + m->rxlen, MP_RXCAP - m->rxlen, 0);
+        if (n > 0) {
+            int consumed;
+            m->rxlen += n;
+            /* scan for the first checksum-valid 23-byte 0x55 frame anywhere
+               in the buffer; tolerant of leading/stray bytes */
+            consumed = BL0942_TCP_ScanStore(m->rx, m->rxlen, slot);
+            if (consumed > 0) {
+                int rem = m->rxlen - consumed;
+                if (rem > 0) memmove(m->rx, m->rx + consumed, rem);
+                m->rxlen = rem;
+                return 1;
+            }
+        } else if (n == 0) {
+            return -1;                                   /* peer closed */
+        } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            return -1;                                   /* hard error */
+        } else {
+            rtos_delay_milliseconds(5);                  /* nothing yet, wait */
+        }
+    }
+    return 0;                                            /* deadline, no frame */
+}
+
+static void MeterPoll_Task(void* arg)
+{
+    int rrobin = 0;
+    (void)arg;
+
+    for (int i = 0; i < MP_SLOTS; i++) {
+        g_mc[i].fd = INVALID_SOCK;
+        g_mc[i].rxlen = 0;
+        g_mc[i].timeouts = 0;
+        g_mc[i].next_retry_ms = 0;
+    }
+
+    while (g_pollRun) {
+
+        /* ---- poll every slot that is currently connected ---- */
+        for (int slot = 0; slot < MP_SLOTS; slot++) {
+            int oct = BL_GetMeterOctet(slot);
+
+            if (oct == 0) {                              /* unset -> hard offline */
+                if (g_mc[slot].fd != INVALID_SOCK) mc_close(slot);
+                BL_SetMeterReading(slot, 0, 0, 0, 0, 0);
+                continue;
+            }
+            if (g_mc[slot].fd == INVALID_SOCK) {         /* (re)connect handled below */
+                BL_MeterReadFailed(slot);
+                continue;
+            }
+
+            int r = mc_poll(slot);
+            if (r == 1) {
+                g_mc[slot].timeouts = 0;                 /* frame stored online */
+            } else if (r < 0) {
+                mc_close(slot);                          /* drop; reconnect later */
+                g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
+                BL_MeterReadFailed(slot);
+            } else {
+                if (++g_mc[slot].timeouts >= MP_MAX_TIMEOUTS) {
+                    mc_close(slot);
+                    g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
+                }
+                BL_MeterReadFailed(slot);
+            }
+        }
+
+        /* ---- at most ONE (re)connect attempt per sweep, round-robin,
+                respecting the per-slot backoff ---- */
+        for (int k = 0; k < MP_SLOTS; k++) {
+            int slot = (rrobin + k) % MP_SLOTS;
+            int oct  = BL_GetMeterOctet(slot);
+            if (oct != 0 && g_mc[slot].fd == INVALID_SOCK &&
+                (int32_t)(now_ms() - g_mc[slot].next_retry_ms) >= 0) {
+                char ip[24];
+                UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
+                if (mc_connect(slot, ip) < 0)
+                    g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
+                rrobin = (slot + 1) % MP_SLOTS;
+                break;
+            }
+        }
+
+        BL_ProcessSweep();
+        rtos_delay_milliseconds(MP_SWEEP_GAP_MS);
+    }
+
+    for (int i = 0; i < MP_SLOTS; i++) mc_close(i);
+    g_pollDone = true;
+    vTaskDelete(NULL);
+}
+
+void UART_TCP_StartMeterPoll(void)
+{
+    if (g_pollTask != NULL) return;
+    g_pollRun = true;
+    g_pollDone = false;
+    if (xTaskCreate((TaskFunction_t)MeterPoll_Task, "MeterPoll",
+                    6144, NULL, 5, &g_pollTask) != pdPASS) {
+        g_pollTask = NULL;
+        g_pollRun = false;
+        ADDLOG_ERROR(LOG_FEATURE_DRV, "MeterPoll: task create failed");
+        return;
+    }
+    ADDLOG_INFO(LOG_FEATURE_DRV, "Remote meter poller started");
+}
+
+void UART_TCP_StopMeterPoll(void)
+{
+    int i;
+    if (g_pollTask == NULL) return;
+    g_pollRun = false;
+    for (i = 0; i < 50 && !g_pollDone; i++) rtos_delay_milliseconds(10);
+    if (!g_pollDone && g_pollTask != NULL) vTaskDelete(g_pollTask); /* force if stuck */
+    g_pollTask = NULL;
+    g_pollDone = false;
+    for (i = 0; i < MP_SLOTS; i++) mc_close(i);
+}
+
+/* ===========================================================================
+   Charger targets — unchanged
+   =========================================================================== */
 const char *UART_TCP_GetChargerIP(int slot)
 {
     if (slot < 0 || slot >= UART_TCP_CHARGER_MAX) return NULL;
@@ -196,39 +397,27 @@ const char *UART_TCP_GetChargerIP(int slot)
 
 void UART_TCP_SendChargerCmd(const char *path)
 {
-    const char *ip = UART_TCP_GetChargerIP(1);   /* slot 1 = active charger */
-    if (!ip) {
-        ADDLOG_WARN(LOG_FEATURE_DRV, "UART_TCP: charger IP2 not set");
-        return;
-    }
+    const char *ip = UART_TCP_GetChargerIP(1);
+    if (!ip) { ADDLOG_WARN(LOG_FEATURE_DRV, "UART_TCP: charger IP2 not set"); return; }
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) return;
-
-    /* Use the same 50ms timeout as serial targets.
-       The old hardcoded 2s blocked the caller (main task) for 2 full seconds
-       on every failed charger command, which added directly to HTTP latency. */
     struct timeval tv = { .tv_sec  = UART_TCP_TIMEOUT_MS / 1000,
                           .tv_usec = (UART_TCP_TIMEOUT_MS % 1000) * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(80);
     addr.sin_addr.s_addr = inet_addr(ip);
-
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         ADDLOG_WARN(LOG_FEATURE_DRV, "UART_TCP: charger connect %s failed", ip);
         close(fd); return;
     }
-
     char req[256];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
-             path, ip);
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, ip);
     send(fd, req, strlen(req), 0);
-    /* fire-and-forget — don't wait for response */
     close(fd);
     ADDLOG_INFO(LOG_FEATURE_DRV, "UART_TCP: charger cmd sent: %s -> %s", path, ip);
 }
@@ -241,13 +430,9 @@ static int cmd_set_serial(int slot, const char *args)
     if (octet < 0 || octet > 255) octet = 0;
     s_serial[slot] = (uint8_t)octet;
     nvs_save_serial(slot);
-    if (octet)
-        ADDLOG_INFO(LOG_FEATURE_DRV, "UART serial target %d = .%d", slot+1, octet);
-    else
-        ADDLOG_INFO(LOG_FEATURE_DRV, "UART serial target %d cleared (hardware UART)", slot+1);
+    ADDLOG_INFO(LOG_FEATURE_DRV, "UART serial target %d = .%d", slot+1, octet);
     return 1;
 }
-
 static int cmd_set_charger(int slot, const char *args)
 {
     while (args && *args == ' ') args++;
@@ -255,17 +440,12 @@ static int cmd_set_charger(int slot, const char *args)
     if (octet < 0 || octet > 255) octet = 0;
     s_charger[slot] = (uint8_t)octet;
     nvs_save_charger(slot);
-    if (octet)
-        ADDLOG_INFO(LOG_FEATURE_DRV, "Charger IP%d = .%d", slot+1, octet);
-    else
-        ADDLOG_INFO(LOG_FEATURE_DRV, "Charger IP%d cleared", slot+1);
+    ADDLOG_INFO(LOG_FEATURE_DRV, "Charger IP%d = .%d", slot+1, octet);
     return 1;
 }
-
 #define SERIAL_CMD(N) \
 static int cmd_s##N(const void *c,const char *cmd,const char *a){(void)c;(void)cmd;return cmd_set_serial(N-1,a);}
 SERIAL_CMD(1) SERIAL_CMD(2) SERIAL_CMD(3) SERIAL_CMD(4)
-
 #define CHARGER_CMD(N) \
 static int cmd_c##N(const void *c,const char *cmd,const char *a){(void)c;(void)cmd;return cmd_set_charger(N-1,a);}
 CHARGER_CMD(1) CHARGER_CMD(2)
@@ -274,29 +454,18 @@ static int cmd_list_serial(const void *c,const char *cmd,const char *a)
 {
     (void)c;(void)cmd;(void)a;
     char prefix[24]; get_ip_prefix(prefix, sizeof(prefix));
-    for (int i = 0; i < UART_TCP_SERIAL_MAX; i++) {
-        if (s_serial[i])
-            ADDLOG_INFO(LOG_FEATURE_DRV,"Serial target %d: %s.%d",i+1,prefix,s_serial[i]);
-        else
-            ADDLOG_INFO(LOG_FEATURE_DRV,"Serial target %d: (empty — hardware UART if all empty)",i+1);
-    }
+    for (int i = 0; i < UART_TCP_SERIAL_MAX; i++)
+        ADDLOG_INFO(LOG_FEATURE_DRV,"Serial target %d: %s.%d",i+1,prefix,s_serial[i]);
     return 1;
 }
-
 static int cmd_list_charger(const void *c,const char *cmd,const char *a)
 {
     (void)c;(void)cmd;(void)a;
     char prefix[24]; get_ip_prefix(prefix, sizeof(prefix));
-    const char *labels[2] = {"placeholder","active charger"};
-    for (int i = 0; i < UART_TCP_CHARGER_MAX; i++) {
-        if (s_charger[i])
-            ADDLOG_INFO(LOG_FEATURE_DRV,"Charger IP%d (%s): %s.%d",i+1,labels[i],prefix,s_charger[i]);
-        else
-            ADDLOG_INFO(LOG_FEATURE_DRV,"Charger IP%d (%s): (empty)",i+1,labels[i]);
-    }
+    for (int i = 0; i < UART_TCP_CHARGER_MAX; i++)
+        ADDLOG_INFO(LOG_FEATURE_DRV,"Charger IP%d: %s.%d",i+1,prefix,s_charger[i]);
     return 1;
 }
-
 static int cmd_send_charger(const void *c,const char *cmd,const char *a)
 {
     (void)c;(void)cmd;

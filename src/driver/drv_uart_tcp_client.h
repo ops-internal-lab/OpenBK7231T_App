@@ -43,6 +43,13 @@ int         UART_TCP_PollMeter(const char *ip, int port, unsigned char *out, int
 /* Build "<our-subnet>.<octet>" (e.g. "192.168.8.156") into out. */
 void        UART_TCP_BuildIP(char *out, int outsz, unsigned char octet);
 
+/* ---- Persistent 6-meter poller ----
+   One task keeps a persistent socket per configured meter (BL_GetMeterOctet
+   slots 0..5) and polls them each sweep. Start once at boot; stop only on
+   driver teardown. Replaces the old connect-per-poll path. */
+void        UART_TCP_StartMeterPoll(void);
+void        UART_TCP_StopMeterPoll(void);
+
 /* ---- Charger targets ---- */
 /* Returns full IP of charger slot (0=placeholder, 1=active), NULL if unset */
 const char *UART_TCP_GetChargerIP(int slot);

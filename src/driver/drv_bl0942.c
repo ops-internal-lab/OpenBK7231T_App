@@ -328,6 +328,12 @@ void BL0942_UART_Init(void) {
                   BL0942_MODE_DEFAULT | BL0942_MODE_RMS_UPDATE_SEL_800_MS);
     // Set the minimun power measurement
     UART_WriteReg(BL0942_REG_WA_CREEP, DEFAULT_WA_CREEP_VAL);
+
+#if PLATFORM_ESPIDF
+    // Remote-meter build: start the persistent 6-socket poller task. Calibration
+    // (PwrCal_Init) ran in Init() above, so frames are scaled correctly.
+    UART_TCP_StartMeterPoll();
+#endif
 }
 
 #if PLATFORM_ESPIDF
@@ -339,7 +345,6 @@ void BL0942_UART_Init(void) {
 // short-lived socket, read one BL0942 frame (50 ms budget), parse + scale, and
 // store to its slot. On sweep completion the shared layer integrates energy and
 // feeds the consumption phases into the existing pipeline.
-static int s_meter_idx = 0;
 
 // Validate + parse a 23-byte 0x55 frame from a flat buffer, scale it, and store
 // to meter `slot`. Returns 1 on a good frame, 0 otherwise. Checksum matches the
@@ -373,43 +378,26 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
     return 1;
 }
 
-static void BL0942_PollRemoteMeters(void) {
-    int  slot = s_meter_idx;
-    int  oct  = BL_GetMeterOctet(slot);
-
-    if (oct == 0) {
-        BL_SetMeterReading(slot, 0, 0, 0, 0, 0);   // unset -> hard offline, no socket
-    } else {
-        char ip[24];
-        byte buf[BL0942_UART_PACKET_LEN];
-        int  got, attempt, ok = 0;
-        UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
-
-        // Up to 3 attempts, but only retry a connected-but-garbage read. A
-        // connect/send failure (got < 0) means the meter is down — bail out
-        // immediately rather than burn another full timeout on a dead host.
-        for (attempt = 0; attempt < 3 && !ok; attempt++) {
-            got = UART_TCP_PollMeter(ip, UART_TCP_PORT, buf, BL0942_UART_PACKET_LEN);
-            if (got < 0) break;   // connect/send failed -> meter down, no retry
-            if (got >= BL0942_UART_PACKET_LEN && BL0942_ParseScaleStore(buf, got, slot))
-                ok = 1;           // good frame stored (sets slot online + timestamp)
-            // else: connected but short/garbled frame -> loop and retry
-        }
-        if (!ok) BL_MeterReadFailed(slot);   // keep last-good, let it age out (30 s)
+// Scan a flat buffer for the first checksum-valid 23-byte 0x55 frame, parse,
+// scale and store it to meter `slot`. Returns the number of bytes consumed up
+// to and including that frame (so the caller can keep any trailing bytes), or
+// 0 if no valid frame is present yet. Tolerant of leading/stray bytes — this
+// is what keeps a single junk byte (e.g. a BL0942 line-low/BREAK glitch) from
+// permanently desyncing the stream the way an offset-0-only parse would.
+int BL0942_TCP_ScanStore(const unsigned char *b, int len, int slot) {
+    int off;
+    for (off = 0; off + BL0942_UART_PACKET_LEN <= len; off++) {
+        if (BL0942_ParseScaleStore(b + off, BL0942_UART_PACKET_LEN, slot))
+            return off + BL0942_UART_PACKET_LEN;
     }
-
-    s_meter_idx = (s_meter_idx + 1) % 6;
-    if (s_meter_idx == 0) {
-        BL_ProcessSweep();   // full sweep complete
-    }
+    return 0;
 }
 #endif // PLATFORM_ESPIDF
 
 void BL0942_UART_RunEverySecond(void) {
 #if PLATFORM_ESPIDF
-    // No local hardware meter on this build — all six meters are remote
-    // (serial-over-TCP). Rotate the remote poll instead of reading a local UART.
-    BL0942_PollRemoteMeters();
+    // Remote-meter build: polling is handled by the persistent MeterPoll_Task
+    // (started in BL0942_UART_Init). Nothing to do on the per-second tick.
     return;
 #endif
     // Send the read request.
