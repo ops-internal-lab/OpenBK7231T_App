@@ -43,12 +43,15 @@ static unsigned short bl0942_baudRate = 4800;
 #define BL0942_REG_WA_CREEP 0x14	// Minimun power measurement register
 #define BL0942_REG_MODE 0x19
 #define BL0942_REG_CF_CNT_CLR_SEL
-// Bit 6 (CF_CNT_CLR_SEL)=1: clear CF_CNT after every read, so each read is a
-//   small per-interval delta (avoids the 24-bit counter ever rolling over).
-// Bit 7 (CF_CNT_ADD_SEL)=0: ALGEBRAIC accumulation. The counter now nets
-//   +import / -export internally, so cf_cnt is a SIGNED per-read energy delta
-//   (read it two's-complement). Direction no longer needs the WATT sign.
-#define BL0942_MODE_DEFAULT 0x47	
+// MODE = 0x07: reserved(0x03) | CF_EN(0x04). Both high control bits are 0:
+//   Bit 7 (CF_CNT_ADD_SEL)=0 -> ALGEBRAIC accumulation: CF_CNT nets +import /
+//     -export, so a read (and the delta between reads) is signed.
+//   Bit 6 (CF_CNT_CLR_SEL)=0 -> NO clear-on-read: CF_CNT free-runs and is
+//     never reset by a read. We derive per-interval energy by differencing our
+//     own consecutive reads (BL0942_CfDelta24), which is robust no matter how
+//     often or from where the chip is read. Overflow is handled by the 24-bit
+//     wrap-fold in the delta, so the free-running counter is safe.
+#define BL0942_MODE_DEFAULT 0x07	
 #define BL0942_MODE_RMS_UPDATE_SEL_800_MS (1 << 3)
 
 // Minimun power measurement value. Can be in the range of 0 to 255.
@@ -90,6 +93,33 @@ static int32_t Int24ToInt32(int32_t val) {
     return (val & (1 << 23) ? val | (0xFF << 24) : val);
 }
 
+// ============================================================================
+// CF_CNT self-differencing (free-running algebraic counter)
+// ============================================================================
+// MODE is set to algebraic + NO clear-on-read (0x07), so CF_CNT is a 24-bit
+// accumulator that climbs on import and falls on export and is never cleared.
+// We derive per-interval energy by subtracting our OWN previous reading and
+// folding the 24-bit wrap. Because we never clear the counter, it does not
+// matter how often, or from where, the chip is read - each reader differences
+// against its own last value. Signed delta => signed Wh (import + / export -).
+static uint32_t s_cfPrev[6]   = {0};   // last raw 24-bit CF_CNT per meter slot
+static uint8_t  s_cfSeen[6]   = {0};   // 0 until first read seeds prev
+static uint32_t s_cfPrevLocal = 0;     // last raw CF_CNT for the local chip
+static uint8_t  s_cfSeenLocal = 0;
+
+// Signed 24-bit modular difference (now - prev), wrap-folded to signed 24-bit.
+static int32_t BL0942_CfDelta24(uint32_t now, uint32_t prev) {
+    int32_t d = (int32_t)((now - prev) & 0x00FFFFFFu);
+    if (d & 0x00800000) d -= 0x01000000;
+    return d;
+}
+
+// Convert a signed CF_CNT pulse delta to signed Wh (same scaling the chip's
+// per-read energy used: power calibration * pulse-energy constant / 3600).
+static float BL0942_CfDeltaToWh(int32_t delta) {
+    return PwrCal_ScalePowerOnly(delta) * 1638.4f * 256.0f / 3600.0f;
+}
+
 static void ScaleAndUpdate(bl0942_data_t *data) {
     float voltage, current, power;
     PwrCal_Scale(data->v_rms, data->i_rms, data->watt, &voltage, &current,
@@ -109,25 +139,27 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     // data->freq can read 0 on a glitched/failed register read; avoid a
     // divide-by-zero (which would yield inf/NaN). Report 0 Hz instead.
     float frequency = (data->freq != 0) ? (2 * 500000.0f / data->freq) : 0.0f;
-    float energyWh = 0;
-    // cf_cnt is now a SIGNED per-read delta (algebraic accumulation, MODE bit7=0):
-    // positive = import, negative = export. Keep the sign — do NOT fabsf() it.
-    energyWh = PwrCal_ScalePowerOnly(data->cf_cnt) * 1638.4f * 256.0f / 3600.0f;
 
-    // Glitch guard: cf_cnt is reset on every read, so energyWh is the energy of a
-    // single ~1s sample - a small value (either sign). If a read is missed or
-    // corrupted the magnitude can come back enormous or non-finite, which later
-    // poisons the float->int casts downstream and can crash. If the MAGNITUDE is
-    // not sane, discard the sample and reuse the last known good value (zero would
-    // dip the running total). Negative is now VALID (export), so guard |energyWh|.
-    #define BL0942_MAX_SANE_ENERGY_WH 50.0f   // ~180kW for 1s; far above any real load
-    static float lastGoodEnergyWh = 0.0f;
-    if (!isfinite(energyWh) || fabsf(energyWh) > BL0942_MAX_SANE_ENERGY_WH) {
-        ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
-                    "BL0942 energyWh glitch (%f), holding last good value\n", energyWh);
-        energyWh = lastGoodEnergyWh;
-    } else {
-        lastGoodEnergyWh = energyWh;
+    // Energy over THIS read interval = signed CF_CNT delta vs our last reading.
+    // Gated on a live reading (v_rms != 0): the offline/zeros report must not
+    // seed the counter, or the next real read would difference against 0 and
+    // spike. On the first live read we only seed prev (no delta yet). A glitch
+    // or a chip reboot (counter reset) shows up as an out-of-range magnitude;
+    // we drop that one sample (0 Wh) and re-baseline so we self-heal.
+    float energyWh = 0.0f;
+    #define BL0942_MAX_SANE_ENERGY_WH 50.0f   // ~30kW over a 6s poll; above any real load
+    if (data->v_rms != 0) {
+        uint32_t cf_now = (uint32_t)data->cf_cnt & 0x00FFFFFFu;
+        if (s_cfSeenLocal) {
+            energyWh = BL0942_CfDeltaToWh(BL0942_CfDelta24(cf_now, s_cfPrevLocal));
+            if (!isfinite(energyWh) || fabsf(energyWh) > BL0942_MAX_SANE_ENERGY_WH) {
+                ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                            "BL0942 energy delta out of range (%f), dropping sample\n", energyWh);
+                energyWh = 0.0f;
+            }
+        }
+        s_cfPrevLocal = cf_now;
+        s_cfSeenLocal = 1;
     }
 
     // Apply sign convention
@@ -379,12 +411,22 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
     frequency   = (d.freq != 0) ? (2 * 500000.0f / d.freq) : 0.0f;
     signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
 
-    // Signed per-read energy (algebraic cf_cnt): + import / - export. Apply the
-    // SAME invert flag as the power so energy and power agree on direction, and
-    // clamp an insane/non-finite magnitude to 0 to protect downstream int casts.
-    energyWh = PwrCal_ScalePowerOnly(d.cf_cnt) * 1638.4f * 256.0f / 3600.0f;
-    if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) energyWh = -1.0f * energyWh;
-    if (!isfinite(energyWh) || fabsf(energyWh) > 50.0f) energyWh = 0.0f;
+    // Energy over THIS meter's poll interval = signed CF_CNT delta vs the last
+    // frame we stored for this slot (~6 s between full sweeps). First frame per
+    // slot only seeds prev (no delta). A glitch or a remote chip reboot (counter
+    // reset) reads as an out-of-range magnitude; drop that one sample and
+    // re-baseline. Apply the same invert flag as the power so signs agree.
+    energyWh = 0.0f;
+    if (slot >= 0 && slot < 6) {
+        uint32_t cf_now = (uint32_t)d.cf_cnt & 0x00FFFFFFu;
+        if (s_cfSeen[slot]) {
+            energyWh = BL0942_CfDeltaToWh(BL0942_CfDelta24(cf_now, s_cfPrev[slot]));
+            if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) energyWh = -1.0f * energyWh;
+            if (!isfinite(energyWh) || fabsf(energyWh) > 50.0f) energyWh = 0.0f;
+        }
+        s_cfPrev[slot] = cf_now;
+        s_cfSeen[slot] = 1;
+    }
 
     BL_SetMeterReading(slot, voltage, current, signedPower, frequency, energyWh, 1);
     return 1;
