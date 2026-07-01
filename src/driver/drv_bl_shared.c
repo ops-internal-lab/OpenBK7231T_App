@@ -1036,8 +1036,9 @@ static float BL_MeterIntegW(int slot) {
 // Read and zero a slot's accumulated signed chip energy (Wh) since the last
 // call (+import / -export). A hard-offline slot returns 0 and stays cleared so
 // a dropout can't dump a stale energy blob when it reconnects. A stale-holding
-// slot still returns whatever it accumulated (the chip's clear-on-read means
-// that energy is real and shouldn't be discarded on a brief comms hiccup).
+// slot still returns whatever it accumulated (the FREE-RUNNING algebraic
+// CF_CNT means that energy was measured by the chip over real time and is
+// real - it shouldn't be discarded on a brief comms hiccup).
 float BL_MeterTakeEnergy(int slot) {
     float e;
     if (slot < 0 || slot >= 6) return 0.0f;

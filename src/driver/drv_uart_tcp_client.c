@@ -1,17 +1,24 @@
 /* ==========================================================================
    drv_uart_tcp_client.c  --  Remote UART-over-TCP client (MASTER side)
 
-   What changed vs the old file:
-   The old 6-meter poller (BL0942_PollRemoteMeters in drv_bl0942.c) opened a
-   BRAND-NEW TCP connection every poll and closed it. On lwIP each closed
-   connection sits in TIME_WAIT for ~2*MSL (~120 s on ESP-IDF), so polling 6
-   meters churned the socket pool dry and most polls failed to connect.
+   Topology: ONE long-lived task (MeterPoll_Task) keeps a PERSISTENT socket
+   open to each configured meter (no per-poll connect churn / TIME_WAIT
+   exhaustion). Every socket has a single owner (the task) and a single close
+   site (mc_close) that nulls the fd, so nothing leaks and nothing
+   double-closes.
 
-   This file now runs ONE long-lived task (MeterPoll_Task) that keeps a
-   PERSISTENT socket open to each configured meter and reuses it every sweep.
-   Connections are created once (or re-created on failure, throttled), never
-   per poll. Every socket has a single owner (the task) and a single close
-   site (mc_close) that nulls the fd, so nothing leaks and nothing double-closes.
+   Cadence: ONE meter is polled per second, round-robin through slots 0..5,
+   then the cycle restarts -> each meter is read every ~6 s, and
+   BL_ProcessSweep (-> BL_ProcessUpdate, the engine) runs once per completed
+   cycle. All reconnect work for a slot happens inside its own 1 s window.
+
+   Chip config: the BL0942 MODE register is VOLATILE (reverts to absolute,
+   unsigned CF_CNT accumulation on chip power loss). The poller therefore
+   pushes the config (WRPROT unlock + MODE 0x0F algebraic/free-running +
+   WA_CREEP) through EACH meter's own socket right after every (re)connect,
+   and re-sends it periodically as brown-out insurance. This is the ONLY
+   reliable delivery path - the legacy HAL write path reaches at most one
+   meter and is no longer used on this build (see BL0942_UART_Init).
 
    The original HAL-level mechanism (setUartTarget1..4 / s_serial[] /
    UART_TCP_GetCurrentTarget / UART_TCP_AdvanceTarget / UART_TCP_PollMeter) is
@@ -180,9 +187,15 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 #define MP_PORT          UART_TCP_PORT     /* 8888 */
 #define MP_CONNECT_MS    250               /* bounded non-blocking connect wait */
 #define MP_READ_MS       250               /* per-slot response deadline        */
-#define MP_SWEEP_GAP_MS  300               /* pause between full sweeps         */
+#define MP_SLOT_PERIOD_MS 1000             /* ONE meter polled per second ->
+                                              full 6-meter cycle every 6 s      */
 #define MP_RETRY_GAP_MS  3000              /* backoff before reconnecting a slot */
 #define MP_MAX_TIMEOUTS  3                 /* consecutive timeouts -> reconnect  */
+#define MP_CFG_REFRESH_VISITS 100          /* re-send chip config every ~100
+                                              visits (~10 min at 6 s/visit):
+                                              MODE is volatile and a chip can
+                                              brown-out while the bridge (and
+                                              our socket) stays up             */
 #define MP_RXCAP         64                /* per-slot resync buffer            */
 #define MP_SLOTS         6
 
@@ -190,6 +203,7 @@ typedef struct {
     int           fd;
     int           rxlen;
     unsigned      timeouts;
+    unsigned      cfg_visits;   /* polls since chip config was last sent */
     uint32_t      next_retry_ms;
     unsigned char rx[MP_RXCAP];
 } meter_conn_t;
@@ -213,8 +227,31 @@ static void mc_close(int slot)
         close(g_mc[slot].fd);
         g_mc[slot].fd = INVALID_SOCK;
     }
-    g_mc[slot].rxlen    = 0;
-    g_mc[slot].timeouts = 0;
+    g_mc[slot].rxlen      = 0;
+    g_mc[slot].timeouts   = 0;
+    g_mc[slot].cfg_visits = 0;
+}
+
+/* Push the BL0942 config (WRPROT unlock + MODE algebraic/free-running +
+   WA_CREEP) through this slot's own socket. MODE is volatile on the chip, so
+   this runs after EVERY (re)connect and periodically (MP_CFG_REFRESH_VISITS).
+   Without it a chip that lost power reverts to absolute accumulation and
+   CF_CNT counts export as import - the signed-energy model silently breaks.
+   Writes have no response frame, so a fixed settle delay is the only sync:
+   3 frames x 6 B at 4800 baud ~= 38 ms on the slave's wire, +margin. */
+static void mc_sendConfig(int slot)
+{
+    unsigned char frames[24];
+    int n = BL0942_BuildConfigFrames(frames, sizeof(frames));
+    if (n <= 0 || g_mc[slot].fd == INVALID_SOCK) return;
+    if (send(g_mc[slot].fd, frames, n, 0) != n) {
+        ADDLOG_WARN(LOG_FEATURE_DRV, "Meter %d: chip config send failed", slot + 1);
+        return;
+    }
+    g_mc[slot].cfg_visits = 0;
+    rtos_delay_milliseconds(60);
+    ADDLOG_INFO(LOG_FEATURE_DRV,
+                "Meter %d: chip configured (algebraic CF_CNT, creep=64)", slot + 1);
 }
 
 /* bounded non-blocking connect so a dead slave never stalls the sweep */
@@ -242,10 +279,14 @@ static int mc_connect(int slot, const char *ip)
         getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l);
         if (err != 0) { close(fd); return -1; }
     }
-    g_mc[slot].fd       = fd;   /* stays non-blocking for reads */
-    g_mc[slot].rxlen    = 0;
-    g_mc[slot].timeouts = 0;
+    g_mc[slot].fd         = fd;   /* stays non-blocking for reads */
+    g_mc[slot].rxlen      = 0;
+    g_mc[slot].timeouts   = 0;
+    g_mc[slot].cfg_visits = 0;
     ADDLOG_INFO(LOG_FEATURE_DRV, "Meter %d connected (%s)", slot + 1, ip);
+    /* Configure the chip immediately: MODE reverted to absolute-mode default
+       if the chip (not just the link) went down since we last talked to it. */
+    mc_sendConfig(slot);
     return fd;
 }
 
@@ -290,66 +331,80 @@ static int mc_poll(int slot)
 
 static void MeterPoll_Task(void* arg)
 {
-    int rrobin = 0;
+    int slot = 0;
     (void)arg;
 
     for (int i = 0; i < MP_SLOTS; i++) {
         g_mc[i].fd = INVALID_SOCK;
         g_mc[i].rxlen = 0;
         g_mc[i].timeouts = 0;
+        g_mc[i].cfg_visits = 0;
         g_mc[i].next_retry_ms = 0;
     }
 
+    /* ONE meter per second, round-robin 0..5, then start over. Each meter is
+       therefore read every ~6 s; BL_ProcessSweep (-> BL_ProcessUpdate) runs
+       once per completed cycle, so the shared layer's 2-sample averaged power
+       spans ~12 s: avg_W = (E0+E1)*3600/(t0+t1). All (re)connect work for a
+       slot happens inside that slot's own 1 s window (worst case: 250 ms
+       connect + 60 ms config + 250 ms read < 1 s), so a dead slave costs only
+       its own second, never the others'. */
     while (g_pollRun) {
+        uint32_t t0  = now_ms();
+        int      oct = BL_GetMeterOctet(slot);
 
-        /* ---- poll every slot that is currently connected ---- */
-        for (int slot = 0; slot < MP_SLOTS; slot++) {
-            int oct = BL_GetMeterOctet(slot);
-
-            if (oct == 0) {                              /* unset -> hard offline */
-                if (g_mc[slot].fd != INVALID_SOCK) mc_close(slot);
-                BL_SetMeterReading(slot, 0, 0, 0, 0, 0, 0);
-                continue;
-            }
-            if (g_mc[slot].fd == INVALID_SOCK) {         /* (re)connect handled below */
-                BL_MeterReadFailed(slot);
-                continue;
-            }
-
-            int r = mc_poll(slot);
-            if (r == 1) {
-                g_mc[slot].timeouts = 0;                 /* frame stored online */
-            } else if (r < 0) {
-                mc_close(slot);                          /* drop; reconnect later */
-                g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
-                BL_MeterReadFailed(slot);
-            } else {
-                if (++g_mc[slot].timeouts >= MP_MAX_TIMEOUTS) {
-                    mc_close(slot);
-                    g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
-                }
-                BL_MeterReadFailed(slot);
-            }
-        }
-
-        /* ---- at most ONE (re)connect attempt per sweep, round-robin,
-                respecting the per-slot backoff ---- */
-        for (int k = 0; k < MP_SLOTS; k++) {
-            int slot = (rrobin + k) % MP_SLOTS;
-            int oct  = BL_GetMeterOctet(slot);
-            if (oct != 0 && g_mc[slot].fd == INVALID_SOCK &&
+        if (oct == 0) {                              /* unset -> hard offline */
+            if (g_mc[slot].fd != INVALID_SOCK) mc_close(slot);
+            BL_SetMeterReading(slot, 0, 0, 0, 0, 0, 0);
+        } else {
+            /* (re)connect this slot inside its own window, throttled */
+            if (g_mc[slot].fd == INVALID_SOCK &&
                 (int32_t)(now_ms() - g_mc[slot].next_retry_ms) >= 0) {
                 char ip[24];
                 UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
-                if (mc_connect(slot, ip) < 0)
+                if (mc_connect(slot, ip) < 0)        /* mc_connect sends config */
                     g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
-                rrobin = (slot + 1) % MP_SLOTS;
-                break;
+            }
+
+            if (g_mc[slot].fd == INVALID_SOCK) {
+                BL_MeterReadFailed(slot);            /* keep last-good, age out */
+            } else {
+                /* periodic chip re-config: a chip can brown-out and revert to
+                   absolute accumulation while the bridge (and our socket)
+                   stays up. Cheap insurance every ~10 min per slot. */
+                if (++g_mc[slot].cfg_visits >= MP_CFG_REFRESH_VISITS)
+                    mc_sendConfig(slot);
+
+                int r = mc_poll(slot);
+                if (r == 1) {
+                    g_mc[slot].timeouts = 0;         /* frame stored, online */
+                } else if (r < 0) {
+                    mc_close(slot);                  /* drop; reconnect later */
+                    g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
+                    BL_MeterReadFailed(slot);
+                } else {
+                    if (++g_mc[slot].timeouts >= MP_MAX_TIMEOUTS) {
+                        mc_close(slot);
+                        g_mc[slot].next_retry_ms = now_ms() + MP_RETRY_GAP_MS;
+                    }
+                    BL_MeterReadFailed(slot);
+                }
             }
         }
 
-        BL_ProcessSweep();
-        rtos_delay_milliseconds(MP_SWEEP_GAP_MS);
+        /* advance; end of a full 6-slot cycle -> aggregate into the engine */
+        slot++;
+        if (slot >= MP_SLOTS) {
+            slot = 0;
+            BL_ProcessSweep();
+        }
+
+        /* pace: exactly one meter per second regardless of poll duration */
+        {
+            uint32_t spent = now_ms() - t0;
+            if (spent < MP_SLOT_PERIOD_MS)
+                rtos_delay_milliseconds(MP_SLOT_PERIOD_MS - spent);
+        }
     }
 
     for (int i = 0; i < MP_SLOTS; i++) mc_close(i);

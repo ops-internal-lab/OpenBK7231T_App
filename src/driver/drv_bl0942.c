@@ -8,6 +8,8 @@
 #include "../new_pins.h"
 #if PLATFORM_ESPIDF
 #include "drv_uart_tcp_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #endif
 #include "../cmnds/cmd_public.h"
 #include "drv_bl_shared.h"
@@ -90,7 +92,7 @@ static uint32_t PrevCfCnt = CF_CNT_INVALID;
 static int g_offlineSec = 0;
 
 static int32_t Int24ToInt32(int32_t val) {
-    return (val & (1 << 23) ? val | 0xFF000000u : val);
+    return (val & (1 << 23) ? val | (0xFF << 24) : val);
 }
 
 // ============================================================================
@@ -104,8 +106,35 @@ static int32_t Int24ToInt32(int32_t val) {
 // against its own last value. Signed delta => signed Wh (import + / export -).
 static uint32_t s_cfPrev[6]   = {0};   // last raw 24-bit CF_CNT per meter slot
 static uint8_t  s_cfSeen[6]   = {0};   // 0 until first read seeds prev
+static uint32_t s_cfPrevSec[6] = {0};  // seconds-stamp of the last good read per slot
 static uint32_t s_cfPrevLocal = 0;     // last raw CF_CNT for the local chip
 static uint8_t  s_cfSeenLocal = 0;
+static uint32_t s_cfPrevSecLocal = 0;
+// Local-path clock: ScaleAndUpdate is called once per second by design (both
+// UART and SPI RunEverySecond paths, including the offline-zeros report), so a
+// simple call counter is a portable seconds clock — no FreeRTOS tick API
+// needed on the local/slave builds.
+static uint32_t s_localSecClock = 0;
+
+// ============================================================================
+// Plausibility guard for a CF_CNT delta (chip-reset / glitch discard)
+// ============================================================================
+// The plant limit is ~6 kW per meter (user spec). Over the nominal 6 s
+// per-meter read interval that is 6000*6/3600 = 10 Wh, so any delta implying
+// a sustained average above 6 kW over the ACTUAL elapsed time since the last
+// good read is impossible and must be a chip reset (CF_CNT back to 0), a
+// corrupted-but-checksum-lucky frame, or a re-baselining artefact. Scaling
+// the limit by real elapsed time (instead of a fixed 50 Wh) means:
+//   - a missed cycle (12 s gap) doesn't discard the genuinely larger delta,
+//   - a reset can't smuggle in a large phantom during a short interval.
+// A small slack (~2 CF pulses) covers pulse quantisation at the boundaries.
+#define BL0942_MAX_METER_W      6000.0f
+#define BL0942_ENERGY_SLACK_WH  0.4f
+static float BL0942_MaxSaneWh(uint32_t elapsed_s) {
+    if (elapsed_s < 1)    elapsed_s = 1;    // floor: never collapse the window
+    if (elapsed_s > 3600) elapsed_s = 3600; // >1 h gap: treat like a reset
+    return (BL0942_MAX_METER_W * (float)elapsed_s / 3600.0f) + BL0942_ENERGY_SLACK_WH;
+}
 
 // Signed 24-bit modular difference (now - prev), wrap-folded to signed 24-bit.
 static int32_t BL0942_CfDelta24(uint32_t now, uint32_t prev) {
@@ -147,19 +176,22 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     // or a chip reboot (counter reset) shows up as an out-of-range magnitude;
     // we drop that one sample (0 Wh) and re-baseline so we self-heal.
     float energyWh = 0.0f;
-    #define BL0942_MAX_SANE_ENERGY_WH 50.0f   // ~30kW over a 6s poll; above any real load
+    s_localSecClock++;                      // 1 Hz by design (see decl comment)
     if (data->v_rms != 0) {
         uint32_t cf_now = (uint32_t)data->cf_cnt & 0x00FFFFFFu;
         if (s_cfSeenLocal) {
+            float maxWh = BL0942_MaxSaneWh(s_localSecClock - s_cfPrevSecLocal);
             energyWh = BL0942_CfDeltaToWh(BL0942_CfDelta24(cf_now, s_cfPrevLocal));
-            if (!isfinite(energyWh) || fabsf(energyWh) > BL0942_MAX_SANE_ENERGY_WH) {
+            if (!isfinite(energyWh) || fabsf(energyWh) > maxWh) {
                 ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
-                            "BL0942 energy delta out of range (%f), dropping sample\n", energyWh);
+                            "BL0942 energy delta %f Wh exceeds sane %f Wh (chip reset/glitch), dropping sample\n",
+                            energyWh, maxWh);
                 energyWh = 0.0f;
             }
         }
-        s_cfPrevLocal = cf_now;
-        s_cfSeenLocal = 1;
+        s_cfPrevLocal    = cf_now;
+        s_cfPrevSecLocal = s_localSecClock;
+        s_cfSeenLocal    = 1;
     }
 
     // Apply sign convention
@@ -171,7 +203,7 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     // ====================================================================
     // 10-SECOND TICK LOGIC (INSTANTANEOUS SENSORS + ACCUMULATED ENERGY)
     // ====================================================================
-    #define SAMPLES_PER_UPDATE 2
+    #define SAMPLES_PER_UPDATE 5
 
     static int   sampleCount = 0;
     static float energyAccum = 0.0f;
@@ -181,9 +213,11 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     sampleCount++;
 
     if (sampleCount < SAMPLES_PER_UPDATE) {
-        return; // Do nothing else until the 2nd call
+        return; // Do nothing else until the 10th call
     }
 
+    // On the 10th call, pass instantaneous readings from THIS exact sample,
+    // alongside the total energy accumulated over the last 10 samples.
     float totalEnergyWh = energyAccum;
 
     BL_ProcessUpdate(voltage, current, signedPower, frequency, totalEnergyWh);
@@ -289,6 +323,46 @@ static void UART_WriteReg(uint8_t reg, uint32_t val) {
     UART_SendByte(crc ^ 0xFF);
 }
 
+// ============================================================================
+// Chip-config frame builder (used by the TCP poller to configure remote chips)
+// ============================================================================
+// The BL0942's MODE register is VOLATILE: it reverts to the power-on default
+// (CF_CNT_ADD_SEL=1, absolute-value accumulation - datasheet 0x19 bit[7])
+// whenever the chip loses power. In absolute mode CF_CNT climbs on export as
+// well as import, so the signed-energy model silently breaks. The config must
+// therefore be (re)written to EACH chip, THROUGH ITS OWN socket, after every
+// (re)connect and periodically - not once at init through the legacy HAL path,
+// which reaches at most one meter. This builds the raw UART write frames
+// (LSB-first payload, checksum = sum^0xFF, same wire format as UART_WriteReg):
+//   1. USR_WRPROT (0x1D) = 0x55  -> unlock user registers
+//   2. MODE       (0x19) = 0x0F  -> CF_CNT_ADD_SEL=0 (ALGEBRAIC/signed),
+//                                   CF_CNT_CLR_SEL=0 (free-running, no
+//                                   clear-on-read), CF_EN=1, RMS 800 ms
+//   3. WA_CREEP   (0x14) = 64    -> anti-creep floor
+// Returns total bytes written to `out` (18), or 0 if the buffer is too small.
+static int BL0942_BuildWriteFrame(unsigned char *out, uint8_t reg, uint32_t val) {
+    uint8_t crc = 0;
+    int i;
+    out[0] = BL0942_UART_CMD_WRITE(BL0942_UART_ADDR);
+    out[1] = reg;
+    out[2] = (val & 0xFF);
+    out[3] = ((val >> 8) & 0xFF);
+    out[4] = ((val >> 16) & 0xFF);
+    for (i = 0; i < 5; i++) crc += out[i];
+    out[5] = crc ^ 0xFF;
+    return 6;
+}
+
+int BL0942_BuildConfigFrames(unsigned char *out, int maxLen) {
+    int n = 0;
+    if (maxLen < 18) return 0;
+    n += BL0942_BuildWriteFrame(out + n, BL0942_REG_USR_WRPROT, BL0942_USR_WRPROT_DISABLE);
+    n += BL0942_BuildWriteFrame(out + n, BL0942_REG_MODE,
+                                BL0942_MODE_DEFAULT | BL0942_MODE_RMS_UPDATE_SEL_800_MS);
+    n += BL0942_BuildWriteFrame(out + n, BL0942_REG_WA_CREEP, DEFAULT_WA_CREEP_VAL);
+    return n;
+}
+
 static int SPI_ReadReg(uint8_t reg, uint32_t *val) {
 	uint8_t send[2];
 	uint8_t recv[4];
@@ -339,8 +413,14 @@ static int SPI_WriteReg(uint8_t reg, uint32_t val) {
 }
 
 static void Init(void) {
+    int i;
     PrevCfCnt = CF_CNT_INVALID;
     g_offlineSec = 0;
+
+    // Fresh CF_CNT baselines: a driver restart must re-seed, never difference
+    // against a value captured before the restart.
+    for (i = 0; i < 6; i++) { s_cfSeen[i] = 0; s_cfPrev[i] = 0; s_cfPrevSec[i] = 0; }
+    s_cfSeenLocal = 0; s_cfPrevLocal = 0; s_cfPrevSecLocal = 0;
 
     BL_Shared_Init();
 
@@ -353,6 +433,23 @@ static void Init(void) {
 void BL0942_UART_Init(void) {
 	Init();
 
+#if PLATFORM_ESPIDF
+	// Remote-meter build: do NOT bring up the legacy HAL TCP-UART here.
+	// (a) UART_InitUART would open a second, competing TCP client to legacy
+	//     target 1 whose rx task steals/duplicates frames alongside the
+	//     poller's own socket to the same bridge, and
+	// (b) UART_WriteReg through that path reaches AT MOST that one chip -
+	//     the other five would stay in the power-on default MODE (absolute
+	//     accumulation, unsigned CF_CNT), which is exactly the failure mode
+	//     that corrupts the signed-energy totals.
+	// Chip configuration (WRPROT unlock + MODE algebraic + WA_CREEP) is now
+	// sent by the poller through each meter's own socket after every
+	// (re)connect and refreshed periodically (see drv_uart_tcp_client.c),
+	// so a power-cycled chip re-acquires algebraic mode automatically.
+	UART_TCP_StartMeterPoll();
+	return;
+#endif
+
 	bl0942_baudRate = Tokenizer_GetArgIntegerDefault(1, 4800);
 
 	UART_InitUART(bl0942_baudRate, 0, false);
@@ -363,12 +460,6 @@ void BL0942_UART_Init(void) {
                   BL0942_MODE_DEFAULT | BL0942_MODE_RMS_UPDATE_SEL_800_MS);
     // Set the minimun power measurement
     UART_WriteReg(BL0942_REG_WA_CREEP, DEFAULT_WA_CREEP_VAL);
-
-#if PLATFORM_ESPIDF
-    // Remote-meter build: start the persistent 6-socket poller task. Calibration
-    // (PwrCal_Init) ran in Init() above, so frames are scaled correctly.
-    UART_TCP_StartMeterPoll();
-#endif
 }
 
 #if PLATFORM_ESPIDF
@@ -410,20 +501,33 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
     signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
 
     // Energy over THIS meter's poll interval = signed CF_CNT delta vs the last
-    // frame we stored for this slot (~6 s between full sweeps). First frame per
-    // slot only seeds prev (no delta). A glitch or a remote chip reboot (counter
-    // reset) reads as an out-of-range magnitude; drop that one sample and
-    // re-baseline. Apply the same invert flag as the power so signs agree.
+    // frame we stored for this slot (~6 s between visits, one meter polled per
+    // second). Per-slot memory: s_cfPrev[] holds the last raw counter,
+    // s_cfPrevSec[] when it was taken. First frame per slot only seeds prev
+    // (no delta). Gated on v_rms != 0 like the local path, so a frame from a
+    // resetting/dead chip can never seed or difference the counter. A glitch
+    // or a remote chip reboot (counter reset to 0) reads as a delta implying
+    // > 6 kW sustained over the actual elapsed time -> that one sample is
+    // discarded (0 Wh, logged) and the baseline re-seeds, so we self-heal.
+    // Apply the same invert flag as the power so signs agree.
     energyWh = 0.0f;
-    if (slot >= 0 && slot < 6) {
+    if (slot >= 0 && slot < 6 && d.v_rms != 0) {
         uint32_t cf_now = (uint32_t)d.cf_cnt & 0x00FFFFFFu;
+        uint32_t now_s  = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000u);
         if (s_cfSeen[slot]) {
+            float maxWh = BL0942_MaxSaneWh(now_s - s_cfPrevSec[slot]);
             energyWh = BL0942_CfDeltaToWh(BL0942_CfDelta24(cf_now, s_cfPrev[slot]));
             if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) energyWh = -1.0f * energyWh;
-            if (!isfinite(energyWh) || fabsf(energyWh) > 50.0f) energyWh = 0.0f;
+            if (!isfinite(energyWh) || fabsf(energyWh) > maxWh) {
+                ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
+                            "BL0942 m%d: delta %f Wh exceeds sane %f Wh (chip reset/glitch), dropping sample\n",
+                            slot + 1, energyWh, maxWh);
+                energyWh = 0.0f;
+            }
         }
-        s_cfPrev[slot] = cf_now;
-        s_cfSeen[slot] = 1;
+        s_cfPrev[slot]    = cf_now;
+        s_cfPrevSec[slot] = now_s;
+        s_cfSeen[slot]    = 1;
     }
 
     BL_SetMeterReading(slot, voltage, current, signedPower, frequency, energyWh, 1);
