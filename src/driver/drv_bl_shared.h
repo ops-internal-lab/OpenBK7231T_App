@@ -12,7 +12,9 @@ void BL_ProcessUpdate(float voltage, float current, float power,
 
 /* Remote multi-meter interface (BL0942 TCP poller <-> shared accounting). */
 int  BL_GetMeterOctet(int slot);                                  /* 0 = unset */
-void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online);
+void BL_SetMeterReading(int slot, float v, float a, float w, float freq, float e_wh, int online);
+// Read and zero a slot's accumulated signed energy (Wh) since the last call.
+float BL_MeterTakeEnergy(int slot);
 void BL_MeterReadFailed(int slot);     /* failed poll: keep last-good, age out */
 int  BL_MeterOnlineState(int slot);    /* 0 offline / 1 fresh / 2 stale-holding */
 int  BL_GetMeter(int slot, float *v, float *a, float *w, int *online);

@@ -43,10 +43,12 @@ static unsigned short bl0942_baudRate = 4800;
 #define BL0942_REG_WA_CREEP 0x14	// Minimun power measurement register
 #define BL0942_REG_MODE 0x19
 #define BL0942_REG_CF_CNT_CLR_SEL
-// Changed to reset at every read. This way we end up summing little values
-// Instead of ever increasing ones, which should resolve overflow issues
-// Bit 6 = 1
-#define BL0942_MODE_DEFAULT 0xC7	
+// Bit 6 (CF_CNT_CLR_SEL)=1: clear CF_CNT after every read, so each read is a
+//   small per-interval delta (avoids the 24-bit counter ever rolling over).
+// Bit 7 (CF_CNT_ADD_SEL)=0: ALGEBRAIC accumulation. The counter now nets
+//   +import / -export internally, so cf_cnt is a SIGNED per-read energy delta
+//   (read it two's-complement). Direction no longer needs the WATT sign.
+#define BL0942_MODE_DEFAULT 0x47	
 #define BL0942_MODE_RMS_UPDATE_SEL_800_MS (1 << 3)
 
 // Minimun power measurement value. Can be in the range of 0 to 255.
@@ -74,7 +76,7 @@ typedef struct {
     uint32_t i_rms;
     uint32_t v_rms;
     int32_t watt;
-    uint32_t cf_cnt;
+    int32_t cf_cnt;
     uint32_t freq;
 } bl0942_data_t;
 
@@ -108,19 +110,19 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
     // divide-by-zero (which would yield inf/NaN). Report 0 Hz instead.
     float frequency = (data->freq != 0) ? (2 * 500000.0f / data->freq) : 0.0f;
     float energyWh = 0;
-    energyWh = fabsf(PwrCal_ScalePowerOnly(data->cf_cnt)) * 1638.4f * 256.0f / 3600.0f;
+    // cf_cnt is now a SIGNED per-read delta (algebraic accumulation, MODE bit7=0):
+    // positive = import, negative = export. Keep the sign — do NOT fabsf() it.
+    energyWh = PwrCal_ScalePowerOnly(data->cf_cnt) * 1638.4f * 256.0f / 3600.0f;
 
-    // Glitch guard: cf_cnt is normally reset on every read, so energyWh
-    // represents the energy of a single ~1s sample - a small value. If a
-    // read is missed/corrupted (more likely under high power, where the
-    // counter climbs fast), the raw value can come back enormous or even
-    // non-finite, which later poisons the float->int casts downstream and
-    // can crash. If this sample is not finite or exceeds a physically
-    // impossible per-sample energy, discard it and reuse the last known
-    // good value instead of zero (zero would dip the running total).
+    // Glitch guard: cf_cnt is reset on every read, so energyWh is the energy of a
+    // single ~1s sample - a small value (either sign). If a read is missed or
+    // corrupted the magnitude can come back enormous or non-finite, which later
+    // poisons the float->int casts downstream and can crash. If the MAGNITUDE is
+    // not sane, discard the sample and reuse the last known good value (zero would
+    // dip the running total). Negative is now VALID (export), so guard |energyWh|.
     #define BL0942_MAX_SANE_ENERGY_WH 50.0f   // ~180kW for 1s; far above any real load
     static float lastGoodEnergyWh = 0.0f;
-    if (!isfinite(energyWh) || energyWh < 0.0f || energyWh > BL0942_MAX_SANE_ENERGY_WH) {
+    if (!isfinite(energyWh) || fabsf(energyWh) > BL0942_MAX_SANE_ENERGY_WH) {
         ADDLOG_WARN(LOG_FEATURE_ENERGYMETER,
                     "BL0942 energyWh glitch (%f), holding last good value\n", energyWh);
         energyWh = lastGoodEnergyWh;
@@ -130,6 +132,9 @@ static void ScaleAndUpdate(bl0942_data_t *data) {
 
     // Apply sign convention
     float signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
+    // energyWh is signed (algebraic cf_cnt); apply the SAME invert as the power
+    // so energy and power agree on import(+)/export(-).
+    if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) energyWh = -1.0f * energyWh;
 
     // ====================================================================
     // 10-SECOND TICK LOGIC (INSTANTANEOUS SENSORS + ACCUMULATED ENERGY)
@@ -211,8 +216,8 @@ static int UART_TryToGetNextPacket(void) {
         (UART_GetByte(6) << 16) | (UART_GetByte(5) << 8) | UART_GetByte(4);
     data.watt = Int24ToInt32((UART_GetByte(12) << 16) |
                              (UART_GetByte(11) << 8) | UART_GetByte(10));
-    data.cf_cnt =
-        (UART_GetByte(15) << 16) | (UART_GetByte(14) << 8) | UART_GetByte(13);
+    data.cf_cnt = Int24ToInt32(
+        (UART_GetByte(15) << 16) | (UART_GetByte(14) << 8) | UART_GetByte(13));
     data.freq = (UART_GetByte(17) << 8) | UART_GetByte(16);
 
     /* ---------------------------------------------------------------
@@ -353,7 +358,7 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
     int i;
     byte checksum;
     bl0942_data_t d;
-    float voltage, current, power, frequency, signedPower;
+    float voltage, current, power, frequency, signedPower, energyWh;
 
     if (len < BL0942_UART_PACKET_LEN)        return 0;
     if (b[0] != BL0942_UART_PACKET_HEAD)     return 0;
@@ -366,7 +371,7 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
     d.i_rms  = (b[3] << 16) | (b[2] << 8) | b[1];
     d.v_rms  = (b[6] << 16) | (b[5] << 8) | b[4];
     d.watt   = Int24ToInt32((b[12] << 16) | (b[11] << 8) | b[10]);
-    d.cf_cnt = (b[15] << 16) | (b[14] << 8) | b[13];
+    d.cf_cnt = Int24ToInt32((b[15] << 16) | (b[14] << 8) | b[13]);
     d.freq   = (b[17] << 8) | b[16];
 
     PwrCal_Scale(d.v_rms, d.i_rms, d.watt, &voltage, &current, &power);
@@ -374,7 +379,14 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot) {
     frequency   = (d.freq != 0) ? (2 * 500000.0f / d.freq) : 0.0f;
     signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
 
-    BL_SetMeterReading(slot, voltage, current, signedPower, frequency, 1);
+    // Signed per-read energy (algebraic cf_cnt): + import / - export. Apply the
+    // SAME invert flag as the power so energy and power agree on direction, and
+    // clamp an insane/non-finite magnitude to 0 to protect downstream int casts.
+    energyWh = PwrCal_ScalePowerOnly(d.cf_cnt) * 1638.4f * 256.0f / 3600.0f;
+    if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) energyWh = -1.0f * energyWh;
+    if (!isfinite(energyWh) || fabsf(energyWh) > 50.0f) energyWh = 0.0f;
+
+    BL_SetMeterReading(slot, voltage, current, signedPower, frequency, energyWh, 1);
     return 1;
 }
 
@@ -474,7 +486,7 @@ void BL0942_SPI_RunEverySecond(void) {
     err |= SPI_ReadReg(BL0942_REG_I_RMS,  &data.i_rms);
     err |= SPI_ReadReg(BL0942_REG_V_RMS,  &data.v_rms);
     err |= SPI_ReadReg(BL0942_REG_WATT,   (uint32_t *)&data.watt);
-    err |= SPI_ReadReg(BL0942_REG_CF_CNT, &data.cf_cnt);
+    err |= SPI_ReadReg(BL0942_REG_CF_CNT, (uint32_t *)&data.cf_cnt);
     err |= SPI_ReadReg(BL0942_REG_FREQ,   &data.freq);
 
     if (err != 0) {
@@ -495,5 +507,6 @@ void BL0942_SPI_RunEverySecond(void) {
     }
 
     data.watt = Int24ToInt32(data.watt);
+    data.cf_cnt = Int24ToInt32(data.cf_cnt);
     ScaleAndUpdate(&data);
 }

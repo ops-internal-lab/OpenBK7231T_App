@@ -308,7 +308,7 @@ static void MeterPoll_Task(void* arg)
 
             if (oct == 0) {                              /* unset -> hard offline */
                 if (g_mc[slot].fd != INVALID_SOCK) mc_close(slot);
-                BL_SetMeterReading(slot, 0, 0, 0, 0, 0);
+                BL_SetMeterReading(slot, 0, 0, 0, 0, 0, 0);
                 continue;
             }
             if (g_mc[slot].fd == INVALID_SOCK) {         /* (re)connect handled below */
