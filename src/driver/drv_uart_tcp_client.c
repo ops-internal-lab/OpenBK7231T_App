@@ -2,11 +2,13 @@
    drv_uart_tcp_client.c  --  Remote UART-over-TCP client (MASTER side)
 
    What changed:
-   Fixed the programming sequence based on corrected trace analysis. The meter 
-   does not issue replies for writes. The code now sends the Unlock write frame, 
-   waits 50ms, sends the Mode program write frame, waits 50ms to let it settle, 
-   and then cleanly terminates the connection. All obsolete draining code has 
-   been removed.
+   Modified the polling logic to execute a strict check-before-read operation 
+   on every single cycle. The 30-second cadence timers have been completely 
+   removed. Every time a connection is opened, the master will actively read 
+   the MODE register. If it matches the signed mode, it proceeds to read the 
+   data frame. If it has defaulted or reset, it rewrites the signed configuration, 
+   notes the reset, and aborts the cycle immediately to allow the target chip 
+   to settle.
    ========================================================================== */
 
 #include "../new_common.h"
@@ -143,6 +145,7 @@ int UART_TCP_Connect(const char *ip, int port)
     return fd;
 }
 
+/* Legacy transient poll — kept for compatibility; the new task does not use it */
 int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 {
     int got = 0;
@@ -160,26 +163,30 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 }
 
 /* ===========================================================================
-   REMOTE 6-METER POLLER  --  connect / check-mode / read / close, PER READ
+   REMOTE 6-METER POLLER  --  connect / read / (retry) / close, PER READ
    =========================================================================== */
 
 #define MP_PORT            UART_TCP_PORT   /* 8888 */
-#define MP_CONNECT_MS      80              /* bounded connection wait time */
-
-/* Timing parameters synchronized exactly to instructions */
-#define MP_MODE_WAIT_MS    20              /* wait 20ms after 58 19 */
-#define MP_UNLOCK_WAIT_MS  50              /* wait 50ms gap between configuration writes */
-#define MP_FRAME_WAIT_MS   80              /* wait 80ms after 58 aa */
-
-#define MP_GATHER_SPINS    12              /* extra polls to gather network fragments */
-#define MP_MAX_ATTEMPTS    3               /* up to 3 frame requests if data is invalid */
-#define MP_RXCAP           64              
+#define MP_CONNECT_MS      80              /* bounded "get the link live" wait    */
+#define MP_FRAME_SETTLE_MS 70              /* skip the guaranteed-empty period    */
+#define MP_ATTEMPT_MS      100             /* total wait per attempt (settle+poll) */
+#define MP_MAX_ATTEMPTS    3               /* re-send + retry up to this many      */
+#define MP_REG_READ_MS     200             /* single-register reply wait          */
+#define MP_REG_SETTLE_MS   50              /* reg reply is only 4 bytes (~8 ms)    */
+#define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
-#define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10s cycle */
+#define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
 
-static bool g_pollRun  = false;            
-static int     g_pollTick = 0;            
+static bool     g_pollRun  = false;        /* poller enabled between Start/Stop   */
+static int      g_pollTick = 0;            /* 0..MP_TICKS_PER_CYCLE-1 round-robin  */
 
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+/* RST close (SO_LINGER 0): no TIME_WAIT, so per-read connects don't exhaust the
+   socket pool, and the slave sees the drop immediately and frees its one slot. */
 static void mc_close(int fd)
 {
     if (fd != INVALID_SOCK) {
@@ -189,6 +196,7 @@ static void mc_close(int fd)
     }
 }
 
+/* Open a fresh, bounded, non-blocking connection to a meter. Returns fd or -1. */
 static int mc_open(const char *ip)
 {
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -216,71 +224,81 @@ static int mc_open(const char *ip)
     return fd;
 }
 
-/* Send 58 aa, wait 80ms, gather frame. Retries automatically driven by the service loop */
-static int mc_read_frame(int fd, int slot)
+/* Send one read-full-frame request and wait (until `deadline`) for a
+   checksum-valid 23-byte frame; store it to `slot`. Returns 1 stored, 0 no
+   valid frame before the deadline, -1 socket error / peer closed. */
+static int mc_read_frame(int fd, int slot, int cf_reset, uint32_t deadline)
 {
     unsigned char req[2] = { 0x58, 0xAA };
     unsigned char rx[MP_RXCAP];
-    int rxlen = 0, spins;
+    int rxlen = 0;
 
     if (send(fd, req, 2, 0) < 0 && errno != EWOULDBLOCK && errno != EAGAIN) return -1;
 
-    rtos_delay_milliseconds(MP_FRAME_WAIT_MS);            /* wait 80 ms */
+    /* Give the slow 4800-baud link time to start delivering before we poll —
+       nothing can arrive in the first ~48 ms anyway. */
+    rtos_delay_milliseconds(MP_FRAME_SETTLE_MS);
 
-    for (spins = 0; spins < MP_GATHER_SPINS; spins++) {
+    while ((int32_t)(now_ms() - deadline) < 0) {
         int n;
-        if (rxlen >= MP_RXCAP) rxlen = 0;                 
+        if (rxlen >= MP_RXCAP) rxlen = 0;                 /* overflow -> resync */
         n = recv(fd, rx + rxlen, MP_RXCAP - rxlen, 0);
         if (n > 0) {
             rxlen += n;
-            if (BL0942_TCP_ScanStore(rx, rxlen, slot, BL0942_CF_RESET_NONE) > 0) return 1;
-            spins = 0;                                    
+            if (BL0942_TCP_ScanStore(rx, rxlen, slot, cf_reset) > 0) return 1;
         } else if (n == 0) {
-            return -1;                                    
+            return -1;                                    /* peer closed */
         } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            return -1;                                    
+            return -1;                                    /* hard error */
         } else {
-            rtos_delay_milliseconds(3);                    
+            rtos_delay_milliseconds(20);                   /* nothing yet, wait */
         }
     }
-    return 0;                                             /* Invalid data frame */
+    return 0;                                             /* deadline, no frame */
 }
 
-/* Send 58 19, wait 20ms, read and validate 4-byte response register */
+/* Single-register read. Protocol: send {0x58,reg}, reply = 3 data bytes (MSB first) 
+   + checksum ~(0x58+reg+b0+b1+b2). Returns 0 + *val, or -1. */
 static int mc_read_reg(int fd, unsigned char reg, uint32_t *val)
 {
     unsigned char req[2] = { 0x58, reg };
     unsigned char rx[8];
-    int rxn = 0, spins;
+    int rxn = 0;
+    uint32_t deadline = now_ms() + MP_REG_READ_MS;
 
     if (send(fd, req, 2, 0) < 0 && errno != EWOULDBLOCK && errno != EAGAIN) return -1;
 
-    rtos_delay_milliseconds(MP_MODE_WAIT_MS);             /* wait 20 ms */
+    rtos_delay_milliseconds(MP_REG_SETTLE_MS);            /* let the reply arrive */
 
-    for (spins = 0; spins < MP_GATHER_SPINS && rxn < 4; spins++) {
+    while ((int32_t)(now_ms() - deadline) < 0) {
         int n = recv(fd, rx + rxn, (int)sizeof(rx) - rxn, 0);
-        if (n > 0) { rxn += n; spins = 0; }
-        else if (n == 0) return -1;
-        else if (errno != EWOULDBLOCK && errno != EAGAIN) return -1;
-        else rtos_delay_milliseconds(2);
+        if (n > 0) {
+            rxn += n;
+            if (rxn >= 4) {
+                unsigned char cs = (unsigned char)((0x58 + reg + rx[0] + rx[1] + rx[2]) ^ 0xFF);
+                if (cs != rx[3]) return -1;               /* bad checksum */
+                *val = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) | ((uint32_t)rx[2] << 16);
+                return 0;
+            }
+        } else if (n == 0) {
+            return -1;
+        } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            return -1;
+        } else {
+            rtos_delay_milliseconds(20);
+        }
     }
-    if (rxn < 4) return -1;
-
-    {
-        unsigned char cs = (unsigned char)((0x58 + reg + rx[0] + rx[1] + rx[2]) ^ 0xFF);
-        if (cs != rx[3]) return -1;                       
-        *val = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) | ((uint32_t)rx[2] << 16);
-    }
-    return 0;
+    return -1;                                            /* timeout */
 }
 
-/* Fire-and-forget write command sequence */
+/* Fire-and-forget register write (no reply). Value bytes little-endian,
+   checksum = ~(sum of the 5 bytes). */
 static void mc_write_reg(int fd, unsigned char reg, uint32_t val)
 {
     unsigned char msg[6];
     int i;
     unsigned char crc = 0;
-    msg[0] = 0xA8;                       
+    msg[0] = 0xA8;                       /* WRITE command, addr 0 */
     msg[1] = reg;
     msg[2] = (unsigned char)( val        & 0xFF);
     msg[3] = (unsigned char)((val >>  8) & 0xFF);
@@ -290,15 +308,18 @@ static void mc_write_reg(int fd, unsigned char reg, uint32_t val)
     (void)send(fd, msg, sizeof(msg), 0);
 }
 
-/* Service ONE meter per sequence instructions */
+/* Service ONE meter in a single pass:
+     open -> verify MODE actively -> (if wrong: reprogram and abort) -> 
+     (if correct: read frame, retrying up to MP_MAX_ATTEMPTS) -> RST-close. */
 static int mc_service(int slot)
 {
+    int cf_reset = BL0942_CF_RESET_NONE;
     int oct = BL_GetMeterOctet(slot);
     int fd, attempt, got = 0;
     uint32_t mode = 0;
     char ip[24];
 
-    if (oct == 0) {                                       
+    if (oct == 0) {                                       /* unset -> hard offline */
         BL_SetMeterReading(slot, 0, 0, 0, 0, 0);
         return -1;
     }
@@ -307,43 +328,40 @@ static int mc_service(int slot)
     fd = mc_open(ip);
     if (fd < 0) { BL_MeterReadFailed(slot); return -1; }
 
-    /* 1) Send 58 19, wait 20ms, read register (Checked EVERY single time) */
+    /* 1) Always verify the MODE register first using the stable deadline logic */
     if (mc_read_reg(fd, BL0942_REG_MODE_ADDR, &mode) != 0) {
         mc_close(fd);
         BL_MeterReadFailed(slot);
-        return 0;
+        return 0; /* Read failed, skip this cycle */
     }
 
-    /* 2) Check if register is correct (Expecting 07 00 00) */
+    /* 2) Check if register requires reprogramming */
     if ((mode & BL0942_MODE_MATCH_MASK) != BL0942_MODE_FREE_RUN_SIGNED) {
+        mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);
+        rtos_delay_milliseconds(50); /* Settling time for the chip configuration */   
+        mc_write_reg(fd, BL0942_REG_MODE_ADDR,   BL0942_MODE_FREE_RUN_SIGNED);
         
-        /* Register is incorrect: Unlock and Program */
-        mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);      /* Send a8 1d 55 00 00 e5 */
-        rtos_delay_milliseconds(MP_UNLOCK_WAIT_MS);                          /* Wait 50ms */
-        
-        mc_write_reg(fd, BL0942_REG_MODE_ADDR, BL0942_MODE_FREE_RUN_SIGNED); /* Send a8 19 07 00 00 37 */
-        rtos_delay_milliseconds(MP_UNLOCK_WAIT_MS);                          /* Wait 50ms for chip safety */
-        
-        if (slot >= 0 && slot <= 2) BL_MeterNoteReset(slot);
         ADDLOG_WARN(LOG_FEATURE_DRV,
                     "Meter %d MODE was 0x%X (reset) - reprogrammed to signed",
                     slot + 1, (unsigned)mode);
-        
-        /* Terminate connection immediately after programming */
+                    
+        if (slot >= 0 && slot <= 2) BL_MeterNoteReset(slot); 
+
+        /* Terminate connection immediately to let the chip settle until the next cycle */
         mc_close(fd);
         BL_MeterReadFailed(slot);
         return 0;
     }
 
-    /* 3) Register is correct: Ask for data (58 aa), wait 80ms. Request again if data invalid */
+    /* 3) Register is verified. Proceed to read the data frame. */
     for (attempt = 0; attempt < MP_MAX_ATTEMPTS; attempt++) {
-        int r = mc_read_frame(fd, slot);
-        if (r == 1) { got = 1; break; }                   /* Valid frame parsed -> break out */
-        if (r < 0)  break;                                /* Socket error -> abort loops */
+        int r = mc_read_frame(fd, slot, cf_reset, now_ms() + MP_ATTEMPT_MS);
+        if (r == 1) { got = 1; break; }                   /* valid frame stored */
+        if (r < 0)  break;                                /* socket dead -> stop */
     }
 
-    /* 4) Terminate connection */
-    mc_close(fd);
+    /* 4) Clean up */
+    mc_close(fd);                                         /* always RST-close */
 
     if (got) return 1;
     BL_MeterReadFailed(slot);
@@ -355,11 +373,11 @@ void UART_TCP_MeterTick(void)
     if (!g_pollRun) return;
 
     if (g_pollTick < MP_SLOTS) {
-        mc_service(g_pollTick);                 
+        mc_service(g_pollTick);                 /* one real meter this tick */
     }
 
     if (g_pollTick == MP_TICKS_PER_CYCLE - 1) {
-        BL_ProcessSweep();                      
+        BL_ProcessSweep();                      /* integrate deltas + sync web */
     }
 
     g_pollTick++;
@@ -375,11 +393,11 @@ void UART_TCP_StartMeterPoll(void)
 
 void UART_TCP_StopMeterPoll(void)
 {
-    g_pollRun = false;   
+    g_pollRun = false;   /* no persistent sockets to close — each read cleans up */
 }
 
 /* ===========================================================================
-   Charger targets & Console Commands — unchanged
+   Charger targets — unchanged
    =========================================================================== */
 const char *UART_TCP_GetChargerIP(int slot)
 {
@@ -416,6 +434,7 @@ void UART_TCP_SendChargerCmd(const char *path)
     ADDLOG_INFO(LOG_FEATURE_DRV, "UART_TCP: charger cmd sent: %s -> %s", path, ip);
 }
 
+/* ---- console commands ---- */
 static int cmd_set_serial(int slot, const char *args)
 {
     while (args && *args == ' ') args++;
@@ -468,6 +487,7 @@ static int cmd_send_charger(const void *c,const char *cmd,const char *a)
     return 1;
 }
 
+/* ---- init ---- */
 void UART_TCP_ClientInit(void)
 {
     nvs_load_all();
