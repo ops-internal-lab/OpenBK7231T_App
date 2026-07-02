@@ -181,46 +181,40 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 }
 
 /* ===========================================================================
-   REMOTE 6-METER POLLER  --  connect / read / (retry) / close, PER READ
+   REMOTE 6-METER POLLER  --  connect / check-mode / read / close, PER READ
    ---------------------------------------------------------------------------
    One meter is serviced per 1 Hz tick (round-robin, 10-tick cycle). Each
-   service opens a FRESH short-lived TCP connection, reads one frame (retrying
-   a few times inside a 250 ms budget until a checksum-valid frame arrives),
-   then RST-closes the socket. Nothing is kept open between reads.
+   service opens a FRESH short-lived connection and runs the exact sequence:
+     58 19 -> wait 20 ms -> read MODE reply         (verified EVERY read)
+     if MODE wrong: a8 1d 55.. (unlock) -> 50 ms -> a8 19 07.. (program),
+                    draining each write's reply; take no data this cycle
+     else:          58 aa -> wait 80 ms -> read frame; retry the request on
+                    invalid data (up to MP_MAX_ATTEMPTS)
+   then RST-close. Nothing is kept open between reads.
 
-   Why this is safe against the socket-pool exhaustion that killed the original
-   connect-per-poll code: we close with SO_LINGER 0 (RST), which does NOT enter
+   Why per-read connects are safe against the socket-pool exhaustion that killed
+   the original code: we close with SO_LINGER 0 (RST), which does NOT enter
    TIME_WAIT, so opening a socket every read never drains the pool. And a fresh
-   connection is inherently clean — the slave bridge flushes its stale UART on
-   accept(), so there is never carried-over garbage to desync the frame.
+   connection is inherently clean — the slave flushes its stale UART on accept(),
+   so there is never carried-over garbage to desync the frame.
    =========================================================================== */
 
 #define MP_PORT            UART_TCP_PORT   /* 8888 */
-#define MP_CONNECT_MS      80              /* bounded "get the link live" wait    */
-/* Per frame attempt: after sending {0x58,0xAA} we SETTLE, then poll for the
-   reply. A 23-byte frame at 4800 baud is ~48 ms on the wire ALONE, before the
-   request byte-time, BL0942 turnaround and WiFi jitter — so we must wait for
-   it. Bailing before it arrives is exactly how reads were being "lost". */
-#define MP_FRAME_SETTLE_MS 70              /* skip the guaranteed-empty period    */
-#define MP_ATTEMPT_MS      100              /* total wait per attempt (settle+poll) */
-#define MP_MAX_ATTEMPTS    3               /* re-send + retry up to this many      */
-#define MP_REG_READ_MS     200             /* single-register reply wait          */
-#define MP_REG_SETTLE_MS   50              /* reg reply is only 4 bytes (~8 ms)    */
-#define MP_RXCAP           64              /* frame resync buffer                 */
+#define MP_CONNECT_MS      80              /* bounded "get the link live" wait     */
+/* Fixed post-command waits, per your capture — a slow 4800-baud link needs
+   them (a 23-byte frame alone is ~48 ms on the wire). After the wait we do a
+   short gather loop to pick up a fragmented reply, then validate. */
+#define MP_MODE_WAIT_MS    20              /* after 58 19, before reading the reply */
+#define MP_UNLOCK_WAIT_MS  50              /* after each WRPROT / MODE write        */
+#define MP_FRAME_WAIT_MS   80              /* after 58 aa, before reading the frame */
+#define MP_GATHER_SPINS    12              /* extra ~2-3 ms polls to gather a reply */
+#define MP_MAX_ATTEMPTS    3               /* frame requests before giving up       */
+#define MP_RXCAP           64              /* frame resync buffer                  */
 #define MP_SLOTS           6
-#define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
-#define MP_MODE_CHECK_MS   30000           /* MODE re-verify cadence, per meter    */
+#define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle  */
 
-static bool     g_pollRun  = false;        /* poller enabled between Start/Stop   */
-static int      g_pollTick = 0;            /* 0..MP_TICKS_PER_CYCLE-1 round-robin  */
-/* Per-meter state that must persist ACROSS the short-lived connections. */
-static uint32_t g_lastModeCheck[MP_SLOTS] = { 0 };
-static bool     g_modeSet[MP_SLOTS]       = { false };
-
-static uint32_t now_ms(void)
-{
-    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-}
+static bool g_pollRun  = false;            /* poller enabled between Start/Stop     */
+static int  g_pollTick = 0;                /* 0..MP_TICKS_PER_CYCLE-1 round-robin    */
 
 /* RST close (SO_LINGER 0): no TIME_WAIT, so per-read connects don't exhaust the
    socket pool, and the slave sees the drop immediately and frees its one slot. */
@@ -261,76 +255,82 @@ static int mc_open(const char *ip)
     return fd;
 }
 
-/* Send one read-full-frame request and wait (until `deadline`) for a
-   checksum-valid 23-byte frame; store it to `slot`. Returns 1 stored, 0 no
-   valid frame before the deadline, -1 socket error / peer closed. */
-static int mc_read_frame(int fd, int slot, int cf_reset, uint32_t deadline)
+/* Send 58 aa, wait the fixed frame time, then gather + validate a 23-byte
+   frame (TCP may deliver it fragmented). Returns 1 stored, 0 no valid frame,
+   -1 socket error / peer closed. */
+static int mc_read_frame(int fd, int slot)
 {
     unsigned char req[2] = { 0x58, 0xAA };
     unsigned char rx[MP_RXCAP];
-    int rxlen = 0;
+    int rxlen = 0, spins;
 
     if (send(fd, req, 2, 0) < 0 && errno != EWOULDBLOCK && errno != EAGAIN) return -1;
 
-    /* Give the slow 4800-baud link time to start delivering before we poll —
-       nothing can arrive in the first ~48 ms anyway. */
-    rtos_delay_milliseconds(MP_FRAME_SETTLE_MS);
+    rtos_delay_milliseconds(MP_FRAME_WAIT_MS);            /* wait 80 ms */
 
-    while ((int32_t)(now_ms() - deadline) < 0) {
+    for (spins = 0; spins < MP_GATHER_SPINS; spins++) {
         int n;
         if (rxlen >= MP_RXCAP) rxlen = 0;                 /* overflow -> resync */
         n = recv(fd, rx + rxlen, MP_RXCAP - rxlen, 0);
         if (n > 0) {
             rxlen += n;
-            if (BL0942_TCP_ScanStore(rx, rxlen, slot, cf_reset) > 0) return 1;
+            if (BL0942_TCP_ScanStore(rx, rxlen, slot, BL0942_CF_RESET_NONE) > 0) return 1;
+            spins = 0;                                    /* got bytes; keep gathering */
         } else if (n == 0) {
             return -1;                                    /* peer closed */
         } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
             return -1;                                    /* hard error */
         } else {
-            rtos_delay_milliseconds(20);                   /* nothing yet, wait */
+            rtos_delay_milliseconds(3);                   /* wait for the tail */
         }
     }
-    return 0;                                             /* deadline, no frame */
+    return 0;                                             /* no valid frame */
 }
 
-/* Single-register read. On a FRESH connection there is nothing stale to drain
-   (the slave flushed its UART on accept), so no pre-drain is needed. Protocol:
-   send {0x58,reg}, reply = 3 data bytes (MSB first) + checksum
-   ~(0x58+reg+b0+b1+b2). Returns 0 + *val, or -1. */
+/* Send 58 <reg>, wait the fixed mode time, then gather the 4-byte reply and
+   validate. Value bytes are LITTLE-ENDIAN on the wire (confirmed: MODE read
+   returns 07 00 00 87 == 0x07, matching the 07 00 00 we write). Returns 0 +
+   *val, or -1. */
 static int mc_read_reg(int fd, unsigned char reg, uint32_t *val)
 {
     unsigned char req[2] = { 0x58, reg };
     unsigned char rx[8];
-    int rxn = 0;
-    uint32_t deadline = now_ms() + MP_REG_READ_MS;
+    int rxn = 0, spins;
 
     if (send(fd, req, 2, 0) < 0 && errno != EWOULDBLOCK && errno != EAGAIN) return -1;
 
-    rtos_delay_milliseconds(MP_REG_SETTLE_MS);            /* let the reply arrive */
+    rtos_delay_milliseconds(MP_MODE_WAIT_MS);             /* wait 20 ms */
 
-    while ((int32_t)(now_ms() - deadline) < 0) {
+    for (spins = 0; spins < MP_GATHER_SPINS && rxn < 4; spins++) {
         int n = recv(fd, rx + rxn, (int)sizeof(rx) - rxn, 0);
-        if (n > 0) {
-            rxn += n;
-            if (rxn >= 4) {
-                unsigned char cs = (unsigned char)((0x58 + reg + rx[0] + rx[1] + rx[2]) ^ 0xFF);
-                if (cs != rx[3]) return -1;               /* bad checksum */
-                /* Value bytes are LITTLE-ENDIAN on the wire (confirmed against a
-                   MODE read: RX 07 00 00 87 == 0x07, matching the 07 00 00 we
-                   write). rx[0] is the LSB. */
-                *val = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) | ((uint32_t)rx[2] << 16);
-                return 0;
-            }
-        } else if (n == 0) {
-            return -1;
-        } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            return -1;
-        } else {
-            rtos_delay_milliseconds(20);
-        }
+        if (n > 0) { rxn += n; spins = 0; }
+        else if (n == 0) return -1;
+        else if (errno != EWOULDBLOCK && errno != EAGAIN) return -1;
+        else rtos_delay_milliseconds(2);
     }
-    return -1;                                            /* timeout */
+    if (rxn < 4) return -1;
+
+    {
+        unsigned char cs = (unsigned char)((0x58 + reg + rx[0] + rx[1] + rx[2]) ^ 0xFF);
+        if (cs != rx[3]) return -1;                       /* bad checksum */
+        *val = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) | ((uint32_t)rx[2] << 16);
+    }
+    return 0;
+}
+
+/* Read and discard whatever the meter sent (e.g. the reply/echo a write emits),
+   so it can't pollute the next command's reply. */
+static void mc_drain(int fd)
+{
+    unsigned char tmp[16];
+    int spins;
+    for (spins = 0; spins < MP_GATHER_SPINS; spins++) {
+        int n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n > 0) { spins = 0; continue; }               /* keep draining */
+        if (n == 0) return;
+        if (errno != EWOULDBLOCK && errno != EAGAIN) return;
+        rtos_delay_milliseconds(2);
+    }
 }
 
 /* Fire-and-forget register write (no reply). Value bytes little-endian,
@@ -350,15 +350,20 @@ static void mc_write_reg(int fd, unsigned char reg, uint32_t val)
     (void)send(fd, msg, sizeof(msg), 0);
 }
 
-/* Service ONE meter in a single pass:
-     open -> (ensure/verify MODE) -> read a frame, re-sending and retrying up to
-     MP_MAX_ATTEMPTS (each a MP_ATTEMPT_MS window) -> RST-close.
-   Returns 1 good frame / 0 no valid frame / -1 offline (couldn't connect). */
+/* Service ONE meter in a single pass, per the exact sequence:
+     open
+     -> 58 19, wait 20 ms, read reply           (CHECK MODE, every time)
+     -> if MODE != 0x07: unlock + program (reading each write's reply), then
+        take NO data this cycle and discard the tainted interval
+     -> else: 58 aa, wait 80 ms, read frame; on invalid data request again
+        (up to MP_MAX_ATTEMPTS)
+     -> close
+   Returns 1 good frame / 0 no valid frame or reprogrammed / -1 offline. */
 static int mc_service(int slot)
 {
-    int cf_reset = BL0942_CF_RESET_NONE;
     int oct = BL_GetMeterOctet(slot);
     int fd, attempt, got = 0;
+    uint32_t mode = 0;
     char ip[24];
 
     if (oct == 0) {                                       /* unset -> hard offline */
@@ -370,47 +375,45 @@ static int mc_service(int slot)
     fd = mc_open(ip);
     if (fd < 0) { BL_MeterReadFailed(slot); return -1; }
 
-    /* MODE, on this fresh connection:
-       - first ever contact: blind-program signed mode (the chip powers up in
-         its default ABSOLUTE mode). g_cfPrev is still INVALID, so the parser
-         drops this first delta regardless.
-       - otherwise, every MP_MODE_CHECK_MS: read MODE back. Only a CONFIRMED
-         wrong value (a successful read that disagrees) means the chip reset ->
-         reprogram + discard the tainted interval (CF_RESET_CHIP). An unreadable
-         mode changes nothing (no reprogram, no wipe). */
-    if (!g_modeSet[slot]) {
-        mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);
-        rtos_delay_milliseconds(20);    
-        mc_write_reg(fd, BL0942_REG_MODE_ADDR,   BL0942_MODE_FREE_RUN_SIGNED);
-        g_modeSet[slot]       = true;
-        g_lastModeCheck[slot] = now_ms();
-    } else if ((int32_t)(now_ms() - g_lastModeCheck[slot]) >= MP_MODE_CHECK_MS) {
-        uint32_t mode = 0;
-        g_lastModeCheck[slot] = now_ms();
-        if (mc_read_reg(fd, BL0942_REG_MODE_ADDR, &mode) == 0 &&
-            (mode & BL0942_MODE_MATCH_MASK) != BL0942_MODE_FREE_RUN_SIGNED) {
-            mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);
-            rtos_delay_milliseconds(20);    
-            mc_write_reg(fd, BL0942_REG_MODE_ADDR,   BL0942_MODE_FREE_RUN_SIGNED);
-            cf_reset = BL0942_CF_RESET_CHIP;
-            ADDLOG_WARN(LOG_FEATURE_DRV,
-                        "Meter %d MODE was 0x%X (reset) - reprogrammed to signed",
-                        slot + 1, (unsigned)mode);
-        }
+    /* 1) CHECK THE MODE, EVERY TIME. */
+    if (mc_read_reg(fd, BL0942_REG_MODE_ADDR, &mode) != 0) {
+        /* No usable reply -> can't trust the chip's state. Take no data and do
+           NOT reprogram on a mere comms hiccup. */
+        mc_close(fd);
+        BL_MeterReadFailed(slot);
+        return 0;
     }
 
-    /* Read one frame, re-sending and retrying up to MP_MAX_ATTEMPTS. Each
-       attempt gets its OWN MP_ATTEMPT_MS window (settle + poll), so a retry
-       genuinely re-sends rather than one attempt eating the whole budget.
-       3 x 80 ms stays under the 250 ms we allow per read. */
+    if ((mode & BL0942_MODE_MATCH_MASK) != BL0942_MODE_FREE_RUN_SIGNED) {
+        /* 2) WRONG MODE = the chip reset to its default absolute accumulator.
+           Unlock, then program, reading the reply each write emits before the
+           next command. Take NO data this cycle and discard the tainted interval
+           (a grid meter's partial period is now meaningless). The stale CF
+           baseline self-heals next cycle: the post-reset delta trips the sanity
+           cap and is dropped, then re-baselines. */
+        mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);   /* a8 1d 55.. */
+        rtos_delay_milliseconds(MP_UNLOCK_WAIT_MS);       /* wait 50 ms */
+        mc_drain(fd);                                     /* accommodate its reply */
+        mc_write_reg(fd, BL0942_REG_MODE_ADDR, BL0942_MODE_FREE_RUN_SIGNED); /* a8 19 07.. */
+        rtos_delay_milliseconds(MP_UNLOCK_WAIT_MS);       /* let its reply arrive */
+        mc_drain(fd);                                     /* accommodate its reply */
+        if (slot >= 0 && slot <= 2) BL_MeterNoteReset(slot);
+        ADDLOG_WARN(LOG_FEATURE_DRV,
+                    "Meter %d MODE was 0x%X (reset) - reprogrammed to signed",
+                    slot + 1, (unsigned)mode);
+        mc_close(fd);
+        BL_MeterReadFailed(slot);
+        return 0;
+    }
+
+    /* 3) MODE OK -> ask for the frame; retry the request on invalid data. */
     for (attempt = 0; attempt < MP_MAX_ATTEMPTS; attempt++) {
-        int r = mc_read_frame(fd, slot, cf_reset, now_ms() + MP_ATTEMPT_MS);
-        if (r == 1) { got = 1; break; }                   /* valid frame stored */
+        int r = mc_read_frame(fd, slot);
+        if (r == 1) { got = 1; break; }
         if (r < 0)  break;                                /* socket dead -> stop */
-        /* r == 0: no valid frame in this window -> re-send and try again */
     }
 
-    mc_close(fd);                                         /* always RST-close */
+    mc_close(fd);
 
     if (got) return 1;
     BL_MeterReadFailed(slot);
@@ -446,11 +449,6 @@ void UART_TCP_MeterTick(void)
 
 void UART_TCP_StartMeterPoll(void)
 {
-    int i;
-    for (i = 0; i < MP_SLOTS; i++) {
-        g_lastModeCheck[i] = 0;
-        g_modeSet[i]       = false;    /* re-program MODE on first read after boot */
-    }
     g_pollTick = 0;
     g_pollRun  = true;
     ADDLOG_INFO(LOG_FEATURE_DRV, "Remote meter poller armed (connect/read/close per read)");
