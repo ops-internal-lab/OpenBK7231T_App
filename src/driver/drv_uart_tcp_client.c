@@ -197,9 +197,15 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 
 #define MP_PORT            UART_TCP_PORT   /* 8888 */
 #define MP_CONNECT_MS      80              /* bounded "get the link live" wait    */
-#define MP_READ_BUDGET_MS  250             /* send + read + retry budget (post-connect) */
-#define MP_MAX_ATTEMPTS    3               /* frame attempts within that budget   */
-#define MP_REG_READ_MS     120             /* single-register reply budget        */
+/* Per frame attempt: after sending {0x58,0xAA} we SETTLE, then poll for the
+   reply. A 23-byte frame at 4800 baud is ~48 ms on the wire ALONE, before the
+   request byte-time, BL0942 turnaround and WiFi jitter — so we must wait for
+   it. Bailing before it arrives is exactly how reads were being "lost". */
+#define MP_FRAME_SETTLE_MS 25              /* skip the guaranteed-empty period    */
+#define MP_ATTEMPT_MS      80              /* total wait per attempt (settle+poll) */
+#define MP_MAX_ATTEMPTS    3               /* re-send + retry up to this many      */
+#define MP_REG_READ_MS     100             /* single-register reply wait          */
+#define MP_REG_SETTLE_MS   15              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
 #define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
@@ -266,6 +272,10 @@ static int mc_read_frame(int fd, int slot, int cf_reset, uint32_t deadline)
 
     if (send(fd, req, 2, 0) < 0 && errno != EWOULDBLOCK && errno != EAGAIN) return -1;
 
+    /* Give the slow 4800-baud link time to start delivering before we poll —
+       nothing can arrive in the first ~48 ms anyway. */
+    rtos_delay_milliseconds(MP_FRAME_SETTLE_MS);
+
     while ((int32_t)(now_ms() - deadline) < 0) {
         int n;
         if (rxlen >= MP_RXCAP) rxlen = 0;                 /* overflow -> resync */
@@ -297,6 +307,8 @@ static int mc_read_reg(int fd, unsigned char reg, uint32_t *val)
 
     if (send(fd, req, 2, 0) < 0 && errno != EWOULDBLOCK && errno != EAGAIN) return -1;
 
+    rtos_delay_milliseconds(MP_REG_SETTLE_MS);            /* let the reply arrive */
+
     while ((int32_t)(now_ms() - deadline) < 0) {
         int n = recv(fd, rx + rxn, (int)sizeof(rx) - rxn, 0);
         if (n > 0) {
@@ -304,7 +316,10 @@ static int mc_read_reg(int fd, unsigned char reg, uint32_t *val)
             if (rxn >= 4) {
                 unsigned char cs = (unsigned char)((0x58 + reg + rx[0] + rx[1] + rx[2]) ^ 0xFF);
                 if (cs != rx[3]) return -1;               /* bad checksum */
-                *val = ((uint32_t)rx[0] << 16) | ((uint32_t)rx[1] << 8) | rx[2];
+                /* Value bytes are LITTLE-ENDIAN on the wire (confirmed against a
+                   MODE read: RX 07 00 00 87 == 0x07, matching the 07 00 00 we
+                   write). rx[0] is the LSB. */
+                *val = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) | ((uint32_t)rx[2] << 16);
                 return 0;
             }
         } else if (n == 0) {
@@ -336,15 +351,14 @@ static void mc_write_reg(int fd, unsigned char reg, uint32_t val)
 }
 
 /* Service ONE meter in a single pass:
-     open -> (ensure/verify MODE) -> read a frame, retrying up to
-     MP_MAX_ATTEMPTS inside one MP_READ_BUDGET_MS window -> RST-close.
+     open -> (ensure/verify MODE) -> read a frame, re-sending and retrying up to
+     MP_MAX_ATTEMPTS (each a MP_ATTEMPT_MS window) -> RST-close.
    Returns 1 good frame / 0 no valid frame / -1 offline (couldn't connect). */
 static int mc_service(int slot)
 {
     int cf_reset = BL0942_CF_RESET_NONE;
     int oct = BL_GetMeterOctet(slot);
     int fd, attempt, got = 0;
-    uint32_t deadline;
     char ip[24];
 
     if (oct == 0) {                                       /* unset -> hard offline */
@@ -383,14 +397,15 @@ static int mc_service(int slot)
         }
     }
 
-    /* Read one frame, retrying within a single 250 ms budget on the live link.
-       Each attempt re-sends the request so the chip emits a fresh frame. */
-    deadline = now_ms() + MP_READ_BUDGET_MS;
+    /* Read one frame, re-sending and retrying up to MP_MAX_ATTEMPTS. Each
+       attempt gets its OWN MP_ATTEMPT_MS window (settle + poll), so a retry
+       genuinely re-sends rather than one attempt eating the whole budget.
+       3 x 80 ms stays under the 250 ms we allow per read. */
     for (attempt = 0; attempt < MP_MAX_ATTEMPTS; attempt++) {
-        int r = mc_read_frame(fd, slot, cf_reset, deadline);
+        int r = mc_read_frame(fd, slot, cf_reset, now_ms() + MP_ATTEMPT_MS);
         if (r == 1) { got = 1; break; }                   /* valid frame stored */
         if (r < 0)  break;                                /* socket dead -> stop */
-        if ((int32_t)(now_ms() - deadline) >= 0) break;   /* out of budget */
+        /* r == 0: no valid frame in this window -> re-send and try again */
     }
 
     mc_close(fd);                                         /* always RST-close */
