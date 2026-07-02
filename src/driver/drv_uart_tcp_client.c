@@ -167,12 +167,12 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
    =========================================================================== */
 
 #define MP_PORT            UART_TCP_PORT   /* 8888 */
-#define MP_CONNECT_MS      25              /* bounded "get the link live" wait    */
-#define MP_FRAME_SETTLE_MS 50              /* skip the guaranteed-empty period    */
-#define MP_ATTEMPT_MS      200             /* total wait per attempt (settle+poll) */
-#define MP_MAX_ATTEMPTS    4               /* re-send + retry up to this many      */
-#define MP_REG_READ_MS     50             /* single-register reply wait          */
-#define MP_REG_SETTLE_MS   20              /* reg reply is only 4 bytes (~8 ms)    */
+#define MP_CONNECT_MS      80              /* bounded "get the link live" wait    */
+#define MP_FRAME_SETTLE_MS 70              /* skip the guaranteed-empty period    */
+#define MP_ATTEMPT_MS      100             /* total wait per attempt (settle+poll) */
+#define MP_MAX_ATTEMPTS    3               /* re-send + retry up to this many      */
+#define MP_REG_READ_MS     200             /* single-register reply wait          */
+#define MP_REG_SETTLE_MS   50              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
 #define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
@@ -251,7 +251,7 @@ static int mc_read_frame(int fd, int slot, int cf_reset, uint32_t deadline)
         } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
             return -1;                                    /* hard error */
         } else {
-            rtos_delay_milliseconds(20);                   /* nothing yet, wait */
+            rtos_delay_milliseconds(50);                   /* nothing yet, wait */
         }
     }
     return 0;                                             /* deadline, no frame */
@@ -285,7 +285,7 @@ static int mc_read_reg(int fd, unsigned char reg, uint32_t *val)
         } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
             return -1;
         } else {
-            rtos_delay_milliseconds(20);
+            rtos_delay_milliseconds(50);
         }
     }
     return -1;                                            /* timeout */
