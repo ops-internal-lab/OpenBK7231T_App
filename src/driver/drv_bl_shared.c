@@ -171,10 +171,12 @@ static void SETTINGS_Save(void);             // defined after the NVS includes b
 // failures so we can hold the last-good value); last_ok = tick of the most
 // recent successful read. Display/integration freshness is derived from the
 // age of last_ok, not from online alone (see BL_MeterOnlineState).
-// e_acc = signed Wh accumulated from the BL0942's algebraic CF_CNT deltas since
-// the sweep last consumed this slot (+import / -export). The sweep sums and
-// zeroes it each cycle, so no chip energy is lost between sweeps.
-typedef struct { float v, a, w, freq, e_acc; int online; TickType_t last_ok; } meter_slot_t;
+// cf_wh  = signed net Wh for THIS sweep, from the chip's CF-CNT delta
+//          (+ = import/charge/generation-direction, - = the opposite).
+// cf_valid = 1 when cf_wh holds a trustworthy delta this cycle, 0 otherwise
+//          (first read after (re)connect, detected chip reset, or a glitch).
+typedef struct { float v, a, w, freq; int online; TickType_t last_ok;
+                 float cf_wh; int cf_valid; } meter_slot_t;
 static meter_slot_t g_meter[6];
 
 // Read freshness windows. A slot is polled ~every 6 s, so within 9 s a good
@@ -332,22 +334,15 @@ static void evaluate_diversion(void) {
 }
 
 // ====================================================================
-// AVERAGED POWER (2-sample rolling, energy-over-time, signed)
+// INSTANTANEOUS POWER (derived directly from the Wh delta of the cycle)
 // ====================================================================
-// Each BL_ProcessUpdate call delivers the SIGNED energy (Wh) accumulated from
-// the meter's algebraic CF_CNT since the previous call (+import / -export),
-// plus the elapsed interval. We keep the last 2 samples (~6 s each -> ~12 s
-// window) and convert the summed energy back to average watts:
-//     avg_W = (E0 + E1) * 3600 / (t0 + t1)
-// This is a true time-weighted average of actual metered energy, so it is
-// immune to where a pulsating load happens to be sampled, and never uses the
-// instantaneous power to sign anything (the energy carries its own sign).
-#define AVG_POWER_SAMPLES 2
-static float         avg_e_buf[AVG_POWER_SAMPLES] = {0};   // signed Wh per sample
-static float         avg_t_buf[AVG_POWER_SAMPLES] = {0};   // seconds per sample
-static int           avg_pwr_idx   = 0;
-static int           avg_pwr_count = 0;
-static float         calc_power_w  = 0.0f;                  // signed averaged watts
+// Each BL_ProcessUpdate call receives the SIGNED Wh that flowed since the
+// last call (from the chip's CF-CNT delta on remote meters). Dividing by the
+// elapsed time gives the average wattage over that window — which, because a
+// full cycle is a fixed ~10 s, already IS the smoothed value. No extra rolling
+// average is applied. Signed: positive = import (consumption), negative =
+// export.
+static float         calc_power_w     = 0.0f;
 
 // ====================================================================
 // LOOP INTERVAL MEASUREMENT
@@ -990,21 +985,64 @@ int BL_GetMeterOctet(int slot) {
 // online=0 means a hard offline (unset IP) — clear the slot completely so it
 // shows as absent. A *failed read* must NOT come through here as online=0
 // (that would wipe the last-good value); use BL_MeterReadFailed instead.
-void BL_SetMeterReading(int slot, float v, float a, float w, float freq, float e_wh, int online) {
+void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online) {
     if (slot < 0 || slot >= 6) return;
     if (online) {
         g_meter[slot].v = v; g_meter[slot].a = a;
         g_meter[slot].w = w; g_meter[slot].freq = freq;
-        if (isfinite(e_wh)) g_meter[slot].e_acc += e_wh;   // sum signed chip energy
         g_meter[slot].online = 1;
         g_meter[slot].last_ok = xTaskGetTickCount();
     } else {
         g_meter[slot].v = 0; g_meter[slot].a = 0;
         g_meter[slot].w = 0; g_meter[slot].freq = 0;
-        g_meter[slot].e_acc = 0;
         g_meter[slot].online = 0;
         g_meter[slot].last_ok = 0;
+        g_meter[slot].cf_wh = 0.0f; g_meter[slot].cf_valid = 0;
     }
+}
+
+// Store a good reading plus this cycle's signed CF-CNT energy. The raw counter
+// delta / wrap / scaling is done in the BL0942 driver (where the calibration
+// lives); here we just latch the result and timestamp the slot.
+void BL_SetMeterReadingCf(int slot, float v, float a, float w, float freq,
+                          float cf_wh, int cf_valid) {
+    if (slot < 0 || slot >= 6) return;
+    g_meter[slot].v = v; g_meter[slot].a = a;
+    g_meter[slot].w = w; g_meter[slot].freq = freq;
+    g_meter[slot].online = 1;
+    g_meter[slot].last_ok = xTaskGetTickCount();
+    g_meter[slot].cf_wh = cf_valid ? cf_wh : 0.0f;
+    g_meter[slot].cf_valid = cf_valid ? 1 : 0;
+}
+
+// Signed net Wh contributed by this slot for the current sweep. Gated on both
+// cf_valid AND freshness: a slot that dropped past the hold window contributes
+// 0 rather than replaying a stale delta.
+float BL_MeterCfWh(int slot) {
+    if (slot < 0 || slot >= 6) return 0.0f;
+    if (!g_meter[slot].cf_valid) return 0.0f;
+    if (BL_MeterOnlineState(slot) == 0) return 0.0f;
+    return g_meter[slot].cf_wh;
+}
+
+// Clear per-cycle CF energy once the sweep has folded it into the totals.
+void BL_MeterCfConsume(void) {
+    int i;
+    for (i = 0; i < 6; i++) { g_meter[i].cf_wh = 0.0f; g_meter[i].cf_valid = 0; }
+}
+
+// A grid meter reported a chip reset mid-interval. Everything accumulated for
+// the current 15-min interval is now untrustworthy (the counter it was derived
+// from restarted), so wipe the interval's running net and let it re-accumulate
+// from the next good delta. The lifetime totals are untouched — only the
+// in-progress period is discarded, exactly as if this partial period never
+// happened. The estimate re-derives from the zeroed net on the next tick.
+void BL_MeterNoteReset(int slot) {
+    (void)slot;
+    real_consumption = 0.0f;
+    real_export      = 0.0f;
+    net_energy       = 0.0f;
+    estimated_energy_period = 0;
 }
 
 // A read attempt failed but the meter may just have a comms hiccup: keep the
@@ -1033,21 +1071,6 @@ static float BL_MeterIntegW(int slot) {
     return BL_MeterOnlineState(slot) ? g_meter[slot].w : 0.0f;
 }
 
-// Read and zero a slot's accumulated signed chip energy (Wh) since the last
-// call (+import / -export). A hard-offline slot returns 0 and stays cleared so
-// a dropout can't dump a stale energy blob when it reconnects. A stale-holding
-// slot still returns whatever it accumulated (the FREE-RUNNING algebraic
-// CF_CNT means that energy was measured by the chip over real time and is
-// real - it shouldn't be discarded on a brief comms hiccup).
-float BL_MeterTakeEnergy(int slot) {
-    float e;
-    if (slot < 0 || slot >= 6) return 0.0f;
-    if (!g_meter[slot].online) { g_meter[slot].e_acc = 0.0f; return 0.0f; }
-    e = g_meter[slot].e_acc;
-    g_meter[slot].e_acc = 0.0f;
-    return e;
-}
-
 // Read back a slot for the /api_dash?req=meters payload. *online returns the
 // tri-state (0 offline / 1 fresh / 2 stale-holding).
 int BL_GetMeter(int slot, float *v, float *a, float *w, int *online) {
@@ -1059,37 +1082,46 @@ int BL_GetMeter(int slot, float *v, float *a, float *w, int *online) {
     return 1;
 }
 
-// Called once per completed 6-meter sweep by the poller. Sums the three grid
-// phases into the existing net pipeline (sign = import/export), and integrates
-// the Solar and ESS energy counters from power * actual elapsed time.
+// Called once per 10 s cycle (on the poller's 10th tick). Sums each meter's
+// signed CF-CNT delta for this cycle into the totals: the three grid phases
+// feed the net import/export pipeline, Solar A+B feed generation, and the ESS
+// slot splits charge/discharge by sign. Energy comes from the counter, not
+// from power*time.
 void BL_ProcessSweep(void) {
-    // Energy now comes from each meter's algebraic CF_CNT (already integrated over
-    // real time on the chip and summed per-slot by BL_SetMeterReading), so there's
-    // no software power*dt integration and no dt guard needed here: a stalled meter
-    // simply accumulates nothing and contributes 0 this sweep. Instantaneous power
-    // (BL_MeterIntegW) is still used for the live grid reading / OBK_POWER.
+    // Energy is now taken straight from each meter's free-running signed CF-CNT
+    // counter: the delta since the previous read (computed in the BL0942 driver)
+    // IS the true net Wh that flowed over the ~10 s cycle, immune to the
+    // instantaneous-watt-sign misattribution that power*time suffered on
+    // pulsating loads. A slot with no valid delta this cycle (just (re)connected,
+    // reset, or offline) contributes exactly 0 via BL_MeterCfWh().
+    //
+    // The instantaneous W is still summed for DISPLAY and for the 15-min
+    // estimate ("instant consumption reported by the chip"); it no longer
+    // drives the energy totals or the import/export split.
 
-    // --- Consumption: L1+L2+L3 signed net chip energy -> existing pipeline ---
-    // A hard-offline phase yields 0 W and 0 Wh (BL_MeterTakeEnergy) so a dropout
-    // can't freeze a phantom load into the net. Voltage/freq still come from slot 0.
+    // --- Consumption: L1+L2+L3 signed net -> existing 15-min pipeline ---
     {
+        float cons_wh = BL_MeterCfWh(0) + BL_MeterCfWh(1) + BL_MeterCfWh(2); // signed
         float cons_w  = BL_MeterIntegW(0) + BL_MeterIntegW(1) + BL_MeterIntegW(2);
-        float cons_wh = BL_MeterTakeEnergy(0) + BL_MeterTakeEnergy(1) + BL_MeterTakeEnergy(2);
         BL_ProcessUpdate(g_meter[0].v, g_meter[0].a, cons_w, g_meter[0].freq, cons_wh);
     }
 
-    // --- Solar generation: Solar A + Solar B (generation = positive energy) ---
+    // --- Solar generation: Solar A + Solar B (generation-direction only) ---
     {
-        float gen_wh = BL_MeterTakeEnergy(3) + BL_MeterTakeEnergy(4);
-        if (gen_wh > 0.0f) { gen_today += gen_wh; gen_total += gen_wh; }
+        float gen_wh = BL_MeterCfWh(3) + BL_MeterCfWh(4);
+        if (gen_wh < 0.0f) gen_wh = 0.0f;
+        gen_today += gen_wh; gen_total += gen_wh;
     }
 
-    // --- ESS (m6) signed: charge/import (>=0) vs discharge/export (<0) ---
+    // --- ESS (m6) signed: import/charge (>=0) vs export/discharge (<0) ---
     {
-        float ess_wh = BL_MeterTakeEnergy(5);
+        float ess_wh = BL_MeterCfWh(5);
         if (ess_wh >= 0.0f) { ess_imp_today +=  ess_wh; ess_imp_total +=  ess_wh; }
         else                { ess_exp_today += -ess_wh; ess_exp_total += -ess_wh; }
     }
+
+    // Fold-in done: clear this cycle's deltas so nothing is counted twice.
+    BL_MeterCfConsume();
 
     // --- 15-min flash persistence + midnight reset of "today" counters ---
     // Totals accumulate in RAM every sweep and are flushed to NVS once per
@@ -1138,23 +1170,17 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
         loop_interval_ms = (unsigned int)(
             (now_tick - last_processupdate_tick) * portTICK_PERIOD_MS);
 
-        // Averaged power from the SIGNED energy the meter accumulated over this
-        // interval. energyWh already carries its sign, so no power-based signing.
+        // Instantaneous power derived from the Wh the meter accumulated
+        // over that same interval. Guard against zero elapsed time and
+        // non-finite energyWh (stray meter glitch).
         if (loop_interval_ms > 0 && isfinite(energyWh))
         {
             float delta_s = loop_interval_ms / 1000.0f;
 
-            avg_e_buf[avg_pwr_idx] = energyWh;          // signed Wh this interval
-            avg_t_buf[avg_pwr_idx] = delta_s;
-            avg_pwr_idx = (avg_pwr_idx + 1) % AVG_POWER_SAMPLES;
-            if (avg_pwr_count < AVG_POWER_SAMPLES) avg_pwr_count++;
-
-            {
-                float se = 0.0f, st = 0.0f;
-                int k;
-                for (k = 0; k < avg_pwr_count; k++) { se += avg_e_buf[k]; st += avg_t_buf[k]; }
-                calc_power_w = (st > 0.0f) ? (se / st) * 3600.0f : 0.0f;
-            }
+            // energyWh is already SIGNED (+ import / - export) — the sign now
+            // comes from the CF-CNT delta, not from a single instantaneous watt
+            // reading. Convert Wh → W over the interval; no smoothing needed.
+            calc_power_w = (energyWh / delta_s) * 3600.0f;
         }
     }
     last_processupdate_tick = now_tick;
@@ -1362,11 +1388,8 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
             check_time_estimate_mins = 15 - min_in_block; 
             if (check_time_estimate_mins <= 0) check_time_estimate_mins = 1;
 
-            // 1. Predict total Wh accumulated by the end of the 15-minute period.
-            //    Projection uses the AVERAGED power (calc_power_w), not the noisy
-            //    instantaneous reading, so a pulsating load can't skew the estimate
-            //    (and, in turn, the export-control loop that consumes it).
-            estimated_energy_period = safe_int(net_energy) + (safe_int(calc_power_w) * check_time_estimate_mins) / 60;
+            // 1. Predict total Wh accumulated by the end of the 15-minute period
+            estimated_energy_period = safe_int(net_energy) + (safe_int(sensors[OBK_POWER].lastReading) * check_time_estimate_mins) / 60;
 
             // 2. Update Base Solar State
             if (net_energy < -((float)target_export + 10.0f)) {
@@ -1466,10 +1489,10 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     if (!isfinite(energyWh)) {
         energyWh = 0.0f;
     }
-    // energyWh is signed (algebraic CF_CNT): >=0 import, <0 export. Bin by the
-    // energy's OWN sign, not the instantaneous power's, so a mid-interval
-    // reversal is attributed correctly. real_export stores a positive magnitude
-    // (net_energy = real_consumption - real_export).
+    // Import/export is now decided by the SIGN OF THE ENERGY that actually
+    // flowed this cycle (CF-CNT delta), not by one instantaneous watt sample.
+    // real_export is kept as a positive magnitude (period_net = consumption -
+    // export), so we add the negated value on the export branch.
     if (energyWh >= 0.0f)
     {
         real_consumption += energyWh;

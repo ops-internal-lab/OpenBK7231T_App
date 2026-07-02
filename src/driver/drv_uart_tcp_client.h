@@ -43,12 +43,15 @@ int         UART_TCP_PollMeter(const char *ip, int port, unsigned char *out, int
 /* Build "<our-subnet>.<octet>" (e.g. "192.168.8.156") into out. */
 void        UART_TCP_BuildIP(char *out, int outsz, unsigned char octet);
 
-/* ---- Persistent 6-meter poller ----
-   One task keeps a persistent socket per configured meter (BL_GetMeterOctet
-   slots 0..5) and polls them each sweep. Start once at boot; stop only on
-   driver teardown. Replaces the old connect-per-poll path. */
+/* ---- Persistent 6-meter poller (1 Hz round-robin) ----
+   Keeps a persistent socket per configured meter (BL_GetMeterOctet slots
+   0..5). UART_TCP_MeterTick() must be called once per second (from the
+   BL0942 RunEverySecond hook): it services one meter per tick over a 10-tick
+   (10 s) cycle — 6 meters + 4 dummy skips — and syncs the dashboard on the
+   final tick. Start arms it once at boot; Stop disarms and closes sockets. */
 void        UART_TCP_StartMeterPoll(void);
 void        UART_TCP_StopMeterPoll(void);
+void        UART_TCP_MeterTick(void);
 
 /* ---- Charger targets ---- */
 /* Returns full IP of charger slot (0=placeholder, 1=active), NULL if unset */
