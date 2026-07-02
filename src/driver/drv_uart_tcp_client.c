@@ -167,12 +167,12 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
    =========================================================================== */
 
 #define MP_PORT            UART_TCP_PORT   /* 8888 */
-#define MP_CONNECT_MS      50              /* bounded "get the link live" wait    */
-#define MP_FRAME_SETTLE_MS 60              /* skip the guaranteed-empty period    */
-#define MP_ATTEMPT_MS      250             /* total wait per attempt (settle+poll) */
-#define MP_MAX_ATTEMPTS    2               /* re-send + retry up to this many      */
-#define MP_REG_READ_MS     60             /* single-register reply wait          */
-#define MP_REG_SETTLE_MS   25              /* reg reply is only 4 bytes (~8 ms)    */
+#define MP_CONNECT_MS      25              /* bounded "get the link live" wait    */
+#define MP_FRAME_SETTLE_MS 50              /* skip the guaranteed-empty period    */
+#define MP_ATTEMPT_MS      200             /* total wait per attempt (settle+poll) */
+#define MP_MAX_ATTEMPTS    4               /* re-send + retry up to this many      */
+#define MP_REG_READ_MS     50             /* single-register reply wait          */
+#define MP_REG_SETTLE_MS   20              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
 #define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
