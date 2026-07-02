@@ -380,6 +380,7 @@ static int mc_service(int slot)
          mode changes nothing (no reprogram, no wipe). */
     if (!g_modeSet[slot]) {
         mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);
+        rtos_delay_milliseconds(20);    
         mc_write_reg(fd, BL0942_REG_MODE_ADDR,   BL0942_MODE_FREE_RUN_SIGNED);
         g_modeSet[slot]       = true;
         g_lastModeCheck[slot] = now_ms();
@@ -389,6 +390,7 @@ static int mc_service(int slot)
         if (mc_read_reg(fd, BL0942_REG_MODE_ADDR, &mode) == 0 &&
             (mode & BL0942_MODE_MATCH_MASK) != BL0942_MODE_FREE_RUN_SIGNED) {
             mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);
+            rtos_delay_milliseconds(20);    
             mc_write_reg(fd, BL0942_REG_MODE_ADDR,   BL0942_MODE_FREE_RUN_SIGNED);
             cf_reset = BL0942_CF_RESET_CHIP;
             ADDLOG_WARN(LOG_FEATURE_DRV,
