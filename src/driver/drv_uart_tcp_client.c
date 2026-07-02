@@ -175,7 +175,7 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 #define MP_REG_SETTLE_MS   50              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
-#define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
+#define MP_TICKS_PER_CYCLE 6             /* 6 meters + 4 dummy skips = 10 s cycle */
 
 static bool     g_pollRun  = false;        /* poller enabled between Start/Stop   */
 static int      g_pollTick = 0;            /* 0..MP_TICKS_PER_CYCLE-1 round-robin  */
@@ -251,7 +251,7 @@ static int mc_read_frame(int fd, int slot, int cf_reset, uint32_t deadline)
         } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
             return -1;                                    /* hard error */
         } else {
-            rtos_delay_milliseconds(50);                   /* nothing yet, wait */
+            rtos_delay_milliseconds(30);                   /* nothing yet, wait */
         }
     }
     return 0;                                             /* deadline, no frame */
@@ -285,7 +285,7 @@ static int mc_read_reg(int fd, unsigned char reg, uint32_t *val)
         } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
             return -1;
         } else {
-            rtos_delay_milliseconds(50);
+            rtos_delay_milliseconds(30);
         }
     }
     return -1;                                            /* timeout */
@@ -338,7 +338,7 @@ static int mc_service(int slot)
     /* 2) Check if register requires reprogramming */
     if ((mode & BL0942_MODE_MATCH_MASK) != BL0942_MODE_FREE_RUN_SIGNED) {
         mc_write_reg(fd, BL0942_REG_WRPROT_ADDR, BL0942_WRPROT_UNLOCK);
-        rtos_delay_milliseconds(50); /* Settling time for the chip configuration */   
+        rtos_delay_milliseconds(30); /* Settling time for the chip configuration */   
         mc_write_reg(fd, BL0942_REG_MODE_ADDR,   BL0942_MODE_FREE_RUN_SIGNED);
         
         ADDLOG_WARN(LOG_FEATURE_DRV,
