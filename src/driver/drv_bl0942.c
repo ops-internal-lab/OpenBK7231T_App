@@ -359,6 +359,14 @@ void BL0942_UART_Init(void) {
 // store to its slot. On sweep completion the shared layer integrates energy and
 // feeds the consumption phases into the existing pipeline.
 
+// Drop a slot's CF-CNT baseline so its NEXT read re-baselines (contributes 0 Wh)
+// instead of computing a delta against a stale previous value. Called by the
+// shared layer at a 15-min boundary for meters that are offline, so a meter that
+// returns in a later interval starts fresh rather than bridging a long gap.
+void BL0942_InvalidateBaseline(int slot) {
+    if (slot >= 0 && slot < 6) g_cfPrev[slot] = CF_CNT_INVALID;
+}
+
 // Validate + parse a 23-byte 0x55 frame from a flat buffer, scale it, and store
 // to meter `slot`. Returns 1 on a good frame, 0 otherwise. Checksum matches the
 // local parser: (CMD_READ + sum(bytes[0..len-2])) ^ 0xFF == last byte.
@@ -390,6 +398,12 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
     frequency   = (d.freq != 0) ? (2 * 500000.0f / d.freq) : 0.0f;
     signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
 
+    // Per-meter direction flip for a reverse-wired slave (settings page). Applies
+    // to BOTH the signed watt and the signed CF-CNT energy (below) so a slot's
+    // displayed direction and its counters always agree.
+    int meterInv = BL_GetMeterInvert(slot);
+    if (meterInv) signedPower = -signedPower;
+
     // -------- Signed CF-CNT delta (free-running signed mode) --------
     // The counter is a 24-bit value that increments on import and decrements on
     // export (two's-complement, wraps 0x000000<->0xFFFFFF). Compute the
@@ -420,6 +434,7 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
             // reverse-wired meter's totals and its displayed direction agree.
             // (This is a fixed config convention, NOT per-cycle power-sign logic.)
             if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) cf_wh = -cf_wh;
+            if (meterInv) cf_wh = -cf_wh;            // per-meter reverse-wire flip
             cf_valid = 1;
         }
     }

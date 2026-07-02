@@ -156,6 +156,12 @@ static int   inverter_gated    = 0;      // 1 = inverter latched off by BMS
 //   g_meter_ip[1] = L2   (consumption)   g_meter_ip[4] = Solar B (generation)
 //   g_meter_ip[2] = L3   (consumption)   g_meter_ip[5] = ESS Inverter (bidir)
 static unsigned char g_meter_ip[6]  = {0,0,0,0,0,0};
+// Per-meter direction inversion. Some BL0942 slaves get wired backwards, so the
+// signed WATT and the signed CF-CNT energy delta come out with the wrong sign.
+// A 1 here flips BOTH for that slot (applied in the BL0942 driver, so display
+// and energy stay consistent). Set from the meter settings page (SetMeterInvert),
+// persisted to flash on Apply (keys minv0..minv5).
+static unsigned char g_meter_invert[6] = {0,0,0,0,0,0};
 static char          g_bms_mac[18]  = {0};   // "AA:BB:CC:DD:EE:FF"
 static char          g_bms2_mac[18] = {0};
 static unsigned char g_inv2_ip      = 0;     // Boost Inverter (remote), last octet
@@ -163,6 +169,7 @@ static unsigned char g_bypass_ip    = 0;     // Diversion Load (remote), last oc
 static int           g_boost_power   = 10;   // Boost net-energy trigger (Wh)
 static int           g_inv2_on       = 0;    // Boost Inverter desired state
 static void SETTINGS_Save(void);             // defined after the NVS includes below
+static void COUNTERS_Save(void);             // defined after the NVS includes below
 
 // ---- Remote meter slots (filled once per read by the BL0942 TCP poller) ----
 // Slot roles match g_meter_ip[]: [0..2]=L1/L2/L3 (bidirectional grid phases,
@@ -192,6 +199,44 @@ static float gen_today = 0, gen_total = 0;            // Solar generation (m4+m5
 static float ess_imp_today = 0, ess_imp_total = 0;    // ESS import / charge   (m6 >=0)
 static float ess_exp_today = 0, ess_exp_total = 0;    // ESS export / discharge(m6 < 0)
 
+// ---- Grid (utility) energy counters (Wh) ----
+// L1+L2+L3 signed net, split by sign into two ALWAYS-POSITIVE counters exactly
+// the way solar/ESS are: >=0 -> import, <0 -> export (stored positive). Fed from
+// the CF-CNT delta each sweep (BL_ProcessSweep), NOT from power*time. "today"
+// resets at local midnight; totals are lifetime. Persisted keys gitod/gitot/
+// getod/getot.
+static float grid_imp_today = 0, grid_imp_total = 0;  // utility import  (>=0)
+static float grid_exp_today = 0, grid_exp_total = 0;  // utility export  (<0, stored +)
+
+// ---- Per-TYPE, per-15-min-interval accumulators (reset every rollover) ----
+// Grid uses the existing real_consumption / real_export (import / export Wh for
+// the current interval). Solar and ESS get their own here so all three types
+// keep a live "this interval so far" value taken straight from the counters.
+static float cur_solar   = 0;   // solar Wh generated this interval (one-way)
+static float cur_ess_chg = 0;   // ESS charge  Wh this interval
+static float cur_ess_dis = 0;   // ESS discharge Wh this interval
+
+// ---- Last-hour rings: the 4 most-recently-COMPLETED 15-min intervals ----
+// "Energy last hour" = sum of these 4. Import and export are separate positive
+// counters (they never go negative); solar is one-way. Written at each rollover.
+// RAM-only (like the in-progress interval) - after a reboot they refill within
+// an hour, matching the existing behaviour for real_consumption/real_export.
+#define LH_SLOTS 4
+static float lh_grid_imp[LH_SLOTS] = {0}, lh_grid_exp[LH_SLOTS] = {0};
+static float lh_solar[LH_SLOTS]    = {0};
+static float lh_ess_chg[LH_SLOTS]  = {0}, lh_ess_dis[LH_SLOTS]  = {0};
+static int   lh_pos = 0;   // next write slot in the rings
+
+// ---- Per-meter lifetime accumulated energy (signed Wh), for diagnosis ----
+// Shown on the meter settings page. Fed from each slot's signed CF-CNT delta
+// (post-invert). Persisted keys macc0..macc5. Cleared by ClearMeteringData.
+static float meter_acc[6] = {0,0,0,0,0,0};
+
+// Sum of the 4 ring entries for a last-hour counter.
+static float lh_sum4(const float *ring) {
+    return ring[0] + ring[1] + ring[2] + ring[3];
+}
+
 #include "drv_bl_shared.h"
 
 #include "../new_cfg.h"
@@ -202,6 +247,10 @@ static float ess_exp_today = 0, ess_exp_total = 0;    // ESS export / discharge(
 #include "../hal/hal_ota.h"
 #if PLATFORM_ESPIDF
 #include "drv_uart_tcp_client.h"
+// Drop a slot's CF-CNT baseline so its next read re-baselines (contributes 0)
+// instead of bridging a stale gap. Used at the interval boundary for any meter
+// that is currently offline (see point-2 offline policy in BL_ProcessUpdate).
+void BL0942_InvalidateBaseline(int slot);
 #endif
 #include "drv_local.h"
 #include "drv_ntp.h"
@@ -471,6 +520,69 @@ commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, 
     return CMD_RES_OK;
 }
 
+// ClearMeteringData — wipe ALL metering counters (grid / solar / ESS totals and
+// today, per-meter accumulators, the last-hour rings, the in-progress interval,
+// and the 12-hour graph matrices) and persist the zeroed state. Fired from the
+// "Clear Metering Data" button on the meter settings page. Meter IPs, MACs,
+// invert flags and control settings are NOT touched.
+commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int i;
+
+    // Lifetime + today counters, all types.
+    grid_imp_today = grid_imp_total = 0;
+    grid_exp_today = grid_exp_total = 0;
+    gen_today = gen_total = 0;
+    ess_imp_today = ess_imp_total = 0;
+    ess_exp_today = ess_exp_total = 0;
+    for (i = 0; i < 6; i++) meter_acc[i] = 0;
+
+    // In-progress interval + last-hour rings.
+    real_consumption = real_export = net_energy = 0;
+    cur_solar = cur_ess_chg = cur_ess_dis = 0;
+    for (i = 0; i < LH_SLOTS; i++) {
+        lh_grid_imp[i] = lh_grid_exp[i] = 0;
+        lh_solar[i] = lh_ess_chg[i] = lh_ess_dis[i] = 0;
+    }
+    lh_pos = 0;
+    estimated_energy_period = 0;
+
+    // Legacy sensor totals / history + export dailies.
+    sensors[OBK_CONSUMPTION_TOTAL].lastReading   = 0;
+    sensors[OBK_GENERATION_TOTAL].lastReading    = 0;
+    sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = 0;
+    for (i = OBK_CONSUMPTION__DAILY_FIRST; i <= OBK_CONSUMPTION__DAILY_LAST; i++)
+        sensors[i].lastReading = 0;
+    for (i = 0; i < 4; i++) export_daily[i] = 0;
+
+    // 12-hour graph matrices back to a flat zero line.
+    for (i = 0; i < MATRIX_SIZE; i++) {
+        consumption_matrix[i] = 0;
+        export_matrix[i]      = 0;
+        net_matrix[i]         = 0;
+        net_graph_matrix[i]   = (unsigned char)((0 + 150) / 2);
+        ess_pwr_matrix[i]     = 0;
+        solar_graph_matrix[i] = 0;
+    }
+
+    ConsumptionResetTime = (time_t)TIME_GetCurrentTime();
+    lastSavedEnergyCounterValue = 0;
+    lastSavedGenerationCounterValue = 0;
+
+    // Persist the zeroed state so a reboot doesn't restore old counters.
+    BL09XX_SaveEmeteringStatistics();   // sensor totals/history + export dailies
+    COUNTERS_Save();                    // grid/solar/ESS counters + per-meter acc
+#if PLATFORM_ESPIDF
+    HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
+                                    solar_graph_matrix, ess_pwr_matrix,
+                                    MATRIX_SIZE,
+                                    (last_matrix_index < 0) ? 0 : last_matrix_index,
+                                    (unsigned int)TIME_GetCurrentTime());
+#endif
+    mark_energy_dirty();
+    return CMD_RES_OK;
+}
+
 // ====================================================================
 // ApplyDumpLoadGPIO — single actuation point for all three call sites
 // ====================================================================
@@ -721,6 +833,8 @@ static void SETTINGS_Save(void)
     for (i = 0; i < 6; i++) {
         snprintf(key, sizeof(key), "mip%d", i);
         nvs_set_u8(h, key, g_meter_ip[i]);
+        snprintf(key, sizeof(key), "minv%d", i);
+        nvs_set_u8(h, key, g_meter_invert[i]);
     }
     nvs_set_u8 (h, "inv2ip",  g_inv2_ip);
     nvs_set_u8 (h, "bypip",   g_bypass_ip);
@@ -748,6 +862,8 @@ static void SETTINGS_Load(void)
     for (i = 0; i < 6; i++) {
         snprintf(key, sizeof(key), "mip%d", i);
         if (nvs_get_u8(h, key, &u8v) == ESP_OK) g_meter_ip[i] = u8v;
+        snprintf(key, sizeof(key), "minv%d", i);
+        if (nvs_get_u8(h, key, &u8v) == ESP_OK) g_meter_invert[i] = u8v ? 1 : 0;
     }
     if (nvs_get_u8 (h, "inv2ip",  &u8v)  == ESP_OK) g_inv2_ip         = u8v;
     if (nvs_get_u8 (h, "bypip",   &u8v)  == ESP_OK) g_bypass_ip       = u8v;
@@ -775,6 +891,17 @@ static void COUNTERS_Save(void)
     nvs_set_i32(h, "eitot", (int)(ess_imp_total + 0.5f));
     nvs_set_i32(h, "eetod", (int)(ess_exp_today + 0.5f));
     nvs_set_i32(h, "eetot", (int)(ess_exp_total + 0.5f));
+    /* Grid (utility) import/export counters — same treatment as solar/ESS. */
+    nvs_set_i32(h, "gitod", (int)(grid_imp_today + 0.5f));
+    nvs_set_i32(h, "gitot", (int)(grid_imp_total + 0.5f));
+    nvs_set_i32(h, "getod", (int)(grid_exp_today + 0.5f));
+    nvs_set_i32(h, "getot", (int)(grid_exp_total + 0.5f));
+    /* Per-meter lifetime accumulators (signed Wh) for diagnosis. */
+    { int i; char k[8];
+      for (i = 0; i < 6; i++) {
+          snprintf(k, sizeof(k), "macc%d", i);
+          nvs_set_i32(h, k, (int)(meter_acc[i] + (meter_acc[i] >= 0 ? 0.5f : -0.5f)));
+      } }
     nvs_commit(h);
     nvs_close(h);
 }
@@ -790,6 +917,15 @@ static void COUNTERS_Load(void)
     if (nvs_get_i32(h, "eitot", &v) == ESP_OK) ess_imp_total = (float)v;
     if (nvs_get_i32(h, "eetod", &v) == ESP_OK) ess_exp_today = (float)v;
     if (nvs_get_i32(h, "eetot", &v) == ESP_OK) ess_exp_total = (float)v;
+    if (nvs_get_i32(h, "gitod", &v) == ESP_OK) grid_imp_today = (float)v;
+    if (nvs_get_i32(h, "gitot", &v) == ESP_OK) grid_imp_total = (float)v;
+    if (nvs_get_i32(h, "getod", &v) == ESP_OK) grid_exp_today = (float)v;
+    if (nvs_get_i32(h, "getot", &v) == ESP_OK) grid_exp_total = (float)v;
+    { int i; char k[8];
+      for (i = 0; i < 6; i++) {
+          snprintf(k, sizeof(k), "macc%d", i);
+          if (nvs_get_i32(h, k, &v) == ESP_OK) meter_acc[i] = (float)v;
+      } }
     nvs_close(h);
 }
 #else
@@ -813,6 +949,20 @@ commandResult_t BL09XX_SetMeterIP(const void *context, const char *cmd, const ch
     if (oct < 0)   oct = 0;
     if (oct > 255) oct = 255;
     g_meter_ip[slot - 1] = (unsigned char)oct;   // RAM only; flushed by SaveCfg
+    return CMD_RES_OK;
+}
+
+// SetMeterInvert <slot 1..6> <0|1> — flip a reverse-wired meter's direction.
+// RAM only; flushed to flash by SaveCfg (Apply button).
+commandResult_t BL09XX_SetMeterInvert(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int slot, inv;
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 2)) { return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
+    slot = Tokenizer_GetArgInteger(0);
+    inv  = Tokenizer_GetArgInteger(1);
+    if (slot < 1 || slot > 6) { return CMD_RES_BAD_ARGUMENT; }
+    g_meter_invert[slot - 1] = inv ? 1 : 0;
     return CMD_RES_OK;
 }
 
@@ -981,6 +1131,13 @@ int BL_GetMeterOctet(int slot) {
     return g_meter_ip[slot];
 }
 
+// 1 if meter `slot` is reverse-wired (direction flipped). Read by the BL0942
+// driver to flip that slot's signed WATT and signed CF-CNT energy together.
+int BL_GetMeterInvert(int slot) {
+    if (slot < 0 || slot >= 6) return 0;
+    return g_meter_invert[slot];
+}
+
 // Store one freshly-read GOOD reading: latch values and timestamp it.
 // online=0 means a hard offline (unset IP) — clear the slot completely so it
 // shows as absent. A *failed read* must NOT come through here as online=0
@@ -1099,10 +1256,23 @@ void BL_ProcessSweep(void) {
     // estimate ("instant consumption reported by the chip"); it no longer
     // drives the energy totals or the import/export split.
 
-    // --- Consumption: L1+L2+L3 signed net -> existing 15-min pipeline ---
+    // --- Per-meter lifetime accumulators (signed Wh) for diagnosis ---
+    // Taken straight from each slot's signed CF-CNT delta (post-invert). Read
+    // BEFORE BL_MeterCfConsume() below clears the per-cycle deltas.
+    {
+        int i;
+        for (i = 0; i < 6; i++) meter_acc[i] += BL_MeterCfWh(i);
+    }
+
+    // --- Utility (grid): L1+L2+L3 signed net ---
+    // Feeds the existing 15-min interval pipeline (real_consumption/real_export
+    // via BL_ProcessUpdate) AND the lifetime/today import+export counters, both
+    // split by sign into always-positive halves exactly like solar/ESS below.
     {
         float cons_wh = BL_MeterCfWh(0) + BL_MeterCfWh(1) + BL_MeterCfWh(2); // signed
         float cons_w  = BL_MeterIntegW(0) + BL_MeterIntegW(1) + BL_MeterIntegW(2);
+        if (cons_wh >= 0.0f) { grid_imp_today +=  cons_wh; grid_imp_total +=  cons_wh; }
+        else                 { grid_exp_today += -cons_wh; grid_exp_total += -cons_wh; }
         BL_ProcessUpdate(g_meter[0].v, g_meter[0].a, cons_w, g_meter[0].freq, cons_wh);
     }
 
@@ -1111,13 +1281,14 @@ void BL_ProcessSweep(void) {
         float gen_wh = BL_MeterCfWh(3) + BL_MeterCfWh(4);
         if (gen_wh < 0.0f) gen_wh = 0.0f;
         gen_today += gen_wh; gen_total += gen_wh;
+        cur_solar += gen_wh;                      // this interval so far
     }
 
     // --- ESS (m6) signed: import/charge (>=0) vs export/discharge (<0) ---
     {
         float ess_wh = BL_MeterCfWh(5);
-        if (ess_wh >= 0.0f) { ess_imp_today +=  ess_wh; ess_imp_total +=  ess_wh; }
-        else                { ess_exp_today += -ess_wh; ess_exp_total += -ess_wh; }
+        if (ess_wh >= 0.0f) { ess_imp_today +=  ess_wh; ess_imp_total +=  ess_wh; cur_ess_chg +=  ess_wh; }
+        else                { ess_exp_today += -ess_wh; ess_exp_total += -ess_wh; cur_ess_dis += -ess_wh; }
     }
 
     // Fold-in done: clear this cycle's deltas so nothing is counted twice.
@@ -1134,9 +1305,27 @@ void BL_ProcessSweep(void) {
         int msm = TIME_GetHour() * 60 + TIME_GetMinute();
         int qhr = msm / 15;                         // 15-min interval of the day
 
-        if (last_msm >= 0 && msm < last_msm) {      // midnight wrap
+        if (last_msm >= 0 && msm < last_msm) {      // local-midnight wrap
+            int i;
+            // UNIFIED midnight roll — every "today" counter and every daily
+            // history now turns over here, on the one (local) midnight, instead
+            // of consumption rolling on a separate UTC day-change elsewhere.
+            // Consumption daily history shifts down a day, then today zeroes.
+            for (i = OBK_CONSUMPTION__DAILY_LAST; i > OBK_CONSUMPTION__DAILY_FIRST; i--)
+                sensors[i].lastReading = sensors[i - 1].lastReading;
+            sensors[OBK_CONSUMPTION_TODAY].lastReading = 0.0;
+            // Export daily history in parallel.
+            export_daily[3] = export_daily[2];
+            export_daily[2] = export_daily[1];
+            export_daily[1] = export_daily[0];
+            export_daily[0] = 0.0f;
+            // Counter-based "today" values (grid / solar / ESS).
+            grid_imp_today = 0; grid_exp_today = 0;
             gen_today = 0; ess_imp_today = 0; ess_exp_today = 0;
-            COUNTERS_Save();
+            actual_mday = TIME_GetMDay();
+            mark_energy_dirty();
+            BL09XX_SaveEmeteringStatistics();       // consumption + export history
+            COUNTERS_Save();                        // grid / solar / ESS counters
         } else if (last_qhr >= 0 && qhr != last_qhr) {
             COUNTERS_Save();                        // 15-min boundary
         }
@@ -1229,6 +1418,17 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 consumption_matrix[last_matrix_index] = safe_int(real_consumption);
                 export_matrix[last_matrix_index] = safe_int(real_export);
 
+                // Push this COMPLETED interval into the last-hour rings. All
+                // values are positive at the saving stage (grid + ESS keep
+                // separate import/export halves; solar is one-way). "Energy last
+                // hour" for each is the sum of the 4 ring entries.
+                lh_grid_imp[lh_pos] = real_consumption;
+                lh_grid_exp[lh_pos] = real_export;
+                lh_solar[lh_pos]    = cur_solar;
+                lh_ess_chg[lh_pos]  = cur_ess_chg;
+                lh_ess_dis[lh_pos]  = cur_ess_dis;
+                lh_pos = (lh_pos + 1) % LH_SLOTS;
+
                 // Full-precision net Wh for this period (includes decimals).
                 period_net = real_consumption - real_export;
 
@@ -1255,19 +1455,11 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     net_graph_matrix[last_matrix_index] = (unsigned char)((graph_val + 150) / 2);
                 }
 
-                // Rolling last-hour IMPORT total: sum of the positive
-                // (consumption) portions of the 4 most recent 15-minute
-                // slots. Use consumption_matrix directly — always positive,
-                // no sign check needed.
-                {
-                    float lh_sum = 0;
-                    int lh_idx = last_matrix_index;
-                    for (int lh_k = 0; lh_k < 4; lh_k++) {
-                        lh_sum += (float)consumption_matrix[lh_idx];
-                        lh_idx = (lh_idx - 1 + MATRIX_SIZE) % MATRIX_SIZE;
-                    }
-                    sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = lh_sum;
-                }
+                // Rolling last-hour grid IMPORT total = sum of the 4 most recent
+                // completed intervals' import halves (from the ring). Grid EXPORT,
+                // SOLAR and ESS charge/discharge last-hour totals are computed the
+                // same way and served via req=meters.
+                sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = lh_sum4(lh_grid_imp);
 
                 // TOP panel: average battery power for the interval, signed
                 // (+ charge / - discharge), clamped to +/-500 W.
@@ -1342,6 +1534,17 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 real_export = 0;
                 real_consumption = 0;
                 net_energy = 0;
+                cur_solar = 0; cur_ess_chg = 0; cur_ess_dis = 0;
+                // Point-2 offline policy: any meter still offline at this
+                // boundary drops its CF-CNT baseline, so when it comes back in a
+                // LATER interval it re-baselines (starts fresh from the first new
+                // reading) instead of bridging a stale multi-interval gap. A brief
+                // dropout WITHIN an interval still self-heals via the free-running
+                // counter, so its energy is recovered when the meter returns.
+#if PLATFORM_ESPIDF
+                { int _m; for (_m = 0; _m < 6; _m++)
+                    if (BL_MeterOnlineState(_m) == 0) BL0942_InvalidateBaseline(_m); }
+#endif
                 // Keep the "15min Est." tile in sync with "Now" - both
                 // should drop to 0 together at the rollover, rather than
                 // est. showing the previous period's value until the next
@@ -1509,28 +1712,14 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     if (TIME_IsTimeSynced()) {
         ntpTime = (time_t)TIME_GetCurrentTime();
         ltm = gmtime(&ntpTime);
+        (void)ltm;
         if (ConsumptionResetTime == 0)
             ConsumptionResetTime = (time_t)ntpTime;
-
         if (actual_mday == -1)
-        {
-            actual_mday = ltm->tm_mday;
-        }
-        if (actual_mday != ltm->tm_mday)
-        {
-            for (i = OBK_CONSUMPTION__DAILY_LAST; i >= OBK_CONSUMPTION__DAILY_FIRST; i--) {
-                sensors[i].lastReading = sensors[i - 1].lastReading;
-            }
-            sensors[OBK_CONSUMPTION_TODAY].lastReading = 0.0;
-            /* Roll over export daily history in parallel */
-            export_daily[3] = export_daily[2];
-            export_daily[2] = export_daily[1];
-            export_daily[1] = export_daily[0];
-            export_daily[0] = 0.0f;
-            actual_mday = ltm->tm_mday;
-            mark_energy_dirty();
-            // Persistence for this rollover happens on the next 15-minute save.
-        }
+            actual_mday = TIME_GetMDay();
+        // Daily "today"/history rollover now happens ONCE, at local midnight,
+        // in BL_ProcessSweep (unified with the grid/solar/ESS counters) - not
+        // here on a separate UTC day-change.
     }
 
     for(i = OBK__FIRST; i <= OBK__LAST; i++)
@@ -1738,6 +1927,8 @@ void BL_Shared_Init(void)
     CMD_RegisterCommand("SetDivertUser", BL09XX_SetDivertUser, NULL);
     CMD_RegisterCommand("SetDivertThreshold", BL09XX_SetDivertThreshold, NULL);
     CMD_RegisterCommand("SetMeterIP", BL09XX_SetMeterIP, NULL);
+    CMD_RegisterCommand("SetMeterInvert", BL09XX_SetMeterInvert, NULL);
+    CMD_RegisterCommand("ClearMeteringData", BL09XX_ClearMeteringData, NULL);
     CMD_RegisterCommand("SetBmsMAC", BL09XX_SetBmsMAC, NULL);
     CMD_RegisterCommand("SetBms2MAC", BL09XX_SetBms2MAC, NULL);
     CMD_RegisterCommand("SetInv2IP", BL09XX_SetInv2IP, NULL);
@@ -1771,7 +1962,7 @@ int http_fn_api_dash(http_request_t *request) {
 
     http_setup(request, "application/json");
 
-    char buf[512];
+    char buf[640];   /* headroom for the extended req=meters counter payload */
     int  pos     = 0;
     int  has_ntp = CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE) && TIME_IsTimeSynced();
 
@@ -2044,6 +2235,9 @@ int http_fn_api_dash(http_request_t *request) {
             if (g_meter_ip[i]) B("\"m%d\":\"%d\",", i + 1, g_meter_ip[i]);
             else               B("\"m%d\":\"\",", i + 1);
         }
+        B("\"minv\":[");
+        for (i = 0; i < 6; i++) B("%s%d", i ? "," : "", g_meter_invert[i]);
+        B("],");
         if (g_inv2_ip)   B("\"inv2\":\"%d\",", g_inv2_ip);  else B("\"inv2\":\"\",");
         if (g_bypass_ip) B("\"byp\":\"%d\",", g_bypass_ip); else B("\"byp\":\"\",");
         B("\"boost\":%d,\"dthr\":%d", g_boost_power, divert_threshold);
@@ -2062,13 +2256,28 @@ int http_fn_api_dash(http_request_t *request) {
         for (i = 0; i < 6; i++) {
             v = a = w = 0; on = 0;
             BL_GetMeter(i, &v, &a, &w, &on);
-            B("%s{\"v\":%d,\"w\":%d,\"o\":%d}",
-              i ? "," : "", (int)(v * 10.0f + 0.5f), (int)w, on);
+            // e = this meter's lifetime accumulated energy (signed Wh) for the
+            // per-meter diagnostic readout on the settings page.
+            B("%s{\"v\":%d,\"w\":%d,\"o\":%d,\"e\":%d}",
+              i ? "," : "", (int)(v * 10.0f + 0.5f), (int)w, on,
+              safe_int(meter_acc[i]));
         }
-        B("],\"gen\":{\"d\":%d,\"t\":%d},\"imp\":{\"d\":%d,\"t\":%d},\"exp\":{\"d\":%d,\"t\":%d}",
-          (int)(gen_today + 0.5f),     (int)(gen_total + 0.5f),
-          (int)(ess_imp_today + 0.5f), (int)(ess_imp_total + 0.5f),
-          (int)(ess_exp_today + 0.5f), (int)(ess_exp_total + 0.5f));
+        // Per-type counters: today (d), total (t), last-hour (lh). NOTE the key
+        // is "lh" (last hour) and is a SCALAR - distinct from the frontend's "h"
+        // daily-history arrays. lh = sum of the 4 most recent completed 15-min
+        // intervals. Grid & ESS carry separate positive import/export halves;
+        // solar is one-way.
+        //   gen  = solar (one-way)         grid = utility import(i*)/export(e*)
+        //   imp/exp = ESS charge/discharge
+        B("],\"gen\":{\"d\":%d,\"t\":%d,\"lh\":%d}",
+          (int)(gen_today + 0.5f), (int)(gen_total + 0.5f),
+          safe_int(lh_sum4(lh_solar)));
+        B(",\"grid\":{\"id\":%d,\"it\":%d,\"ilh\":%d,\"ed\":%d,\"et\":%d,\"elh\":%d}",
+          (int)(grid_imp_today + 0.5f), (int)(grid_imp_total + 0.5f), safe_int(lh_sum4(lh_grid_imp)),
+          (int)(grid_exp_today + 0.5f), (int)(grid_exp_total + 0.5f), safe_int(lh_sum4(lh_grid_exp)));
+        B(",\"imp\":{\"d\":%d,\"t\":%d,\"lh\":%d},\"exp\":{\"d\":%d,\"t\":%d,\"lh\":%d}",
+          (int)(ess_imp_today + 0.5f), (int)(ess_imp_total + 0.5f), safe_int(lh_sum4(lh_ess_chg)),
+          (int)(ess_exp_today + 0.5f), (int)(ess_exp_total + 0.5f), safe_int(lh_sum4(lh_ess_dis)));
     }
 
     // ---- GRAPH ARRAYS (req=net | req=batt) ----

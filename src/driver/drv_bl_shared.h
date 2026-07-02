@@ -12,6 +12,7 @@ void BL_ProcessUpdate(float voltage, float current, float power,
 
 /* Remote multi-meter interface (BL0942 TCP poller <-> shared accounting). */
 int  BL_GetMeterOctet(int slot);                                  /* 0 = unset */
+int  BL_GetMeterInvert(int slot);        /* 1 = reverse-wired: flip W and energy */
 void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online);
 /* Store a good reading PLUS this cycle's signed net energy taken from the
    chip's free-running signed CF-CNT delta. cf_valid=0 means "no usable delta
