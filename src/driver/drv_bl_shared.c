@@ -162,6 +162,32 @@ static unsigned char g_meter_ip[6]  = {0,0,0,0,0,0};
 // and energy stay consistent). Set from the meter settings page (SetMeterInvert),
 // persisted to flash on Apply (keys minv0..minv5).
 static unsigned char g_meter_invert[6] = {0,0,0,0,0,0};
+// Per-meter calibration coefficients, same divide-mode convention as the
+// onboard sensor's PwrCal (calibrated = raw / coefficient). Defaulted to the
+// SAME nominal BL0942 datasheet constants the shared onboard calibration
+// starts from (DEFAULT_VOLTAGE_CAL/CURRENT_CAL/POWER_CAL in drv_bl0942.c) —
+// NOT 1.0, which would leave an uncalibrated slot displaying raw ADC codes.
+// Set via SetMeterVoltCal/SetMeterCurrentCal/SetMeterPowerCal <slot 1-6>
+// <true value>; persisted to flash on change (keys mvcal0..5/macal0..5/
+// mpcal0..5). "Calibrated" (for the settings-page green/grey state) simply
+// means the coefficient no longer equals its default.
+#define METER_CAL_V_DEFAULT 15188.0f
+#define METER_CAL_A_DEFAULT 251210.0f
+#define METER_CAL_P_DEFAULT 598.0f
+static float g_meter_vcal[6] = {METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT,
+                                 METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT};
+static float g_meter_acal[6] = {METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT,
+                                 METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT};
+static float g_meter_pcal[6] = {METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT,
+                                 METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT};
+// Latest RAW (pre-calibration) chip codes per slot, captured every read so a
+// calibration command always has "what the chip said just now" to compute
+// coefficient = raw / true_value against. Same idea as drv_pwrCal.c's
+// latest_raw_voltage/current/power, just one triple per meter instead of one
+// shared triple.
+static uint32_t g_meter_raw_v[6] = {0};
+static uint32_t g_meter_raw_a[6] = {0};
+static int32_t  g_meter_raw_w[6] = {0};
 static char          g_bms_mac[18]  = {0};   // "AA:BB:CC:DD:EE:FF"
 static char          g_bms2_mac[18] = {0};
 static unsigned char g_inv2_ip      = 0;     // Boost Inverter (remote), last octet
@@ -183,7 +209,7 @@ static void COUNTERS_Save(void);             // defined after the NVS includes b
 // cf_valid = 1 when cf_wh holds a trustworthy delta this cycle, 0 otherwise
 //          (first read after (re)connect, detected chip reset, or a glitch).
 typedef struct { float v, a, w, freq; int online; TickType_t last_ok;
-                 float cf_wh; int cf_valid; } meter_slot_t;
+                 float cf_wh; int64_t cf_ticks; int cf_valid; } meter_slot_t;
 static meter_slot_t g_meter[6];
 
 // Read freshness windows. A slot is polled ~every 6 s, so within 9 s a good
@@ -227,10 +253,15 @@ static float lh_solar[LH_SLOTS]    = {0};
 static float lh_ess_chg[LH_SLOTS]  = {0}, lh_ess_dis[LH_SLOTS]  = {0};
 static int   lh_pos = 0;   // next write slot in the rings
 
-// ---- Per-meter lifetime accumulated energy (signed Wh), for diagnosis ----
-// Shown on the meter settings page. Fed from each slot's signed CF-CNT delta
-// (post-invert). Persisted keys macc0..macc5. Cleared by ClearMeteringData.
-static float meter_acc[6] = {0,0,0,0,0,0};
+// ---- Per-meter lifetime accumulated energy (signed RAW TICKS), for diagnosis ----
+// Shown on the meter settings page. Fed straight from each slot's signed
+// CF-CNT tick delta (post-invert, pre-calibration) — the BL0942's native
+// resolution, ~5116 ticks/Wh. Integer accumulation only: no float ever touches
+// this value, so it can run for the life of the device with zero drift.
+// Converted to Wh (with calibration applied, once that exists) only at
+// display/API time. Persisted as a true 64-bit value (keys macc0..macc5).
+// Cleared by ClearMeteringData.
+static int64_t meter_acc[6] = {0,0,0,0,0,0};
 
 // Sum of the 4 ring entries for a last-hour counter.
 static float lh_sum4(const float *ring) {
@@ -835,6 +866,12 @@ static void SETTINGS_Save(void)
         nvs_set_u8(h, key, g_meter_ip[i]);
         snprintf(key, sizeof(key), "minv%d", i);
         nvs_set_u8(h, key, g_meter_invert[i]);
+        snprintf(key, sizeof(key), "mvcal%d", i);
+        nvs_set_i32(h, key, (int32_t)(g_meter_vcal[i] * 1000.0f + 0.5f));
+        snprintf(key, sizeof(key), "macal%d", i);
+        nvs_set_i32(h, key, (int32_t)(g_meter_acal[i] * 1000.0f + 0.5f));
+        snprintf(key, sizeof(key), "mpcal%d", i);
+        nvs_set_i32(h, key, (int32_t)(g_meter_pcal[i] * 1000.0f + 0.5f));
     }
     nvs_set_u8 (h, "inv2ip",  g_inv2_ip);
     nvs_set_u8 (h, "bypip",   g_bypass_ip);
@@ -864,6 +901,12 @@ static void SETTINGS_Load(void)
         if (nvs_get_u8(h, key, &u8v) == ESP_OK) g_meter_ip[i] = u8v;
         snprintf(key, sizeof(key), "minv%d", i);
         if (nvs_get_u8(h, key, &u8v) == ESP_OK) g_meter_invert[i] = u8v ? 1 : 0;
+        snprintf(key, sizeof(key), "mvcal%d", i);
+        if (nvs_get_i32(h, key, &i32v) == ESP_OK) g_meter_vcal[i] = i32v / 1000.0f;
+        snprintf(key, sizeof(key), "macal%d", i);
+        if (nvs_get_i32(h, key, &i32v) == ESP_OK) g_meter_acal[i] = i32v / 1000.0f;
+        snprintf(key, sizeof(key), "mpcal%d", i);
+        if (nvs_get_i32(h, key, &i32v) == ESP_OK) g_meter_pcal[i] = i32v / 1000.0f;
     }
     if (nvs_get_u8 (h, "inv2ip",  &u8v)  == ESP_OK) g_inv2_ip         = u8v;
     if (nvs_get_u8 (h, "bypip",   &u8v)  == ESP_OK) g_bypass_ip       = u8v;
@@ -896,11 +939,11 @@ static void COUNTERS_Save(void)
     nvs_set_i32(h, "gitot", (int)(grid_imp_total + 0.5f));
     nvs_set_i32(h, "getod", (int)(grid_exp_today + 0.5f));
     nvs_set_i32(h, "getot", (int)(grid_exp_total + 0.5f));
-    /* Per-meter lifetime accumulators (signed Wh) for diagnosis. */
+    /* Per-meter lifetime accumulators (signed RAW TICKS) for diagnosis. */
     { int i; char k[8];
       for (i = 0; i < 6; i++) {
           snprintf(k, sizeof(k), "macc%d", i);
-          nvs_set_i32(h, k, (int)(meter_acc[i] + (meter_acc[i] >= 0 ? 0.5f : -0.5f)));
+          nvs_set_i64(h, k, meter_acc[i]);
       } }
     nvs_commit(h);
     nvs_close(h);
@@ -921,10 +964,10 @@ static void COUNTERS_Load(void)
     if (nvs_get_i32(h, "gitot", &v) == ESP_OK) grid_imp_total = (float)v;
     if (nvs_get_i32(h, "getod", &v) == ESP_OK) grid_exp_today = (float)v;
     if (nvs_get_i32(h, "getot", &v) == ESP_OK) grid_exp_total = (float)v;
-    { int i; char k[8];
+    { int i; char k[8]; int64_t v64;
       for (i = 0; i < 6; i++) {
           snprintf(k, sizeof(k), "macc%d", i);
-          if (nvs_get_i32(h, k, &v) == ESP_OK) meter_acc[i] = (float)v;
+          if (nvs_get_i64(h, k, &v64) == ESP_OK) meter_acc[i] = v64;
       } }
     nvs_close(h);
 }
@@ -964,6 +1007,47 @@ commandResult_t BL09XX_SetMeterInvert(const void *context, const char *cmd, cons
     if (slot < 1 || slot > 6) { return CMD_RES_BAD_ARGUMENT; }
     g_meter_invert[slot - 1] = inv ? 1 : 0;
     return CMD_RES_OK;
+}
+
+// Shared calibration math for the three per-meter commands below: divide-mode,
+// same as the onboard PwrCal — coefficient = latest raw chip code / the true
+// value just measured externally. Self-persists immediately (unlike
+// SetMeterInvert/SetMeterIP, which wait for the page's Save button) because
+// the settings-page OK button turns green right after this call to confirm
+// the coefficient is now live AND saved, not just staged.
+static commandResult_t MeterCalibrate(const char *cmd, const char *args,
+                                      uint32_t raw_table[6], int32_t raw_table_signed[6],
+                                      int is_signed, float *cal_table) {
+    int slot; float real, raw;
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 2)) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+    slot = Tokenizer_GetArgInteger(0);
+    real = Tokenizer_GetArgFloat(1);
+    if (slot < 1 || slot > 6) return CMD_RES_BAD_ARGUMENT;
+    if (real == 0.0f) return CMD_RES_BAD_ARGUMENT;
+    raw = is_signed ? (float)raw_table_signed[slot - 1] : (float)raw_table[slot - 1];
+    if (raw > -0.001f && raw < 0.001f) return CMD_RES_ERROR;   // connect the load first
+    cal_table[slot - 1] = raw / real;
+    SETTINGS_Save();
+    return CMD_RES_OK;
+}
+
+// SetMeterVoltCal <slot 1..6> <true volts> — measured with a trusted meter.
+commandResult_t BL09XX_SetMeterVoltCal(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    return MeterCalibrate(cmd, args, g_meter_raw_v, NULL, 0, g_meter_vcal);
+}
+
+// SetMeterCurrentCal <slot 1..6> <true amps>
+commandResult_t BL09XX_SetMeterCurrentCal(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    return MeterCalibrate(cmd, args, g_meter_raw_a, NULL, 0, g_meter_acal);
+}
+
+// SetMeterPowerCal <slot 1..6> <true watts>
+commandResult_t BL09XX_SetMeterPowerCal(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    return MeterCalibrate(cmd, args, NULL, g_meter_raw_w, 1, g_meter_pcal);
 }
 
 // SetBmsMAC <AA:BB:CC:DD:EE:FF>
@@ -1138,6 +1222,23 @@ int BL_GetMeterInvert(int slot) {
     return g_meter_invert[slot];
 }
 
+// Per-meter calibration coefficients (divide-mode: calibrated = raw / this).
+// Read by the BL0942 driver every frame to scale that slot's raw chip codes
+// independently of the other five slots and the onboard sensor.
+float BL_GetMeterVoltCal(int slot)    { return (slot < 0 || slot >= 6) ? METER_CAL_V_DEFAULT : g_meter_vcal[slot]; }
+float BL_GetMeterCurrentCal(int slot) { return (slot < 0 || slot >= 6) ? METER_CAL_A_DEFAULT : g_meter_acal[slot]; }
+float BL_GetMeterPowerCal(int slot)   { return (slot < 0 || slot >= 6) ? METER_CAL_P_DEFAULT : g_meter_pcal[slot]; }
+
+// Latch this slot's latest RAW (pre-calibration) chip codes, so a calibration
+// command issued right after has "what the chip just said" to compute
+// coefficient = raw / true_value against.
+void BL_SetMeterRaw(int slot, uint32_t raw_v, uint32_t raw_a, int32_t raw_w) {
+    if (slot < 0 || slot >= 6) return;
+    g_meter_raw_v[slot] = raw_v;
+    g_meter_raw_a[slot] = raw_a;
+    g_meter_raw_w[slot] = raw_w;
+}
+
 // Store one freshly-read GOOD reading: latch values and timestamp it.
 // online=0 means a hard offline (unset IP) — clear the slot completely so it
 // shows as absent. A *failed read* must NOT come through here as online=0
@@ -1154,21 +1255,24 @@ void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int onl
         g_meter[slot].w = 0; g_meter[slot].freq = 0;
         g_meter[slot].online = 0;
         g_meter[slot].last_ok = 0;
-        g_meter[slot].cf_wh = 0.0f; g_meter[slot].cf_valid = 0;
+        g_meter[slot].cf_wh = 0.0f; g_meter[slot].cf_ticks = 0; g_meter[slot].cf_valid = 0;
     }
 }
 
-// Store a good reading plus this cycle's signed CF-CNT energy. The raw counter
-// delta / wrap / scaling is done in the BL0942 driver (where the calibration
-// lives); here we just latch the result and timestamp the slot.
+// Store a good reading plus this cycle's signed CF-CNT energy, in BOTH forms:
+// cf_wh (calibrated Wh, for the live power/energy pipeline) and cf_ticks (raw
+// signed pulse count, uncalibrated — the BL0942's native resolution, ~5116
+// ticks/Wh). The raw counter delta / wrap / scaling is done in the BL0942
+// driver; here we just latch both results and timestamp the slot.
 void BL_SetMeterReadingCf(int slot, float v, float a, float w, float freq,
-                          float cf_wh, int cf_valid) {
+                          float cf_wh, int64_t cf_ticks, int cf_valid) {
     if (slot < 0 || slot >= 6) return;
     g_meter[slot].v = v; g_meter[slot].a = a;
     g_meter[slot].w = w; g_meter[slot].freq = freq;
     g_meter[slot].online = 1;
     g_meter[slot].last_ok = xTaskGetTickCount();
-    g_meter[slot].cf_wh = cf_valid ? cf_wh : 0.0f;
+    g_meter[slot].cf_wh    = cf_valid ? cf_wh    : 0.0f;
+    g_meter[slot].cf_ticks = cf_valid ? cf_ticks : 0;
     g_meter[slot].cf_valid = cf_valid ? 1 : 0;
 }
 
@@ -1182,10 +1286,33 @@ float BL_MeterCfWh(int slot) {
     return g_meter[slot].cf_wh;
 }
 
+// Signed net RAW ticks contributed by this slot for the current sweep —
+// uncalibrated, the BL0942's native pulse resolution. Same gating as
+// BL_MeterCfWh. Used for lossless lifetime accumulation (meter_acc): integer
+// ticks in, integer ticks out, no float accumulation ever, so recalibrating
+// later never touches stored history — only the read-time Wh conversion does.
+int64_t BL_MeterCfTicks(int slot) {
+    if (slot < 0 || slot >= 6) return 0;
+    if (!g_meter[slot].cf_valid) return 0;
+    if (BL_MeterOnlineState(slot) == 0) return 0;
+    return g_meter[slot].cf_ticks;
+}
+
+// Convert a signed raw tick count to Wh, for display only, using THIS METER's
+// own calibration coefficient (divide-mode, same convention as everywhere
+// else here). The stored ticks themselves are never touched by calibration —
+// only this read-time conversion is, so recalibrating never rewrites history.
+static float MeterAccToWh(int slot, int64_t ticks) {
+    int64_t mag = (ticks < 0) ? -ticks : ticks;
+    float pcal = BL_GetMeterPowerCal(slot);
+    float wh = ((float)mag / pcal) * 1638.4f * 256.0f / 3600.0f;
+    return (ticks < 0) ? -wh : wh;
+}
+
 // Clear per-cycle CF energy once the sweep has folded it into the totals.
 void BL_MeterCfConsume(void) {
     int i;
-    for (i = 0; i < 6; i++) { g_meter[i].cf_wh = 0.0f; g_meter[i].cf_valid = 0; }
+    for (i = 0; i < 6; i++) { g_meter[i].cf_wh = 0.0f; g_meter[i].cf_ticks = 0; g_meter[i].cf_valid = 0; }
 }
 
 // A grid meter reported a chip reset mid-interval. Everything accumulated for
@@ -1256,12 +1383,14 @@ void BL_ProcessSweep(void) {
     // estimate ("instant consumption reported by the chip"); it no longer
     // drives the energy totals or the import/export split.
 
-    // --- Per-meter lifetime accumulators (signed Wh) for diagnosis ---
-    // Taken straight from each slot's signed CF-CNT delta (post-invert). Read
-    // BEFORE BL_MeterCfConsume() below clears the per-cycle deltas.
+    // --- Per-meter lifetime accumulators (signed RAW TICKS) for diagnosis ---
+    // Taken straight from each slot's signed CF-CNT tick delta (post-invert,
+    // pre-calibration) — integer accumulation, no float drift over the life
+    // of the device. Read BEFORE BL_MeterCfConsume() below clears the
+    // per-cycle deltas.
     {
         int i;
-        for (i = 0; i < 6; i++) meter_acc[i] += BL_MeterCfWh(i);
+        for (i = 0; i < 6; i++) meter_acc[i] += BL_MeterCfTicks(i);
     }
 
     // --- Utility (grid): L1+L2+L3 signed net ---
@@ -1928,6 +2057,9 @@ void BL_Shared_Init(void)
     CMD_RegisterCommand("SetDivertThreshold", BL09XX_SetDivertThreshold, NULL);
     CMD_RegisterCommand("SetMeterIP", BL09XX_SetMeterIP, NULL);
     CMD_RegisterCommand("SetMeterInvert", BL09XX_SetMeterInvert, NULL);
+    CMD_RegisterCommand("SetMeterVoltCal", BL09XX_SetMeterVoltCal, NULL);
+    CMD_RegisterCommand("SetMeterCurrentCal", BL09XX_SetMeterCurrentCal, NULL);
+    CMD_RegisterCommand("SetMeterPowerCal", BL09XX_SetMeterPowerCal, NULL);
     CMD_RegisterCommand("ClearMeteringData", BL09XX_ClearMeteringData, NULL);
     CMD_RegisterCommand("SetBmsMAC", BL09XX_SetBmsMAC, NULL);
     CMD_RegisterCommand("SetBms2MAC", BL09XX_SetBms2MAC, NULL);
@@ -2256,11 +2388,12 @@ int http_fn_api_dash(http_request_t *request) {
         for (i = 0; i < 6; i++) {
             v = a = w = 0; on = 0;
             BL_GetMeter(i, &v, &a, &w, &on);
-            // e = this meter's lifetime accumulated energy (signed Wh) for the
-            // per-meter diagnostic readout on the settings page.
+            // e = this meter's lifetime accumulated energy (signed Wh, derived
+            // from the raw tick accumulator) for the per-meter diagnostic
+            // readout on the settings page.
             B("%s{\"v\":%d,\"w\":%d,\"o\":%d,\"e\":%d}",
               i ? "," : "", (int)(v * 10.0f + 0.5f), (int)w, on,
-              safe_int(meter_acc[i]));
+              safe_int(MeterAccToWh(i, meter_acc[i])));
         }
         // Per-type counters: today (d), total (t), last-hour (lh). NOTE the key
         // is "lh" (last hour) and is a SCALAR - distinct from the frontend's "h"

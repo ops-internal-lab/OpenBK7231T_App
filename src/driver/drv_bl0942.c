@@ -377,6 +377,7 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
     float voltage, current, power, frequency, signedPower;
     uint32_t cf_raw;
     float cf_wh;
+    int64_t cf_ticks;
     int cf_valid;
 
     if (len < BL0942_UART_PACKET_LEN)        return 0;
@@ -393,7 +394,18 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
     d.cf_cnt = (b[15] << 16) | (b[14] << 8) | b[13];
     d.freq   = (b[17] << 8) | b[16];
 
-    PwrCal_Scale(d.v_rms, d.i_rms, d.watt, &voltage, &current, &power);
+    // Latch the raw (pre-calibration) codes so a calibration command issued
+    // right after this read has "what the chip just said" to work from.
+    BL_SetMeterRaw(slot, d.v_rms, d.i_rms, d.watt);
+
+    // Per-meter calibration (divide-mode, same convention as the onboard
+    // sensor's PwrCal): each of the 6 slots gets its OWN voltage/current/power
+    // coefficient instead of sharing one global triple with the onboard
+    // sensor and each other. Defaults to the same nominal BL0942 constants
+    // (see BL_GetMeter*Cal) until a slot is explicitly calibrated.
+    voltage = (float)d.v_rms / BL_GetMeterVoltCal(slot);
+    current = (float)d.i_rms / BL_GetMeterCurrentCal(slot);
+    power   = (float)d.watt  / BL_GetMeterPowerCal(slot);
     if (!isfinite(power)) power = 0.0f;
     frequency   = (d.freq != 0) ? (2 * 500000.0f / d.freq) : 0.0f;
     signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
@@ -419,29 +431,34 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
     if (cf_reset != BL0942_CF_RESET_NONE ||
         slot < 0 || slot >= 6 || g_cfPrev[slot] == CF_CNT_INVALID) {
         cf_wh = 0.0f;
+        cf_ticks = 0;
         cf_valid = 0;
     } else {
         int32_t dd = (int32_t)((cf_raw - g_cfPrev[slot]) & 0xFFFFFF);
         if (dd >= 0x800000) dd -= 0x1000000;          // sign-wrap to [-2^23, 2^23)
         int mag = (dd < 0) ? -dd : dd;
-        float e = PwrCal_ScalePowerOnly(mag) * 1638.4f * 256.0f / 3600.0f;   // Wh
+        float e = ((float)mag / BL_GetMeterPowerCal(slot)) * 1638.4f * 256.0f / 3600.0f;   // Wh
         if (!isfinite(e) || e < 0.0f || e > BL0942_MAX_SANE_CYCLE_WH) {
             cf_wh = 0.0f;
+            cf_ticks = 0;
             cf_valid = 0;                             // glitch/garbage: discard
         } else {
-            cf_wh = (dd < 0) ? -e : e;                // signed net Wh
+            cf_wh = (dd < 0) ? -e : e;                // signed net Wh (calibrated)
+            cf_ticks = dd;                            // signed net RAW ticks (uncalibrated)
             // Same static wiring-inversion the WATT reading already gets, so a
             // reverse-wired meter's totals and its displayed direction agree.
             // (This is a fixed config convention, NOT per-cycle power-sign logic.)
-            if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) cf_wh = -cf_wh;
-            if (meterInv) cf_wh = -cf_wh;            // per-meter reverse-wire flip
+            // Applied to both the calibrated Wh AND the raw ticks so every
+            // downstream consumer of either sees a consistent sign.
+            if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) { cf_wh = -cf_wh; cf_ticks = -cf_ticks; }
+            if (meterInv) { cf_wh = -cf_wh; cf_ticks = -cf_ticks; }   // per-meter reverse-wire flip
             cf_valid = 1;
         }
     }
     if (slot >= 0 && slot < 6) g_cfPrev[slot] = cf_raw;
 
     BL_SetMeterReadingCf(slot, voltage, current, signedPower, frequency,
-                         cf_wh, cf_valid);
+                         cf_wh, cf_ticks, cf_valid);
     return 1;
 }
 

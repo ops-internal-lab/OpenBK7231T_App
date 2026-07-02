@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdint.h>
 #include "../httpserver/new_http.h"
 
 /* Sensor dataset indices — always 0 on single-meter builds */
@@ -13,15 +14,20 @@ void BL_ProcessUpdate(float voltage, float current, float power,
 /* Remote multi-meter interface (BL0942 TCP poller <-> shared accounting). */
 int  BL_GetMeterOctet(int slot);                                  /* 0 = unset */
 int  BL_GetMeterInvert(int slot);        /* 1 = reverse-wired: flip W and energy */
+float BL_GetMeterVoltCal(int slot);
+float BL_GetMeterCurrentCal(int slot);
+float BL_GetMeterPowerCal(int slot);
+void  BL_SetMeterRaw(int slot, uint32_t raw_v, uint32_t raw_a, int32_t raw_w);
 void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online);
 /* Store a good reading PLUS this cycle's signed net energy taken from the
    chip's free-running signed CF-CNT delta. cf_valid=0 means "no usable delta
    this cycle" (first read after (re)connect, or a detected chip reset) — the
    reading is still latched, but it contributes 0 Wh to the sweep. */
 void BL_SetMeterReadingCf(int slot, float v, float a, float w, float freq,
-                          float cf_wh, int cf_valid);
+                          float cf_wh, int64_t cf_ticks, int cf_valid);
 /* Signed net Wh contributed by `slot` this sweep (0 if no valid delta). */
 float BL_MeterCfWh(int slot);
+int64_t BL_MeterCfTicks(int slot);
 /* A meter reported a CHIP RESET (MODE lost): the current 15-min interval's net
    is tainted, so discard it and let counting restart from now. */
 void BL_MeterNoteReset(int slot);
