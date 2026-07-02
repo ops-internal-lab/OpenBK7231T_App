@@ -201,11 +201,11 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
    reply. A 23-byte frame at 4800 baud is ~48 ms on the wire ALONE, before the
    request byte-time, BL0942 turnaround and WiFi jitter — so we must wait for
    it. Bailing before it arrives is exactly how reads were being "lost". */
-#define MP_FRAME_SETTLE_MS 25              /* skip the guaranteed-empty period    */
+#define MP_FRAME_SETTLE_MS 60              /* skip the guaranteed-empty period    */
 #define MP_ATTEMPT_MS      80              /* total wait per attempt (settle+poll) */
 #define MP_MAX_ATTEMPTS    3               /* re-send + retry up to this many      */
 #define MP_REG_READ_MS     100             /* single-register reply wait          */
-#define MP_REG_SETTLE_MS   15              /* reg reply is only 4 bytes (~8 ms)    */
+#define MP_REG_SETTLE_MS   30              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
 #define MP_TICKS_PER_CYCLE 10              /* 6 meters + 4 dummy skips = 10 s cycle */
