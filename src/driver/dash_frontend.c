@@ -542,7 +542,7 @@ int http_fn_custom_dash(http_request_t *request) {
 
     // --- Layout: right column (battery gauge) ---
     poststr(request,
-        "<div class='right-col' id='right-col'>"
+        "<div class='right-col'>"
         "<div class='batt-col'>"
         "<div class='sep-lbl'>Batteries:</div>"
         "<div class='bt-row'>"
