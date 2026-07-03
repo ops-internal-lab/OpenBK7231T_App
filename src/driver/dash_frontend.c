@@ -1029,8 +1029,6 @@ int http_fn_custom_dash(http_request_t *request) {
         "if(state_chg.length>0)drawSmooth(ctx,state_chg,60,false,null,'#a972ff',2.5);"
         "if(state_dis.length>0)drawSmooth(ctx,state_dis,60,false,null,'#00b3b3',2.5);}"
         "function fit(){var c=document.getElementById('dash-container');if(!c)return;"
-        "var bp=document.getElementById('batt-panel'),gc=document.getElementById('graph-col'),lg=document.getElementById('leg-h');"
-        "if(bp&&gc&&lg){var gh=bp.offsetHeight-lg.offsetHeight-10;if(gh<150)gh=150;gc.style.height=gh+'px';}"
         "var w=c.offsetWidth||980,h=c.offsetHeight||700;var s=Math.min(window.innerWidth/w,window.innerHeight/h,1);var e=document.getElementById('scaler');var t='translate(-50%,-50%) scale('+s+')';e.style.webkitTransform=t;e.style.transform=t;}"
         "function fixBtns(){}"
         "initGrid();loadAll();setInterval(runCycle,10000);fit();btnColor();loadCfg();tbLoadCfg();tbInitInputs();window.onresize=function(){fit();};setTimeout(function(){fit();},350);"
