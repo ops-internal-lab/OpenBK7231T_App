@@ -620,21 +620,19 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
 // state <  3          : everything off  (GPIO4 LOW, GPIO2 duty 0, GPIO0 duty 0)
 // state  3..5         : inverter on     (GPIO4 LOW, GPIO2 0,
 //                                        GPIO0 100% for 500ms then 80% hold)
-//                       Pulse fires only on the 0→active rising edge.
-//                       If state remains inverter-active, holds at 80%.
-// state  18..100      : charger on      (GPIO4 HIGH, GPIO2 PWM 0-255, GPIO0 0)
-//                       Duty scaled linearly: 18→0, 100→255.
+//                       Ramp happens inline (blocking) on the 0→active rising
+//                       edge. If state remains inverter-active, stays at 80%.
+// state  10..100      : charger power-on (GPIO4 HIGH). Two sub-ranges:
+//                         10..17  : fixed 10% duty floor, not yet switching
+//                         18..100 : GPIO2 PWM duty tracks state (percent)
+//                                   directly: duty_8bit = state * 2.5,
+//                                   e.g. 18% -> 45, 50% -> 125, 100% -> 250
 //
 // charger_pwm and relay_economiser are updated to reflect what was last
 // written to hardware (shadow state, useful for diagnostics).
 static void ApplyDumpLoadGPIO(int state)
 {
 #if PLATFORM_ESPIDF
-    // Declared static local so TickType_t is resolved after the FreeRTOS
-    // headers are included above; retains value between calls like a file-
-    // scope static would.
-    static TickType_t inverter_engage_tick = 0;
-
     // ---- BMS voltage gate (skipped entirely if BMS offline) ----
     // Re-evaluates the hysteresis latches from live cell voltages, then forces
     // the requested state off if the relevant device is latched. dump_load_relay
@@ -659,18 +657,22 @@ static void ApplyDumpLoadGPIO(int state)
             else if (bd.cell_min >= inverter_cutoff_v + INVERTER_HYST_V) inverter_gated = 0;
         }
         // ALWAYS apply the (possibly held) latch state.
-        if (charger_gated  && state >= 18)              state = 0;
+        if (charger_gated  && state >= CHARGER_MIN_PWM)  state = 0;
         if (inverter_gated && state >= 3 && state <= 5) state = 0;
     }
 #endif
 
-    int inverter_active = (state >= 3 && state <= 5);
-    int charger_active  = (state >= 18);
-    TickType_t now    = xTaskGetTickCount();
+    int inverter_active   = (state >= 3 && state <= 5);
+    // Power-on range (10-100) is wider than the PWM range (18-100): 10-17
+    // enables the supply at a fixed pre-charge floor with no switching yet.
+    int charger_power_on = (state >= CHARGER_MIN_PWM && state <= CHARGER_MAX_PWM);
 
-    if (charger_active) {
+    if (charger_power_on) {
         // ----- CHARGER MODE -----
-        int duty = ((state - 18) * 255) / 82;
+        // state IS the target percentage. 10-17: fixed 10% floor (enabled,
+        // not yet switching). 18-100: duty tracks state directly.
+        int pct  = (state < 18) ? 10 : state;
+        int duty = (pct * 5) / 2;   // percent -> 8-bit duty (100% -> 250)
         if (duty < 0)   duty = 0;
         if (duty > 255) duty = 255;
 
@@ -697,22 +699,24 @@ static void ApplyDumpLoadGPIO(int state)
         charger_pwm = 0;
 
         if (!inverter_was_active) {
-            // Rising edge (0 → active): start 100 % pull-in pulse
-            inverter_engage_tick = now;
+            // Rising edge (0 → active): 100 % pull-in pulse, then hold at 80 %.
+            // Blocking is fine here — this only runs on the rare off->active
+            // transition, from a command handler or the 30s AUTO tick, never
+            // from an ISR or a tight sampling loop.
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_FULL);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, RELAY_ECON_DUTY_FULL);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
-            relay_economiser = RELAY_ECON_DUTY_FULL;
-        } else if ((now - inverter_engage_tick) >= (RELAY_ECON_PULSE_MS / portTICK_PERIOD_MS)) {
-            // 500 ms elapsed: drop to economiser hold duty
+
+            vTaskDelay(pdMS_TO_TICKS(RELAY_ECON_PULSE_MS));   // 500 ms hold at 100%
+
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_HOLD);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, RELAY_ECON_DUTY_HOLD);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
             relay_economiser = RELAY_ECON_DUTY_HOLD;
         }
-        // else: still within 500 ms window — LEDC retains FULL duty, no write needed
+        // else: already active and already holding at 80% — nothing to do
 
         inverter_was_active = 1;
 
