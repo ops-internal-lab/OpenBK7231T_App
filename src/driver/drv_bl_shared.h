@@ -1,44 +1,2589 @@
-#pragma once
+// Internal code ONLY
 
-#include <stdint.h>
-#include "../httpserver/new_http.h"
+#include <stdlib.h>   // atof, abs
+#include <stdio.h>    // snprintf
+#include <string.h>   // memset, strlen
+#if PLATFORM_ESPIDF
+// ESP-IDF does not transitively pull FreeRTOS in via the local headers below,
+// and TickType_t / xTaskGetTickCount are used before those includes (line ~167).
+// Pull them in up front so the type is defined at first use.
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+// Register-level GPIO access (soc/gpio_struct.h = the memory-mapped GPIO
+// peripheral struct, soc/io_mux_reg.h = PIN_FUNC_SELECT/IO_MUX_GPIOn_REG).
+// Used only by BL09XX_TestChargerPinsRegister(), which bypasses driver/gpio.h
+// entirely for hardware-level debugging.
+#include "soc/gpio_struct.h"
+#include "soc/io_mux_reg.h"
+#endif
+#include "dash_frontend.h"
 
-/* Sensor dataset indices — always 0 on single-meter builds */
-#define BL_SENSORS_IX_0 0
-#define BL_SENSORS_IX_1 1
+// Charger C mapping constants
+#define CHARGER_MIN_PWM   10       // lowest useful duty for the supply
+#define CHARGER_MAX_PWM  100
 
-void BL_Shared_Init(void);
-void BL_ProcessUpdate(float voltage, float current, float power,
-                      float frequency, float energyWh);
+// Set to 48 slots (12-hour circular buffer to match the new 12-hour graph)
+#define MATRIX_SIZE 48
 
-/* Remote multi-meter interface (BL0942 TCP poller <-> shared accounting). */
-int  BL_GetMeterOctet(int slot);                                  /* 0 = unset */
-int  BL_GetMeterInvert(int slot);        /* 1 = reverse-wired: flip W and energy */
-float BL_GetMeterVoltCal(int slot);
-float BL_GetMeterCurrentCal(int slot);
-float BL_GetMeterPowerCal(int slot);
-void  BL_SetMeterRaw(int slot, uint32_t raw_v, uint32_t raw_a, int32_t raw_w);
-void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online);
-/* Store a good reading PLUS this cycle's signed net energy taken from the
-   chip's free-running signed CF-CNT delta. cf_valid=0 means "no usable delta
-   this cycle" (first read after (re)connect, or a detected chip reset) — the
-   reading is still latched, but it contributes 0 Wh to the sweep. */
+static int consumption_matrix[MATRIX_SIZE] = {0}; 
+static int export_matrix[MATRIX_SIZE] = {0};
+
+// Full-precision net Wh per 15-minute period (consumption - export,
+// including decimals - this is period_net, not a truncated int).
+// Used for OBK_CONSUMPTION_LAST_HOUR and any other internal accounting
+// that needs accuracy. Sanity-clamped to +/-9999.99, not the graph's
+// display range.
+static float net_matrix[MATRIX_SIZE] = {0};
+
+// Graph-only: net_matrix values capped to -150..+300 Wh and pre-packed
+// as the (val+150)/2 byte the dashboard's "net" graph expects. Kept
+// separate from net_matrix so OBK_CONSUMPTION_LAST_HOUR (and anything
+// else reading net_matrix) sees the true, uncapped net Wh for the
+// period - only the display copy is capped/scaled. Radio payloads stay
+// small (1 byte/sample) while internal calculations keep full accuracy.
+static unsigned char net_graph_matrix[MATRIX_SIZE] = {0};
+
+// --- Graph series for the two-panel dashboard chart, one value per 15-min slot ---
+// TOP panel: average BATTERY power over the period, signed (+ = charge,
+//   - = discharge), in W, clamped to +/-500. Served as 10-bit sign+magnitude
+//   (2 bytes/slot) and split into charge/discharge traces by the browser.
+// BOTTOM panel: SOLAR energy generated over the period, in Wh magnitude,
+//   clamped 0..150. Always drawn as a negative (downward) yellow overlay.
+static int           ess_pwr_matrix[MATRIX_SIZE]    = {0};   // avg battery W, signed
+static unsigned char solar_graph_matrix[MATRIX_SIZE] = {0};  // solar Wh/period, 0..150
+
+// Per-period sample accumulators (sampled by the 30 s sampler below). Battery
+// power is signed; solar power is the (>=0) instantaneous generation in W.
+static int current_ess_pwr_accum   = 0;   // sum of signed battery W samples
+static int current_solar_pwr_accum = 0;   // sum of solar W samples (>=0)
+static int sample_count_30s        = 0;
+
+int solar_available = 0;
+
+// Charger/inverter PWM state (0 = idle, 5 = inverter on, 18+ = charger on
+// at that %). File-scoped (not local to the 30s control block) so the
+// 15-minute rollover can save/restore them across its reset, preventing
+// the inverter from cycling off at every 15-minute boundary.
+static int persistent_state = 0;
+static int solar_excess = 0;
+static int saved_persistent_state = 0;
+static int saved_solar_excess = 0;
+static int rollover_just_happened = 0;
+
+/* Daily export (generation) totals — loaded from NVS on boot, rolled over
+   at midnight via NTP. Index: [0]=today, [1]=yesterday, [2]=2d ago, [3]=3d ago */
+static float export_daily[4] = {0.0f};
+
+int estimated_energy_period = 0;
+
+// NEW GLOBAL TARGETS
+static int target_export       = 20;   // export low/OFF point (Wh), global (auto+manual)
+static int target_power_auto   = 100;  // AUTO  : ceiling the loop regulates up to (%)
+static int target_power_manual = 100;  // MANUAL: actual charger output (%)
+
+// Charger AUTO/MANUAL mode. charger_c_auto stays the master "is auto" flag so the
+// existing control logic keeps working; charger_manual_temp marks the temporary
+// (purple) manual that auto-reverts to AUTO at the next 15-minute rollover:
+//   charger_c_auto==1                       -> AUTO            (blue)
+//   charger_c_auto==0 && charger_manual_temp -> MANUAL temp     (purple, reverts)
+//   charger_c_auto==0 && !charger_manual_temp-> MANUAL locked   (red)
+static int charger_manual_temp = 0;
+
+// Diversion (.22 load) overlay. Works the same in AUTO and MANUAL:
+//   divert_user 0 = auto (follow hysteresis), 1 = force-on temp (reverts at rollover),
+//               2 = force-on locked.
+static int          divert_user          = 0;
+static int          divert_is_on         = 0;   // last state commanded to the .22 load
+static int          divert_threshold     = 60;  // ON point (Wh), kept >= target_export+10
+static int          charger_was_running  = 0;
+// charger_on_tick (TickType_t) is declared after the FreeRTOS headers below.
+
+#define dump_load_relay_number 6
+/* charger_c_ip removed — charger IPs now configured via setChargerIP1/2 */
+#define net_metering_period 15
+
+static int dump_load_relay[dump_load_relay_number] = {0};
+
+static int last_matrix_index = -1; 
+int charger_c_auto = 1;
+
+// ====================================================================
+// LOCAL ACTUATION via OBK's native pin-role/channel system.
+// Our init programmatically assigns roles + channels to the four pins
+// (no web-UI fiddling needed, reapplied every boot), then all control
+// goes through CHANNEL_Set() — the exact mechanism proven working on
+// this board (SetChannel 59/61 toggles the physical pins).
+// Once a pin has an OBK role it speaks channel language, not raw GPIO:
+// driving it with gpio_set_level/ledc_* just fights the role system.
+// ====================================================================
+#define GPIO_CHARGER_ENABLE     4        // charger enable relay (IOR_Relay, active HIGH)
+#define GPIO_CHARGER_PWM        2        // charger duty (IOR_PWM, channel value = 0-100%)
+#define GPIO_RELAY_ECON         0        // relay economiser (IOR_PWM, channel value = 0-100%)
+#define GPIO_INVERTER_LED       8        // onboard LED (IOR_PWM_n on SAME channel as GPIO0:
+                                         // active-LOW LED mirrors the economiser automatically)
+
+// OBK channel numbers for each function (arbitrary free slots; 59/61 are
+// the ones already proven to move GPIO4/GPIO2 from the console, 63 is
+// the slot the user observed for P0)
+#define CH_CHARGER_ENABLE       59       // 0/1 -> GPIO4 relay
+#define CH_CHARGER_PWM          61       // 0-100 -> GPIO2 duty %
+#define CH_RELAY_ECON           63       // 0-100 -> GPIO0 duty %, GPIO8 inverted mirror
+
+#define RELAY_ECON_DUTY_FULL    100      // 100% — initial relay pull-in
+#define RELAY_ECON_DUTY_HOLD    80       // 80%  — economiser hold
+#define RELAY_ECON_PULSE_MS     500      // ms at 100 % before dropping to hold
+
+// Shadow variables — last duty written to each output (available for debug/MQTT)
+static int charger_pwm      = 0;   // 0-100%, mirrors GPIO2
+static int relay_economiser = 0;   // 0 / RELAY_ECON_DUTY_HOLD / RELAY_ECON_DUTY_FULL (percent), mirrors GPIO0
+
+// Economiser edge-detection state (persistent across ApplyDumpLoadGPIO calls)
+static int          inverter_was_active  = 0;
+
+// ---- BMS voltage gating of charger / inverter ----
+// Per-CELL setpoints (volts). Charger cuts OFF when the MAX cell reaches its
+// setpoint and resumes 50 mV below it; inverter cuts OFF when the MIN cell
+// reaches its setpoint and resumes 100 mV above it. Gating is skipped entirely
+// when the BMS is offline (JKBMS_GetData() == false) — we won't act on stale
+// cell voltages. Setpoints come from the bat-pop sliders (SetChargerCutoff /
+// SetInverterCutoff, centivolts) and persist on change.
+static float charger_cutoff_v  = 3.60f;  // max-cell charge stop
+static float inverter_cutoff_v = 3.30f;  // min-cell discharge stop
+static int   charger_gated     = 0;      // 1 = charger latched off by BMS
+static int   inverter_gated    = 0;      // 1 = inverter latched off by BMS
+#define CHARGER_HYST_V   0.050f          // 50 mV
+#define INVERTER_HYST_V  0.100f          // 100 mV
+
+// inverter_engage_tick declared as static local inside ApplyDumpLoadGPIO —
+// TickType_t is only available after the FreeRTOS headers are pulled in
+// by the OpenBK include block below, so it cannot live here at file scope.
+
+// ---- Dashboard "System Configuration" settings ----
+// Set from the settings tab via the Set* commands below, read back via
+// /api_dash?req=cfg, and flash-persisted on change (see SETTINGS_Save).
+//
+// Meter slaves are addressed by last octet only (full IP = device subnet +
+// octet, resolved when the poller opens the socket). 0 = unset / skip. The
+// six slots map fixed to their dashboard roles:
+//   g_meter_ip[0] = L1   (consumption)   g_meter_ip[3] = Solar A (generation)
+//   g_meter_ip[1] = L2   (consumption)   g_meter_ip[4] = Solar B (generation)
+//   g_meter_ip[2] = L3   (consumption)   g_meter_ip[5] = ESS Inverter (bidir)
+static unsigned char g_meter_ip[6]  = {0,0,0,0,0,0};
+// Per-meter direction inversion. Some BL0942 slaves get wired backwards, so the
+// signed WATT and the signed CF-CNT energy delta come out with the wrong sign.
+// A 1 here flips BOTH for that slot (applied in the BL0942 driver, so display
+// and energy stay consistent). Set from the meter settings page (SetMeterInvert),
+// persisted to flash on Apply (keys minv0..minv5).
+static unsigned char g_meter_invert[6] = {0,0,0,0,0,0};
+// Per-meter calibration coefficients, same divide-mode convention as the
+// onboard sensor's PwrCal (calibrated = raw / coefficient). Defaulted to the
+// SAME nominal BL0942 datasheet constants the shared onboard calibration
+// starts from (DEFAULT_VOLTAGE_CAL/CURRENT_CAL/POWER_CAL in drv_bl0942.c) —
+// NOT 1.0, which would leave an uncalibrated slot displaying raw ADC codes.
+// Set via SetMeterVoltCal/SetMeterCurrentCal/SetMeterPowerCal <slot 1-6>
+// <true value>; persisted to flash on change (keys mvcal0..5/macal0..5/
+// mpcal0..5). "Calibrated" (for the settings-page green/grey state) simply
+// means the coefficient no longer equals its default.
+#define METER_CAL_V_DEFAULT 15188.0f
+#define METER_CAL_A_DEFAULT 251210.0f
+#define METER_CAL_P_DEFAULT 598.0f
+static float g_meter_vcal[6] = {METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT,
+                                 METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT, METER_CAL_V_DEFAULT};
+static float g_meter_acal[6] = {METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT,
+                                 METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT, METER_CAL_A_DEFAULT};
+static float g_meter_pcal[6] = {METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT,
+                                 METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT, METER_CAL_P_DEFAULT};
+// Latest RAW (pre-calibration) chip codes per slot, captured every read so a
+// calibration command always has "what the chip said just now" to compute
+// coefficient = raw / true_value against. Same idea as drv_pwrCal.c's
+// latest_raw_voltage/current/power, just one triple per meter instead of one
+// shared triple.
+static uint32_t g_meter_raw_v[6] = {0};
+static uint32_t g_meter_raw_a[6] = {0};
+static int32_t  g_meter_raw_w[6] = {0};
+static char          g_bms_mac[18]  = {0};   // "AA:BB:CC:DD:EE:FF"
+static char          g_bms2_mac[18] = {0};
+static unsigned char g_inv2_ip      = 0;     // Boost Inverter (remote), last octet
+static unsigned char g_bypass_ip    = 0;     // Diversion Load (remote), last octet
+static int           g_boost_power   = 10;   // Boost net-energy trigger (Wh)
+static int           g_inv2_on       = 0;    // Boost Inverter desired state
+static void SETTINGS_Save(void);             // defined after the NVS includes below
+static void COUNTERS_Save(void);             // defined after the NVS includes below
+
+// ---- Remote meter slots (filled once per read by the BL0942 TCP poller) ----
+// Slot roles match g_meter_ip[]: [0..2]=L1/L2/L3 (bidirectional grid phases,
+// signed power: +import / -export), [3..4]=Solar A/B, [5]=ESS (bidir).
+// online = 1 once a good reading has ever landed (stays 1 across brief read
+// failures so we can hold the last-good value); last_ok = tick of the most
+// recent successful read. Display/integration freshness is derived from the
+// age of last_ok, not from online alone (see BL_MeterOnlineState).
+// cf_wh  = signed net Wh for THIS sweep, from the chip's CF-CNT delta
+//          (+ = import/charge/generation-direction, - = the opposite).
+// cf_valid = 1 when cf_wh holds a trustworthy delta this cycle, 0 otherwise
+//          (first read after (re)connect, detected chip reset, or a glitch).
+typedef struct { float v, a, w, freq; int online; TickType_t last_ok;
+                 float cf_wh; int64_t cf_ticks; int cf_valid; } meter_slot_t;
+static meter_slot_t g_meter[6];
+
+// Read freshness windows. A slot is polled ~every 6 s, so within 9 s a good
+// read is "fresh"; up to 30 s we keep showing/integrating the last-good value
+// but flag it as "stale" (comms hiccup); beyond 30 s it's treated as offline.
+#define METER_FRESH_TICKS ((TickType_t)( 9000 / portTICK_PERIOD_MS))
+#define METER_HOLD_TICKS  ((TickType_t)(30000 / portTICK_PERIOD_MS))
+
+// ---- Solar / ESS energy counters (Wh) ----
+// Today resets at local midnight; total is lifetime. Accumulated by
+// BL_ProcessSweep from power*elapsed; flash-persisted on the 15-min boundary.
+static float gen_today = 0, gen_total = 0;            // Solar generation (m4+m5)
+static float ess_imp_today = 0, ess_imp_total = 0;    // ESS import / charge   (m6 >=0)
+static float ess_exp_today = 0, ess_exp_total = 0;    // ESS export / discharge(m6 < 0)
+
+// ---- Grid (utility) energy counters (Wh) ----
+// L1+L2+L3 signed net, split by sign into two ALWAYS-POSITIVE counters exactly
+// the way solar/ESS are: >=0 -> import, <0 -> export (stored positive). Fed from
+// the CF-CNT delta each sweep (BL_ProcessSweep), NOT from power*time. "today"
+// resets at local midnight; totals are lifetime. Persisted keys gitod/gitot/
+// getod/getot.
+static float grid_imp_today = 0, grid_imp_total = 0;  // utility import  (>=0)
+static float grid_exp_today = 0, grid_exp_total = 0;  // utility export  (<0, stored +)
+
+// ---- Per-TYPE, per-15-min-interval accumulators (reset every rollover) ----
+// Grid uses the existing real_consumption / real_export (import / export Wh for
+// the current interval). Solar and ESS get their own here so all three types
+// keep a live "this interval so far" value taken straight from the counters.
+static float cur_solar   = 0;   // solar Wh generated this interval (one-way)
+static float cur_ess_chg = 0;   // ESS charge  Wh this interval
+static float cur_ess_dis = 0;   // ESS discharge Wh this interval
+
+// ---- Last-hour rings: the 4 most-recently-COMPLETED 15-min intervals ----
+// "Energy last hour" = sum of these 4. Import and export are separate positive
+// counters (they never go negative); solar is one-way. Written at each rollover.
+// RAM-only (like the in-progress interval) - after a reboot they refill within
+// an hour, matching the existing behaviour for real_consumption/real_export.
+#define LH_SLOTS 4
+static float lh_grid_imp[LH_SLOTS] = {0}, lh_grid_exp[LH_SLOTS] = {0};
+static float lh_solar[LH_SLOTS]    = {0};
+static float lh_ess_chg[LH_SLOTS]  = {0}, lh_ess_dis[LH_SLOTS]  = {0};
+static int   lh_pos = 0;   // next write slot in the rings
+
+// ---- Per-meter lifetime accumulated energy (signed RAW TICKS), for diagnosis ----
+// Shown on the meter settings page. Fed straight from each slot's signed
+// CF-CNT tick delta (post-invert, pre-calibration) — the BL0942's native
+// resolution, ~5116 ticks/Wh. Integer accumulation only: no float ever touches
+// this value, so it can run for the life of the device with zero drift.
+// Converted to Wh (with calibration applied, once that exists) only at
+// display/API time. Persisted as a true 64-bit value (keys macc0..macc5).
+// Cleared by ClearMeteringData.
+static int64_t meter_acc[6] = {0,0,0,0,0,0};
+
+// Sum of the 4 ring entries for a last-hour counter.
+static float lh_sum4(const float *ring) {
+    return ring[0] + ring[1] + ring[2] + ring[3];
+}
+
+#include "../hal/hal_pins.h"
+#include "drv_bl_shared.h"
+
+#include "../new_cfg.h"
+#include "../new_pins.h"
+#include "../hal/hal_flashVars.h"
+#include "../logging/logging.h"
+#include "../mqtt/new_mqtt.h"
+#include "../hal/hal_ota.h"
+#if PLATFORM_ESPIDF
+#include "drv_uart_tcp_client.h"
+// Drop a slot's CF-CNT baseline so its next read re-baselines (contributes 0)
+// instead of bridging a stale gap. Used at the interval boundary for any meter
+// that is currently offline (see point-2 offline policy in BL_ProcessUpdate).
+void BL0942_InvalidateBaseline(int slot);
+#endif
+#include "drv_local.h"
+#include "drv_ntp.h"
+#include "drv_deviceclock.h"   // TIME_* (live device clock) — used instead of stale NTP_*
+#include "drv_public.h"
+#include "drv_uart.h"
+#include "../hal/hal_wifi.h"     // HAL_GetMyIPString (for the .22 diversion target)
+#include "../cmnds/cmd_public.h" //for enum EventCode
+#include <math.h>
+#include <time.h>
+#if PLATFORM_ESPIDF
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#endif
+
+#ifdef ENABLE_JK_BMS
+#include "drv_jkbms.h"   // JKBMS_GetData / JKBMS_GetMac
+#include "jk_bms.h"      // jk_bms_data_t
+#endif
+
+int stat_updatesSkipped = 0;
+int stat_updatesSent = 0;
+
+static float net_energy = 0;
+static float real_export = 0;
+static float real_consumption = 0;
+
+// Variables for the solar dump load timer
+static byte old_time = 0;
+#define dump_load_hysteresis 1 
+#define max_export -3300
+
+byte check_time = 0;                    
+byte check_hour = 0;                    
+              
+const char UNIT_WH[] = "Wh";
+struct {
+    energySensorNames_t names;
+    byte rounding_decimals;
+    float changeSendThreshold;
+    double lastReading; 
+    double lastSentValue; 
+    int noChangeFrame; 
+} sensors[OBK__NUM_SENSORS] = { 
+    {{"voltage",        "V",    "Voltage",                  "voltage",                  "0", },  0,  1,   },            
+    {{"current",        "A",    "Current",                  "current",                  "1", },  2,  0.01,},            
+    {{"power",          "W",    "Power",                    "power",                    "2", },  0,  10,  },            
+    {{"apparent_power", "VA",   "Apparent Power",           "power_apparent",           "9", },  0,  10,  },             
+    {{"reactive_power", "Wh",   "Energy Balance",           "power_reactive",           "10",},  0,  1,   },            
+    {{"power_factor",   "",     "Power Factor",             "power_factor",             "11",},  1,  0.1, },            
+    {{"energy",         UNIT_WH,"Total Consumption",        "energycounter",            "3", },  2,  0.1, },            
+    {{"energy",         UNIT_WH,"Total Generation",         "energycounter_generation", "14",},  2,  0.1, },            
+    {{"energy",         UNIT_WH,"Energy Last Hour",         "energycounter_last_hour",  "4", },  2,  0.1, },            
+    {{"energy",         UNIT_WH,"Energy Today",             "energycounter_today",      "7", },  2,  0.1, },            
+    {{"energy",         UNIT_WH,"Energy Yesterday",         "energycounter_yesterday",  "6", },  2,  0.1, },            
+    {{"energy",         UNIT_WH,"Energy 2 Days Ago",        "energycounter_2_days_ago", "12",},  2,  0.1, },            
+    {{"energy",         UNIT_WH,"Energy 3 Days Ago",        "energycounter_3_days_ago", "13",},  2,  0.1, },            
+    {{"timestamp",      "",     "Energy Clear Date",        "energycounter_clear_date", "8", },  0,  86400,},            
+}; 
+
+float lastReadingFrequency = NAN;
+
+// Crash-proof float->int conversion. Casting a non-finite (NaN/inf) or
+// out-of-range float to int is undefined behaviour on ARM and can fault.
+// Any energy/power value that ever goes bad (e.g. a stray meter glitch)
+// would otherwise crash at one of the (int) cast sites below. This clamps
+// to a wide but safe integer window and maps non-finite values to 0.
+static int safe_int(double v) {
+    if (!isfinite(v)) return 0;
+    if (v >  1000000000.0) return  1000000000;
+    if (v < -1000000000.0) return -1000000000;
+    return (int)v;
+}
+
+// ====================================================================
+// DIVERSION (.22 load) CONTROL
+// ====================================================================
+// Builds "<my-subnet>.22" from the device's own IP and fires a Tasmota
+// Power ON/OFF to it. Fired only on state changes (edges) so the .22
+// device isn't spammed every loop.
+static void divert_send(int on) {
+    const char *myip = HAL_GetMyIPString();
+    char ip[24];
+    char cmd[96];
+    char *last_dot;
+    if (!myip || !*myip) return;
+    strncpy(ip, myip, sizeof(ip) - 1);
+    ip[sizeof(ip) - 1] = '\0';
+    last_dot = strrchr(ip, '.');
+    if (!last_dot) return;
+    *last_dot = '\0';                       // ip now holds the /24 prefix
+    snprintf(cmd, sizeof(cmd),
+             "SendGet http://%s.22/cm?cmnd=Power%%20%s",
+             ip, on ? "ON" : "OFF");
+    //CMD_ExecuteCommand(cmd, 0);
+}
+
+// Evaluated every loop. Hysteresis band: turn ON at >= divert_threshold Wh of
+// export, OFF at <= target_export Wh. AUTO mode additionally requires the
+// charger to be running and 5 s to have elapsed since it went off->on. A user
+// force-on (divert_user 1/2) ignores the charger gate.
+static TickType_t charger_on_tick = 0;   // tick the charger last went off->on
+static void evaluate_diversion(void) {
+    int charger_running = (dump_load_relay[5] >= 18);
+    TickType_t now = xTaskGetTickCount();
+    int want_on;
+
+    if (charger_running && !charger_was_running) charger_on_tick = now;
+    charger_was_running = charger_running;
+
+    if (divert_user >= 1) {
+        want_on = 1;                                    // force-on (temp or locked)
+    } else if (!charger_running) {
+        want_on = 0;                                    // auto needs charger on
+    } else if ((now - charger_on_tick) < (5000 / portTICK_PERIOD_MS)) {
+        want_on = divert_is_on;                         // 5 s grace after charger start
+    } else {
+        int export_wh = -estimated_energy_period;       // +ve when exporting
+        if (export_wh >= divert_threshold)   want_on = 1;
+        else if (export_wh <= target_export) want_on = 0;
+        else                                 want_on = divert_is_on; // inside the band
+    }
+
+    if (want_on != divert_is_on) {
+        divert_is_on = want_on;
+        divert_send(want_on);
+    }
+}
+
+// ====================================================================
+// INSTANTANEOUS POWER (derived directly from the Wh delta of the cycle)
+// ====================================================================
+// Each BL_ProcessUpdate call receives the SIGNED Wh that flowed since the
+// last call (from the chip's CF-CNT delta on remote meters). Dividing by the
+// elapsed time gives the average wattage over that window — which, because a
+// full cycle is a fixed ~10 s, already IS the smoothed value. No extra rolling
+// average is applied. Signed: positive = import (consumption), negative =
+// export.
+static float         calc_power_w     = 0.0f;
+
+// ====================================================================
+// LOOP INTERVAL MEASUREMENT
+// ====================================================================
+// Tracks the wall-clock time between successive BL_ProcessUpdate calls.
+// Replaces the old worst-case execution-time metric with a value that
+// tells us the actual cadence at which the meter pushes readings.
+static TickType_t  last_processupdate_tick = 0;
+static unsigned int  loop_interval_ms        = 0;
+
+int actual_mday = -1;
+float lastSavedEnergyCounterValue = 0.0f;
+float lastSavedGenerationCounterValue = 0.0f;
+long ConsumptionSaveCounter = 0;
+TickType_t lastConsumptionSaveStamp;
+time_t ConsumptionResetTime = 0;
+
+int changeSendAlwaysFrames = 300;
+int changeDoNotSendMinFrames = 20;
+
+// ====================================================================
+// ENERGY VERSION COUNTER (global)
+// ====================================================================
+int energy_version = 0;
+void mark_energy_dirty(void) { energy_version++; }
+
+// ====================================================================
+// MINIMAL BASE64 ENCODER (for compact graph payloads)
+// ====================================================================
+static const char b64_table[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Encodes `len` bytes from `in` into base64 chars written to `out`
+// (NOT null-terminated). Returns number of chars written.
+// out must have space for ((len + 2) / 3) * 4 bytes.
+static int base64_encode(const unsigned char *in, int len, char *out) {
+    int i, o = 0;
+    for (i = 0; i + 3 <= len; i += 3) {
+        unsigned int v = (in[i] << 16) | (in[i+1] << 8) | in[i+2];
+        out[o++] = b64_table[(v >> 18) & 0x3F];
+        out[o++] = b64_table[(v >> 12) & 0x3F];
+        out[o++] = b64_table[(v >> 6)  & 0x3F];
+        out[o++] = b64_table[v & 0x3F];
+    }
+    if (len - i == 1) {
+        unsigned int v = in[i] << 16;
+        out[o++] = b64_table[(v >> 18) & 0x3F];
+        out[o++] = b64_table[(v >> 12) & 0x3F];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (len - i == 2) {
+        unsigned int v = (in[i] << 16) | (in[i+1] << 8);
+        out[o++] = b64_table[(v >> 18) & 0x3F];
+        out[o++] = b64_table[(v >> 12) & 0x3F];
+        out[o++] = b64_table[(v >> 6)  & 0x3F];
+        out[o++] = '=';
+    }
+    return o;
+}
+
+void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState)
+{
+	(void)bPreState;
+    // Dashboard migrated to standalone JSON architecture on /dash
+}
+
+void BL09XX_SaveEmeteringStatistics()
+{
+    ENERGY_METERING_DATA data;
+    memset(&data, 0, sizeof(ENERGY_METERING_DATA));
+
+    /* TotalGeneration no longer in the struct — stored as NVS key "eExpTotal" */
+    data.TotalConsumption = sensors[OBK_CONSUMPTION_TOTAL].lastReading;
+    data.TodayConsumpion = sensors[OBK_CONSUMPTION_TODAY].lastReading;
+    data.YesterdayConsumption = sensors[OBK_CONSUMPTION_YESTERDAY].lastReading;
+    data.actual_mday = actual_mday;
+    data.ConsumptionHistory[0] = sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading;
+    data.ConsumptionHistory[1] = sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading;
+    data.ConsumptionResetTime = ConsumptionResetTime;
+    ConsumptionSaveCounter++;
+    data.save_counter = ConsumptionSaveCounter;
+
+    HAL_SetEnergyMeterStatus(&data);
+
+    /* Export total and daily history stored separately so the struct stays 32 bytes */
+    HAL_FlashVars_SaveEnergyExportTotal(sensors[OBK_GENERATION_TOTAL].lastReading);
+    HAL_FlashVars_SaveEnergyImportTotal(sensors[OBK_CONSUMPTION_TOTAL].lastReading);
+    HAL_FlashVars_SaveEnergyExportDaily(0, export_daily[0]);
+    HAL_FlashVars_SaveEnergyExportDaily(1, export_daily[1]);
+    HAL_FlashVars_SaveEnergyExportDaily(2, export_daily[2]);
+    HAL_FlashVars_SaveEnergyExportDaily(3, export_daily[3]);
+}
+
+commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    float value;
+    int i;
+
+    if(args==0||*args==0) 
+    {
+        sensors[OBK_GENERATION_TOTAL].lastReading = 0.0;
+        sensors[OBK_CONSUMPTION_TOTAL].lastReading = 0.0;
+        for(i = OBK_CONSUMPTION__DAILY_FIRST; i <= OBK_CONSUMPTION__DAILY_LAST; i++)
+        {
+            sensors[i].lastReading = 0.0;
+        }
+    } else {
+        value = atof(args);
+        sensors[OBK_CONSUMPTION_TOTAL].lastReading = value;
+    }
+    ConsumptionResetTime = (time_t)TIME_GetCurrentTime();
+#if WINDOWS
+#elif PLATFORM_BL602
+#elif PLATFORM_W600 || PLATFORM_W800
+#elif PLATFORM_XR809
+#elif PLATFORM_BK7231N || PLATFORM_BK7231T
+    if (ota_progress()==-1)
+#endif
+    { 
+        lastSavedEnergyCounterValue = sensors[OBK_CONSUMPTION_TOTAL].lastReading;
+        lastSavedGenerationCounterValue = sensors[OBK_GENERATION_TOTAL].lastReading;
+        BL09XX_SaveEmeteringStatistics();
+        lastConsumptionSaveStamp = xTaskGetTickCount();
+    }
+    mark_energy_dirty();
+    return CMD_RES_OK;
+}
+
+// ClearMeteringData — wipe ALL metering counters (grid / solar / ESS totals and
+// today, per-meter accumulators, the last-hour rings, the in-progress interval,
+// and the 12-hour graph matrices) and persist the zeroed state. Fired from the
+// "Clear Metering Data" button on the meter settings page. Meter IPs, MACs,
+// invert flags and control settings are NOT touched.
+commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int i;
+
+    // Lifetime + today counters, all types.
+    grid_imp_today = grid_imp_total = 0;
+    grid_exp_today = grid_exp_total = 0;
+    gen_today = gen_total = 0;
+    ess_imp_today = ess_imp_total = 0;
+    ess_exp_today = ess_exp_total = 0;
+    for (i = 0; i < 6; i++) meter_acc[i] = 0;
+
+    // In-progress interval + last-hour rings.
+    real_consumption = real_export = net_energy = 0;
+    cur_solar = cur_ess_chg = cur_ess_dis = 0;
+    for (i = 0; i < LH_SLOTS; i++) {
+        lh_grid_imp[i] = lh_grid_exp[i] = 0;
+        lh_solar[i] = lh_ess_chg[i] = lh_ess_dis[i] = 0;
+    }
+    lh_pos = 0;
+    estimated_energy_period = 0;
+
+    // Legacy sensor totals / history + export dailies.
+    sensors[OBK_CONSUMPTION_TOTAL].lastReading   = 0;
+    sensors[OBK_GENERATION_TOTAL].lastReading    = 0;
+    sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = 0;
+    for (i = OBK_CONSUMPTION__DAILY_FIRST; i <= OBK_CONSUMPTION__DAILY_LAST; i++)
+        sensors[i].lastReading = 0;
+    for (i = 0; i < 4; i++) export_daily[i] = 0;
+
+    // 12-hour graph matrices back to a flat zero line.
+    for (i = 0; i < MATRIX_SIZE; i++) {
+        consumption_matrix[i] = 0;
+        export_matrix[i]      = 0;
+        net_matrix[i]         = 0;
+        net_graph_matrix[i]   = (unsigned char)((0 + 150) / 2);
+        ess_pwr_matrix[i]     = 0;
+        solar_graph_matrix[i] = 0;
+    }
+
+    ConsumptionResetTime = (time_t)TIME_GetCurrentTime();
+    lastSavedEnergyCounterValue = 0;
+    lastSavedGenerationCounterValue = 0;
+
+    // Persist the zeroed state so a reboot doesn't restore old counters.
+    BL09XX_SaveEmeteringStatistics();   // sensor totals/history + export dailies
+    COUNTERS_Save();                    // grid/solar/ESS counters + per-meter acc
+#if PLATFORM_ESPIDF
+    HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
+                                    solar_graph_matrix, ess_pwr_matrix,
+                                    MATRIX_SIZE,
+                                    (last_matrix_index < 0) ? 0 : last_matrix_index,
+                                    (unsigned int)TIME_GetCurrentTime());
+#endif
+    mark_energy_dirty();
+    return CMD_RES_OK;
+}
+
+// ====================================================================
+// ApplyDumpLoadGPIO — single actuation point for all three call sites
+// ====================================================================
+// state <  3          : everything off  (GPIO4 LOW, GPIO2 duty 0, GPIO0 duty 0)
+// state  3..5         : inverter on     (GPIO4 LOW, GPIO2 0,
+//                                        GPIO0 100% for 500ms then 80% hold)
+//                       Ramp happens inline (blocking) on the 0→active rising
+//                       edge. If state remains inverter-active, stays at 80%.
+// state  10..100      : charger power-on (GPIO4 HIGH). Two sub-ranges:
+//                         10..17  : fixed 10% duty floor, not yet switching
+//                         18..100 : GPIO2 PWM duty tracks state (percent)
+//                                   directly: duty_8bit = state * 2.5,
+//                                   e.g. 18% -> 45, 50% -> 125, 100% -> 250
+//
+// charger_pwm and relay_economiser are updated to reflect what was last
+// written to hardware (shadow state, useful for diagnostics).
+static void ApplyDumpLoadGPIO(int state)
+{
+#if PLATFORM_ESPIDF
+    // ---- BMS voltage gate (skipped entirely if BMS offline) ----
+    // Re-evaluates the hysteresis latches from live cell voltages, then forces
+    // the requested state off if the relevant device is latched. dump_load_relay
+    // is left untouched (the control logic keeps its intent); only the hardware
+    // output is held off until the cell voltage recovers past the hysteresis.
+#ifdef ENABLE_JK_BMS
+    {
+        jk_bms_data_t bd;
+        // Update the latches ONLY when a fresh frame is available. On comms
+        // loss the latches are left exactly as they were, so the last good gate
+        // decision is HELD, not released: a charger gated-off at 3.60 V stays
+        // off through a dropout instead of glitching back on, and a device that
+        // was allowed stays allowed. Resume (release) happens only once fresh
+        // data shows the cell voltage recovered past the hysteresis band.
+        // No fail-to-off timeout on purpose — given the known nightly BMS
+        // desync, forcing the inverter off after a timeout would drop the house
+        // load overnight; holding the last state is the safer behaviour.
+        if (JKBMS_GetData(&bd)) {
+            if (bd.cell_max >= charger_cutoff_v)                        charger_gated  = 1;
+            else if (bd.cell_max <= charger_cutoff_v - CHARGER_HYST_V)  charger_gated  = 0;
+            if (bd.cell_min <= inverter_cutoff_v)                       inverter_gated = 1;
+            else if (bd.cell_min >= inverter_cutoff_v + INVERTER_HYST_V) inverter_gated = 0;
+        }
+        // ALWAYS apply the (possibly held) latch state.
+        if (charger_gated  && state >= CHARGER_MIN_PWM)  state = 0;
+        if (inverter_gated && state >= 3 && state <= 5) state = 0;
+    }
+#endif
+
+    int inverter_active   = (state >= 3 && state <= 5);
+    // Power-on range (10-100) is wider than the PWM range (18-100): 10-17
+    // enables the supply at a fixed pre-charge floor with no switching yet.
+    int charger_power_on = (state >= CHARGER_MIN_PWM && state <= CHARGER_MAX_PWM);
+
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "ApplyDumpLoadGPIO(state=%d): inverter_active=%d charger_power_on=%d\n",
+              state, inverter_active, charger_power_on);
+
+    if (charger_power_on) {
+        // ----- CHARGER MODE -----
+        // state IS the target percentage. 10-17: fixed 10% floor (enabled,
+        // not yet switching). 18-100: duty tracks state directly.
+        int pct = (state < 18) ? 10 : state;
+        if (pct < 0)   pct = 0;
+        if (pct > 100) pct = 100;
+
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "CHARGER branch: pct=%d -> CHANNEL_Set(%d,1) CHANNEL_Set(%d,%d)\n",
+                  pct, CH_CHARGER_ENABLE, CH_CHARGER_PWM, pct);
+
+        CHANNEL_Set(CH_CHARGER_ENABLE, 1,   CHANNEL_SET_FLAG_FORCE);
+        CHANNEL_Set(CH_CHARGER_PWM,    pct, CHANNEL_SET_FLAG_FORCE);
+        CHANNEL_Set(CH_RELAY_ECON,     0,   CHANNEL_SET_FLAG_FORCE);   // GPIO0 off, GPIO8 LED off (auto)
+
+        charger_pwm         = pct;
+        relay_economiser    = 0;
+        inverter_was_active = 0;
+
+    } else if (inverter_active) {
+        // ----- INVERTER MODE -----
+        CHANNEL_Set(CH_CHARGER_ENABLE, 0, CHANNEL_SET_FLAG_FORCE);
+        CHANNEL_Set(CH_CHARGER_PWM,    0, CHANNEL_SET_FLAG_FORCE);
+        charger_pwm = 0;
+
+        if (!inverter_was_active) {
+            // Rising edge (0 → active): 100 % pull-in pulse, then hold at 80 %.
+            // Blocking is fine here — this only runs on the rare off->active
+            // transition, from a command handler or the 30s AUTO tick, never
+            // from an ISR or a tight sampling loop.
+            // GPIO8 LED mirrors each write automatically (IOR_PWM_n, same channel).
+            CHANNEL_Set(CH_RELAY_ECON, RELAY_ECON_DUTY_FULL, CHANNEL_SET_FLAG_FORCE);
+
+            vTaskDelay(pdMS_TO_TICKS(RELAY_ECON_PULSE_MS));   // 500 ms hold at 100%
+
+            CHANNEL_Set(CH_RELAY_ECON, RELAY_ECON_DUTY_HOLD, CHANNEL_SET_FLAG_FORCE);
+            relay_economiser = RELAY_ECON_DUTY_HOLD;
+        }
+        // else: already active and already holding at 80% — nothing to do
+
+        inverter_was_active = 1;
+
+    } else {
+        // ----- OFF (state == 0, 1, or 2) -----
+        CHANNEL_Set(CH_CHARGER_ENABLE, 0, CHANNEL_SET_FLAG_FORCE);
+        CHANNEL_Set(CH_CHARGER_PWM,    0, CHANNEL_SET_FLAG_FORCE);
+        CHANNEL_Set(CH_RELAY_ECON,     0, CHANNEL_SET_FLAG_FORCE);
+
+        charger_pwm         = 0;
+        relay_economiser    = 0;
+        inverter_was_active = 0;
+    }
+#endif
+}
+
+#if PLATFORM_ESPIDF
+// ====================================================================
+// TestChargerPinsRaw <0|1> — bypasses everything: no BL_Shared_Init,
+// no ApplyDumpLoadGPIO, no charger_c_auto, no LEDC. Just gpio_config +
+// gpio_set_level directly on GPIO2 and GPIO4, nothing else. Reconfigures
+// the pins as plain digital outputs every call (so it doesn't matter what
+// state the LEDC channel config left them in) and logs the actual
+// esp_err_t from every step. If this doesn't move the pins, it's not
+// this file's logic — it's the pin itself or the board.
+// ====================================================================
+commandResult_t BL09XX_TestChargerPinsRaw(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int level = (args && *args) ? atoi(args) : 1;
+
+    gpio_config_t conf;
+    memset(&conf, 0, sizeof(conf));
+    conf.pin_bit_mask = (1ULL << GPIO_NUM_2) | (1ULL << GPIO_NUM_4);
+    conf.mode         = GPIO_MODE_OUTPUT;
+    conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+    conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    conf.intr_type    = GPIO_INTR_DISABLE;
+    esp_err_t e_conf = gpio_config(&conf);
+
+    esp_err_t e_lvl2 = gpio_set_level(GPIO_NUM_2, level);
+    esp_err_t e_lvl4 = gpio_set_level(GPIO_NUM_4, level);
+
+    int rd2 = gpio_get_level(GPIO_NUM_2);
+    int rd4 = gpio_get_level(GPIO_NUM_4);
+
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "TestChargerPinsRaw(level=%d): gpio_config=%d set_level(GPIO2)=%d set_level(GPIO4)=%d | readback GPIO2=%d GPIO4=%d\n",
+              level, (int)e_conf, (int)e_lvl2, (int)e_lvl4, rd2, rd4);
+
+    return CMD_RES_OK;
+}
+
+// ====================================================================
+// TestChargerPinsRegister <0|1> — true register-level access. No
+// driver/gpio.h calls at all (not gpio_config, not gpio_set_level).
+// Writes the actual memory-mapped GPIO peripheral struct (soc/gpio_struct.h)
+// and the IO_MUX pin-function-select macro (soc/io_mux_reg.h) directly.
+// This is as low as it goes without hand-typing raw hex addresses — these
+// are the SDK's own register definitions, not the driver abstraction.
+// If this doesn't move the pins either, it's not a software layer at all.
+// ====================================================================
+commandResult_t BL09XX_TestChargerPinsRegister(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int level = (args && *args) ? atoi(args) : 1;
+
+    // Route GPIO2 and GPIO4's IO_MUX to the plain GPIO function, bypassing
+    // gpio_config()/gpio_set_direction() entirely.
+    PIN_FUNC_SELECT(IO_MUX_GPIO2_REG, PIN_FUNC_GPIO);
+    PIN_FUNC_SELECT(IO_MUX_GPIO4_REG, PIN_FUNC_GPIO);
+
+    // Enable both as outputs by writing the peripheral's ENABLE set-register
+    // directly (bit N = 1 -> GPIO N becomes an output).
+    GPIO.enable_w1ts.val = (1u << 2) | (1u << 4);
+
+    // Drive the level via the OUT set/clear registers directly.
+    if (level) {
+        GPIO.out_w1ts.val = (1u << 2) | (1u << 4);
+    } else {
+        GPIO.out_w1tc.val = (1u << 2) | (1u << 4);
+    }
+
+    // Read back what the peripheral itself now holds — not a pin read,
+    // the actual OUT register content.
+    uint32_t out_val    = GPIO.out.val;
+    uint32_t enable_val = GPIO.enable.val;
+    int bit2 = (out_val >> 2) & 1;
+    int bit4 = (out_val >> 4) & 1;
+
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "TestChargerPinsRegister(level=%d): GPIO.out.val=0x%08X (bit2=%d bit4=%d) GPIO.enable.val=0x%08X\n",
+              level, (unsigned int)out_val, bit2, bit4, (unsigned int)enable_val);
+
+    return CMD_RES_OK;
+}
+#endif
+
+commandResult_t BL09XX_SetDumpLoad(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (charger_c_auto == 1) {
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "SetDumpLoad %s ignored: charger_c_auto=1 (AUTO mode) - switch to manual with SetChargerMode 1 or 2 first\n",
+                  args ? args : "");
+        return CMD_RES_OK;
+    }
+
+    if(args && *args) {
+        char fallback_cmd[64];
+
+        dump_load_relay[5] = atoi(args);
+
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "SetDumpLoad %d applied (manual mode), calling ApplyDumpLoadGPIO\n",
+                  dump_load_relay[5]);
+
+        /* Fire command to each configured charger IP */
+        { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
+            const char *_cip = UART_TCP_GetChargerIP(_ci);
+            if (!_cip) continue;
+            char fallback_cmd[96];
+            snprintf(fallback_cmd, sizeof(fallback_cmd),
+                     "SendGet http://%s/cm?cmnd=Channel3%%20%d",
+                     _cip, dump_load_relay[5]);
+            //CMD_ExecuteCommand(fallback_cmd, 0);
+        }}
+        ApplyDumpLoadGPIO(dump_load_relay[5]);
+    }
+    return CMD_RES_OK;
+}
+
+commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if(args && *args) {
+        int val = atoi(args);
+
+        if (charger_c_auto == 1) {
+            // AUTO: this is the ceiling the loop may regulate up to.
+            if (val < 18)  val = 18;
+            if (val > 100) val = 100;
+            target_power_auto = val;
+        } else {
+            // MANUAL: this is the actual charger output, applied instantly.
+            // 1-9 snaps up to the pre-charge floor; 10-17 = enabled/no PWM
+            // yet; 18-100 drives real PWM duty directly; 0 stays off.
+            if (val > 0 && val < CHARGER_MIN_PWM) val = CHARGER_MIN_PWM;
+            if (val > CHARGER_MAX_PWM) val = CHARGER_MAX_PWM;
+            if (val < 0)               val = 0;
+            target_power_manual = val;
+
+            dump_load_relay[5] = target_power_manual;
+            /* Fire command to each configured charger IP */
+            { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
+                const char *_cip = UART_TCP_GetChargerIP(_ci);
+                if (!_cip) continue;
+                char fallback_cmd[96];
+                snprintf(fallback_cmd, sizeof(fallback_cmd),
+                         "SendGet http://%s/cm?cmnd=Channel3%%20%d",
+                         _cip, dump_load_relay[5]);
+               // CMD_ExecuteCommand(fallback_cmd, 0);
+            }}
+            ApplyDumpLoadGPIO(dump_load_relay[5]);
+        }
+        SETTINGS_Save();
+    }
+    return CMD_RES_OK;
+}
+
+commandResult_t BL09XX_SetTargetExport(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if(args && *args) {
+        int val = atoi(args);
+        if (val < 0)   val = 0;
+        if (val > 100) val = 100;
+        target_export = val;
+        // Diversion ON point must stay at least 10 Wh above the export level.
+        if (divert_threshold < target_export + 10) divert_threshold = target_export + 10;
+        SETTINGS_Save();
+    }
+    return CMD_RES_OK;
+}
+
+// Charger mode: 0 = AUTO, 1 = MANUAL temp (reverts at next rollover), 2 = MANUAL locked.
+commandResult_t BL09XX_SetChargerMode(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int m = (args && *args) ? atoi(args) : 0;
+    if (m == 0)      { charger_c_auto = 1; charger_manual_temp = 0; }
+    else if (m == 1) { charger_c_auto = 0; charger_manual_temp = 1; }
+    else             { charger_c_auto = 0; charger_manual_temp = 0; }
+    return CMD_RES_OK;
+}
+
+// Diversion override: 0 = auto, 1 = force-on temp (reverts at rollover), 2 = force-on locked.
+commandResult_t BL09XX_SetDivertUser(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int u = (args && *args) ? atoi(args) : 0;
+    if (u < 0) u = 0;
+    if (u > 2) u = 2;
+    divert_user = u;
+    return CMD_RES_OK;
+}
+
+// Diversion ON threshold (Wh). Clamped to >= target_export + 10.
+commandResult_t BL09XX_SetDivertThreshold(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) {
+        int v = atoi(args);
+        int floor_v = target_export + 10;
+        if (v < floor_v) v = floor_v;
+        if (v > 255)     v = 255;
+        divert_threshold = v;
+        SETTINGS_Save();
+    }
+    return CMD_RES_OK;
+}
+
+commandResult_t BL09XX_ToggleAuto(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    charger_c_auto = !charger_c_auto;
+    return CMD_RES_OK;
+}
+
+// ====================================================================
+// SETTINGS PERSISTENCE  (NVS "config" namespace; keys <=15 chars)
+// ====================================================================
+// Persists the dashboard "System Configuration" fields + the two sliders
+// to flash on change, mirroring drv_uart_tcp_client's NVS pattern. On a
+// non-ESPIDF build these are no-ops (RAM-only) so the code stays portable.
+#if PLATFORM_ESPIDF
+static void SETTINGS_Save(void)
+{
+    nvs_handle_t h = 0;
+    int i;
+    char key[8];
+    if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+    for (i = 0; i < 6; i++) {
+        snprintf(key, sizeof(key), "mip%d", i);
+        nvs_set_u8(h, key, g_meter_ip[i]);
+        snprintf(key, sizeof(key), "minv%d", i);
+        nvs_set_u8(h, key, g_meter_invert[i]);
+        snprintf(key, sizeof(key), "mvcal%d", i);
+        nvs_set_i32(h, key, (int32_t)(g_meter_vcal[i] * 1000.0f + 0.5f));
+        snprintf(key, sizeof(key), "macal%d", i);
+        nvs_set_i32(h, key, (int32_t)(g_meter_acal[i] * 1000.0f + 0.5f));
+        snprintf(key, sizeof(key), "mpcal%d", i);
+        nvs_set_i32(h, key, (int32_t)(g_meter_pcal[i] * 1000.0f + 0.5f));
+    }
+    nvs_set_u8 (h, "inv2ip",  g_inv2_ip);
+    nvs_set_u8 (h, "bypip",   g_bypass_ip);
+    nvs_set_i32(h, "boostp",  g_boost_power);
+    nvs_set_i32(h, "dthr",    divert_threshold);
+    nvs_set_i32(h, "texp",    target_export);
+    nvs_set_i32(h, "tpa",     target_power_auto);
+    nvs_set_i32(h, "ccut",    (int)(charger_cutoff_v  * 100.0f + 0.5f));
+    nvs_set_i32(h, "icut",    (int)(inverter_cutoff_v * 100.0f + 0.5f));
+    nvs_set_str(h, "bmsmac",  g_bms_mac);
+    nvs_set_str(h, "bms2mac", g_bms2_mac);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void SETTINGS_Load(void)
+{
+    nvs_handle_t h = 0;
+    int i;
+    char key[8];
+    uint8_t  u8v;
+    int32_t  i32v;
+    size_t   len;
+    if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return;
+    for (i = 0; i < 6; i++) {
+        snprintf(key, sizeof(key), "mip%d", i);
+        if (nvs_get_u8(h, key, &u8v) == ESP_OK) g_meter_ip[i] = u8v;
+        snprintf(key, sizeof(key), "minv%d", i);
+        if (nvs_get_u8(h, key, &u8v) == ESP_OK) g_meter_invert[i] = u8v ? 1 : 0;
+        snprintf(key, sizeof(key), "mvcal%d", i);
+        if (nvs_get_i32(h, key, &i32v) == ESP_OK) g_meter_vcal[i] = i32v / 1000.0f;
+        snprintf(key, sizeof(key), "macal%d", i);
+        if (nvs_get_i32(h, key, &i32v) == ESP_OK) g_meter_acal[i] = i32v / 1000.0f;
+        snprintf(key, sizeof(key), "mpcal%d", i);
+        if (nvs_get_i32(h, key, &i32v) == ESP_OK) g_meter_pcal[i] = i32v / 1000.0f;
+    }
+    if (nvs_get_u8 (h, "inv2ip",  &u8v)  == ESP_OK) g_inv2_ip         = u8v;
+    if (nvs_get_u8 (h, "bypip",   &u8v)  == ESP_OK) g_bypass_ip       = u8v;
+    if (nvs_get_i32(h, "boostp",  &i32v) == ESP_OK) g_boost_power     = i32v;
+    if (nvs_get_i32(h, "dthr",    &i32v) == ESP_OK) divert_threshold  = i32v;
+    if (nvs_get_i32(h, "texp",    &i32v) == ESP_OK) target_export     = i32v;
+    if (nvs_get_i32(h, "tpa",     &i32v) == ESP_OK) target_power_auto = i32v;
+    if (nvs_get_i32(h, "ccut",    &i32v) == ESP_OK) charger_cutoff_v  = i32v / 100.0f;
+    if (nvs_get_i32(h, "icut",    &i32v) == ESP_OK) inverter_cutoff_v = i32v / 100.0f;
+    len = sizeof(g_bms_mac);  nvs_get_str(h, "bmsmac",  g_bms_mac,  &len);
+    len = sizeof(g_bms2_mac); nvs_get_str(h, "bms2mac", g_bms2_mac, &len);
+    nvs_close(h);
+}
+
+// Solar / ESS energy counters, stored as integer Wh (sub-Wh rounding is
+// negligible; i32 Wh holds ~2.1 GWh of lifetime total). Saved on the 15-min
+// boundary and at the midnight reset; loaded at boot.
+static void COUNTERS_Save(void)
+{
+    nvs_handle_t h = 0;
+    if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "gtod",  (int)(gen_today     + 0.5f));
+    nvs_set_i32(h, "gtot",  (int)(gen_total     + 0.5f));
+    nvs_set_i32(h, "eitod", (int)(ess_imp_today + 0.5f));
+    nvs_set_i32(h, "eitot", (int)(ess_imp_total + 0.5f));
+    nvs_set_i32(h, "eetod", (int)(ess_exp_today + 0.5f));
+    nvs_set_i32(h, "eetot", (int)(ess_exp_total + 0.5f));
+    /* Grid (utility) import/export counters — same treatment as solar/ESS. */
+    nvs_set_i32(h, "gitod", (int)(grid_imp_today + 0.5f));
+    nvs_set_i32(h, "gitot", (int)(grid_imp_total + 0.5f));
+    nvs_set_i32(h, "getod", (int)(grid_exp_today + 0.5f));
+    nvs_set_i32(h, "getot", (int)(grid_exp_total + 0.5f));
+    /* Per-meter lifetime accumulators (signed RAW TICKS) for diagnosis. */
+    { int i; char k[8];
+      for (i = 0; i < 6; i++) {
+          snprintf(k, sizeof(k), "macc%d", i);
+          nvs_set_i64(h, k, meter_acc[i]);
+      } }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void COUNTERS_Load(void)
+{
+    nvs_handle_t h = 0;
+    int32_t v;
+    if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return;
+    if (nvs_get_i32(h, "gtod",  &v) == ESP_OK) gen_today     = (float)v;
+    if (nvs_get_i32(h, "gtot",  &v) == ESP_OK) gen_total     = (float)v;
+    if (nvs_get_i32(h, "eitod", &v) == ESP_OK) ess_imp_today = (float)v;
+    if (nvs_get_i32(h, "eitot", &v) == ESP_OK) ess_imp_total = (float)v;
+    if (nvs_get_i32(h, "eetod", &v) == ESP_OK) ess_exp_today = (float)v;
+    if (nvs_get_i32(h, "eetot", &v) == ESP_OK) ess_exp_total = (float)v;
+    if (nvs_get_i32(h, "gitod", &v) == ESP_OK) grid_imp_today = (float)v;
+    if (nvs_get_i32(h, "gitot", &v) == ESP_OK) grid_imp_total = (float)v;
+    if (nvs_get_i32(h, "getod", &v) == ESP_OK) grid_exp_today = (float)v;
+    if (nvs_get_i32(h, "getot", &v) == ESP_OK) grid_exp_total = (float)v;
+    { int i; char k[8]; int64_t v64;
+      for (i = 0; i < 6; i++) {
+          snprintf(k, sizeof(k), "macc%d", i);
+          if (nvs_get_i64(h, k, &v64) == ESP_OK) meter_acc[i] = v64;
+      } }
+    nvs_close(h);
+}
+#else
+static void SETTINGS_Save(void) {}
+static void SETTINGS_Load(void) {}
+static void COUNTERS_Save(void) {}
+static void COUNTERS_Load(void) {}
+#endif
+
+// ---- Settings setters (store to RAM, then flash-persist on change) ----
+
+// SetMeterIP <slot 1..6> <octet 0..255> — assign a meter slave's last octet.
+commandResult_t BL09XX_SetMeterIP(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int slot, oct;
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 2)) { return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
+    slot = Tokenizer_GetArgInteger(0);
+    oct  = Tokenizer_GetArgInteger(1);
+    if (slot < 1 || slot > 6) { return CMD_RES_BAD_ARGUMENT; }
+    if (oct < 0)   oct = 0;
+    if (oct > 255) oct = 255;
+    g_meter_ip[slot - 1] = (unsigned char)oct;   // RAM only; flushed by SaveCfg
+    return CMD_RES_OK;
+}
+
+// SetMeterInvert <slot 1..6> <0|1> — flip a reverse-wired meter's direction.
+// RAM only; flushed to flash by SaveCfg (Apply button).
+commandResult_t BL09XX_SetMeterInvert(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int slot, inv;
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 2)) { return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
+    slot = Tokenizer_GetArgInteger(0);
+    inv  = Tokenizer_GetArgInteger(1);
+    if (slot < 1 || slot > 6) { return CMD_RES_BAD_ARGUMENT; }
+    g_meter_invert[slot - 1] = inv ? 1 : 0;
+    return CMD_RES_OK;
+}
+
+// Shared calibration math for the three per-meter commands below: divide-mode,
+// same as the onboard PwrCal — coefficient = latest raw chip code / the true
+// value just measured externally. Self-persists immediately (unlike
+// SetMeterInvert/SetMeterIP, which wait for the page's Save button) because
+// the settings-page OK button turns green right after this call to confirm
+// the coefficient is now live AND saved, not just staged.
+static commandResult_t MeterCalibrate(const char *cmd, const char *args,
+                                      uint32_t raw_table[6], int32_t raw_table_signed[6],
+                                      int is_signed, float *cal_table) {
+    int slot; float real, raw;
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 2)) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+    slot = Tokenizer_GetArgInteger(0);
+    real = Tokenizer_GetArgFloat(1);
+    if (slot < 1 || slot > 6) return CMD_RES_BAD_ARGUMENT;
+    if (real == 0.0f) return CMD_RES_BAD_ARGUMENT;
+    raw = is_signed ? (float)raw_table_signed[slot - 1] : (float)raw_table[slot - 1];
+    if (raw > -0.001f && raw < 0.001f) return CMD_RES_ERROR;   // connect the load first
+    cal_table[slot - 1] = raw / real;
+    SETTINGS_Save();
+    return CMD_RES_OK;
+}
+
+// SetMeterVoltCal <slot 1..6> <true volts> — measured with a trusted meter.
+commandResult_t BL09XX_SetMeterVoltCal(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    return MeterCalibrate(cmd, args, g_meter_raw_v, NULL, 0, g_meter_vcal);
+}
+
+// SetMeterCurrentCal <slot 1..6> <true amps>
+commandResult_t BL09XX_SetMeterCurrentCal(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    return MeterCalibrate(cmd, args, g_meter_raw_a, NULL, 0, g_meter_acal);
+}
+
+// SetMeterPowerCal <slot 1..6> <true watts>
+commandResult_t BL09XX_SetMeterPowerCal(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    return MeterCalibrate(cmd, args, NULL, g_meter_raw_w, 1, g_meter_pcal);
+}
+
+// SetBmsMAC <AA:BB:CC:DD:EE:FF>
+commandResult_t BL09XX_SetBmsMAC(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { strncpy(g_bms_mac, args, sizeof(g_bms_mac) - 1); g_bms_mac[sizeof(g_bms_mac) - 1] = 0; }
+    return CMD_RES_OK;
+}
+
+// SetBms2MAC <AA:BB:CC:DD:EE:FF>
+commandResult_t BL09XX_SetBms2MAC(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { strncpy(g_bms2_mac, args, sizeof(g_bms2_mac) - 1); g_bms2_mac[sizeof(g_bms2_mac) - 1] = 0; }
+    return CMD_RES_OK;
+}
+
+// SetInv2IP <octet> — Boost Inverter last octet.
+commandResult_t BL09XX_SetInv2IP(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { int o = atoi(args); if (o < 0) o = 0; if (o > 255) o = 255; g_inv2_ip = (unsigned char)o; }
+    return CMD_RES_OK;
+}
+
+// SetBypassIP <octet> — Diversion Load last octet.
+commandResult_t BL09XX_SetBypassIP(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { int o = atoi(args); if (o < 0) o = 0; if (o > 255) o = 255; g_bypass_ip = (unsigned char)o; }
+    return CMD_RES_OK;
+}
+
+// SetBoostPower <Wh> — Boost net-energy trigger.
+commandResult_t BL09XX_SetBoostPower(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { int v = atoi(args); if (v < 0) v = 0; if (v > 500) v = 500; g_boost_power = v; }
+    return CMD_RES_OK;
+}
+
+// SaveCfg — commit the settings-tab fields to flash in ONE write. The Save
+// button pushes all the Set* values first, then calls this once. (The fields
+// above are RAM-only on purpose: no flash write per keystroke/field.)
+commandResult_t BL09XX_SaveCfg(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    SETTINGS_Save();
+    return CMD_RES_OK;
+}
+
+// SetInv2 <0|1> — Boost Inverter desired state. Relayed to g_inv2_ip via SendGet
+// (zero-IP-guarded) inside the control loop; not flash-persisted (runtime state).
+commandResult_t BL09XX_SetInv2(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    g_inv2_on = (args && atoi(args)) ? 1 : 0;
+    return CMD_RES_OK;
+}
+
+// SetChargerCutoff <centivolts> — per-cell MAX setpoint (charge stop). e.g. 360 = 3.60V.
+// Slider control: persists on change.
+commandResult_t BL09XX_SetChargerCutoff(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) {
+        int cv = atoi(args);
+        if (cv < 250) cv = 250;
+        if (cv > 420) cv = 420;
+        charger_cutoff_v = cv / 100.0f;
+        SETTINGS_Save();
+    }
+    return CMD_RES_OK;
+}
+
+// SetInverterCutoff <centivolts> — per-cell MIN setpoint (discharge stop). e.g. 330 = 3.30V.
+// Slider control: persists on change.
+commandResult_t BL09XX_SetInverterCutoff(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) {
+        int cv = atoi(args);
+        if (cv < 250) cv = 250;
+        if (cv > 420) cv = 420;
+        inverter_cutoff_v = cv / 100.0f;
+        SETTINGS_Save();
+    }
+    return CMD_RES_OK;
+}
+
+commandResult_t BL09XX_VCPPublishIntervals(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 2)) { return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
+    changeDoNotSendMinFrames = Tokenizer_GetArgInteger(0);
+    changeSendAlwaysFrames = Tokenizer_GetArgInteger(1);
+    return CMD_RES_OK;
+}
+
+commandResult_t BL09XX_VCPPrecision(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int i;
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 1)) { return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
+
+    for (i = 0; i < Tokenizer_GetArgsCount(); i++) {
+        int val = Tokenizer_GetArgInteger(i);
+        switch(i) {
+        case 0: sensors[OBK_VOLTAGE].rounding_decimals = val; break;
+        case 1: sensors[OBK_CURRENT].rounding_decimals = val; break;
+        case 2: 
+            sensors[OBK_POWER].rounding_decimals = val;
+            sensors[OBK_POWER_APPARENT].rounding_decimals = val;
+            sensors[OBK_POWER_REACTIVE].rounding_decimals = val;
+            break;
+        case 3: 
+            for (int j = OBK_CONSUMPTION__DAILY_FIRST; j <= OBK_CONSUMPTION__DAILY_LAST; j++) {
+                sensors[j].rounding_decimals = val;
+            };
+        };
+    }
+    return CMD_RES_OK;
+}
+
+commandResult_t BL09XX_VCPPublishThreshold(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    Tokenizer_TokenizeString(args, 0);
+    if (Tokenizer_CheckArgsCountAndPrintWarning(cmd, 3)) { return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
+
+    sensors[OBK_VOLTAGE].changeSendThreshold = Tokenizer_GetArgFloat(0);
+    sensors[OBK_CURRENT].changeSendThreshold = Tokenizer_GetArgFloat(1);
+    sensors[OBK_POWER].changeSendThreshold = Tokenizer_GetArgFloat(2);
+    sensors[OBK_POWER_APPARENT].changeSendThreshold = Tokenizer_GetArgFloat(2);
+    sensors[OBK_POWER_REACTIVE].changeSendThreshold = Tokenizer_GetArgFloat(2);
+
+    if (Tokenizer_GetArgsCount() >= 4) {
+        for (int i = OBK_CONSUMPTION_LAST_HOUR; i <= OBK_CONSUMPTION__DAILY_LAST; i++) {
+            sensors[i].changeSendThreshold = Tokenizer_GetArgFloat(3);
+        }
+    }
+    return CMD_RES_OK;
+}
+
+bool Channel_AreAllRelaysOpen() {
+    int i, role, ch;
+    for (i = 0; i < PLATFORM_GPIO_MAX; i++) {
+        role = g_cfg.pins.roles[i];
+        ch = g_cfg.pins.channels[i];
+        if (role == IOR_Relay) {
+            if (CHANNEL_Get(ch)) { return false; }
+        }
+        if (role == IOR_Relay_n) {
+            if (CHANNEL_Get(ch)==false) { return false; }
+        }
+        if (role == IOR_BridgeForward) {
+            if (CHANNEL_Get(ch)) { return false; }
+        }
+    }
+    return true;
+}
+
+float BL_ChangeEnergyUnitIfNeeded(float Wh) {
+    if (CFG_HasFlag(OBK_FLAG_MQTT_ENERGY_IN_KWH)) { return Wh * 0.001f; }
+    return Wh;
+}
+
+// ====================================================================
+// REMOTE MULTI-METER INTERFACE (filled by the BL0942 TCP poller)
+// ====================================================================
+// Last-octet of meter `slot` (0 = unset → poller skips it). 0..5.
+int BL_GetMeterOctet(int slot) {
+    if (slot < 0 || slot >= 6) return 0;
+    return g_meter_ip[slot];
+}
+
+// 1 if meter `slot` is reverse-wired (direction flipped). Read by the BL0942
+// driver to flip that slot's signed WATT and signed CF-CNT energy together.
+int BL_GetMeterInvert(int slot) {
+    if (slot < 0 || slot >= 6) return 0;
+    return g_meter_invert[slot];
+}
+
+// Per-meter calibration coefficients (divide-mode: calibrated = raw / this).
+// Read by the BL0942 driver every frame to scale that slot's raw chip codes
+// independently of the other five slots and the onboard sensor.
+float BL_GetMeterVoltCal(int slot)    { return (slot < 0 || slot >= 6) ? METER_CAL_V_DEFAULT : g_meter_vcal[slot]; }
+float BL_GetMeterCurrentCal(int slot) { return (slot < 0 || slot >= 6) ? METER_CAL_A_DEFAULT : g_meter_acal[slot]; }
+float BL_GetMeterPowerCal(int slot)   { return (slot < 0 || slot >= 6) ? METER_CAL_P_DEFAULT : g_meter_pcal[slot]; }
+
+// Latch this slot's latest RAW (pre-calibration) chip codes, so a calibration
+// command issued right after has "what the chip just said" to compute
+// coefficient = raw / true_value against.
+void BL_SetMeterRaw(int slot, uint32_t raw_v, uint32_t raw_a, int32_t raw_w) {
+    if (slot < 0 || slot >= 6) return;
+    g_meter_raw_v[slot] = raw_v;
+    g_meter_raw_a[slot] = raw_a;
+    g_meter_raw_w[slot] = raw_w;
+}
+
+// Store one freshly-read GOOD reading: latch values and timestamp it.
+// online=0 means a hard offline (unset IP) — clear the slot completely so it
+// shows as absent. A *failed read* must NOT come through here as online=0
+// (that would wipe the last-good value); use BL_MeterReadFailed instead.
+void BL_SetMeterReading(int slot, float v, float a, float w, float freq, int online) {
+    if (slot < 0 || slot >= 6) return;
+    if (online) {
+        g_meter[slot].v = v; g_meter[slot].a = a;
+        g_meter[slot].w = w; g_meter[slot].freq = freq;
+        g_meter[slot].online = 1;
+        g_meter[slot].last_ok = xTaskGetTickCount();
+    } else {
+        g_meter[slot].v = 0; g_meter[slot].a = 0;
+        g_meter[slot].w = 0; g_meter[slot].freq = 0;
+        g_meter[slot].online = 0;
+        g_meter[slot].last_ok = 0;
+        g_meter[slot].cf_wh = 0.0f; g_meter[slot].cf_ticks = 0; g_meter[slot].cf_valid = 0;
+    }
+}
+
+// Store a good reading plus this cycle's signed CF-CNT energy, in BOTH forms:
+// cf_wh (calibrated Wh, for the live power/energy pipeline) and cf_ticks (raw
+// signed pulse count, uncalibrated — the BL0942's native resolution, ~5116
+// ticks/Wh). The raw counter delta / wrap / scaling is done in the BL0942
+// driver; here we just latch both results and timestamp the slot.
 void BL_SetMeterReadingCf(int slot, float v, float a, float w, float freq,
-                          float cf_wh, int64_t cf_ticks, int cf_valid);
-/* Signed net Wh contributed by `slot` this sweep (0 if no valid delta). */
-float BL_MeterCfWh(int slot);
-int64_t BL_MeterCfTicks(int slot);
-/* A meter reported a CHIP RESET (MODE lost): the current 15-min interval's net
-   is tainted, so discard it and let counting restart from now. */
-void BL_MeterNoteReset(int slot);
-/* Zero every slot's per-cycle CF energy after a sweep has consumed it, so a
-   stalled/duplicate sweep cannot double-count. */
-void BL_MeterCfConsume(void);
-void BL_MeterReadFailed(int slot);     /* failed poll: keep last-good, age out */
-int  BL_MeterOnlineState(int slot);    /* 0 offline / 1 fresh / 2 stale-holding */
-int  BL_GetMeter(int slot, float *v, float *a, float *w, int *online);
-void BL_ProcessSweep(void);                                       /* once per full sweep */
+                          float cf_wh, int64_t cf_ticks, int cf_valid) {
+    if (slot < 0 || slot >= 6) return;
+    g_meter[slot].v = v; g_meter[slot].a = a;
+    g_meter[slot].w = w; g_meter[slot].freq = freq;
+    g_meter[slot].online = 1;
+    g_meter[slot].last_ok = xTaskGetTickCount();
+    g_meter[slot].cf_wh    = cf_valid ? cf_wh    : 0.0f;
+    g_meter[slot].cf_ticks = cf_valid ? cf_ticks : 0;
+    g_meter[slot].cf_valid = cf_valid ? 1 : 0;
+}
 
-void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState);
-void BL09XX_SaveEmeteringStatistics();
+// Signed net Wh contributed by this slot for the current sweep. Gated on both
+// cf_valid AND freshness: a slot that dropped past the hold window contributes
+// 0 rather than replaying a stale delta.
+float BL_MeterCfWh(int slot) {
+    if (slot < 0 || slot >= 6) return 0.0f;
+    if (!g_meter[slot].cf_valid) return 0.0f;
+    if (BL_MeterOnlineState(slot) == 0) return 0.0f;
+    return g_meter[slot].cf_wh;
+}
 
+// Signed net RAW ticks contributed by this slot for the current sweep —
+// uncalibrated, the BL0942's native pulse resolution. Same gating as
+// BL_MeterCfWh. Used for lossless lifetime accumulation (meter_acc): integer
+// ticks in, integer ticks out, no float accumulation ever, so recalibrating
+// later never touches stored history — only the read-time Wh conversion does.
+int64_t BL_MeterCfTicks(int slot) {
+    if (slot < 0 || slot >= 6) return 0;
+    if (!g_meter[slot].cf_valid) return 0;
+    if (BL_MeterOnlineState(slot) == 0) return 0;
+    return g_meter[slot].cf_ticks;
+}
+
+// Convert a signed raw tick count to Wh, for display only, using THIS METER's
+// own calibration coefficient (divide-mode, same convention as everywhere
+// else here). The stored ticks themselves are never touched by calibration —
+// only this read-time conversion is, so recalibrating never rewrites history.
+static float MeterAccToWh(int slot, int64_t ticks) {
+    int64_t mag = (ticks < 0) ? -ticks : ticks;
+    float pcal = BL_GetMeterPowerCal(slot);
+    float wh = ((float)mag / pcal) * 1638.4f * 256.0f / 3600.0f;
+    return (ticks < 0) ? -wh : wh;
+}
+
+// Clear per-cycle CF energy once the sweep has folded it into the totals.
+void BL_MeterCfConsume(void) {
+    int i;
+    for (i = 0; i < 6; i++) { g_meter[i].cf_wh = 0.0f; g_meter[i].cf_ticks = 0; g_meter[i].cf_valid = 0; }
+}
+
+// A grid meter reported a chip reset mid-interval. Everything accumulated for
+// the current 15-min interval is now untrustworthy (the counter it was derived
+// from restarted), so wipe the interval's running net and let it re-accumulate
+// from the next good delta. The lifetime totals are untouched — only the
+// in-progress period is discarded, exactly as if this partial period never
+// happened. The estimate re-derives from the zeroed net on the next tick.
+void BL_MeterNoteReset(int slot) {
+    (void)slot;
+    real_consumption = 0.0f;
+    real_export      = 0.0f;
+    net_energy       = 0.0f;
+    estimated_energy_period = 0;
+}
+
+// A read attempt failed but the meter may just have a comms hiccup: keep the
+// last-good value and let it age out via last_ok. No store change needed —
+// after METER_HOLD_TICKS the slot is reported offline automatically.
+void BL_MeterReadFailed(int slot) {
+    (void)slot;   // intentionally a no-op: do NOT overwrite last-good values
+}
+
+// Tri-state freshness for a slot: 0 = offline (never read, hard-offline, or
+// last good read older than the hold window), 1 = fresh, 2 = stale-but-holding
+// (within the hold window — show the value but flag a comms problem).
+int BL_MeterOnlineState(int slot) {
+    TickType_t age;
+    if (slot < 0 || slot >= 6) return 0;
+    if (!g_meter[slot].online)  return 0;
+    age = xTaskGetTickCount() - g_meter[slot].last_ok;
+    if (age <= METER_FRESH_TICKS) return 1;
+    if (age <= METER_HOLD_TICKS)  return 2;
+    return 0;
+}
+
+// Power for energy integration: last-good W while online (fresh or stale),
+// else 0 so a >30 s dropout can't keep injecting phantom energy.
+static float BL_MeterIntegW(int slot) {
+    return BL_MeterOnlineState(slot) ? g_meter[slot].w : 0.0f;
+}
+
+// Read back a slot for the /api_dash?req=meters payload. *online returns the
+// tri-state (0 offline / 1 fresh / 2 stale-holding).
+int BL_GetMeter(int slot, float *v, float *a, float *w, int *online) {
+    if (slot < 0 || slot >= 6) return 0;
+    if (v)      *v      = g_meter[slot].v;
+    if (a)      *a      = g_meter[slot].a;
+    if (w)      *w      = g_meter[slot].w;
+    if (online) *online = BL_MeterOnlineState(slot);
+    return 1;
+}
+
+// Called once per 10 s cycle (on the poller's 10th tick). Sums each meter's
+// signed CF-CNT delta for this cycle into the totals: the three grid phases
+// feed the net import/export pipeline, Solar A+B feed generation, and the ESS
+// slot splits charge/discharge by sign. Energy comes from the counter, not
+// from power*time.
+void BL_ProcessSweep(void) {
+    // Energy is now taken straight from each meter's free-running signed CF-CNT
+    // counter: the delta since the previous read (computed in the BL0942 driver)
+    // IS the true net Wh that flowed over the ~10 s cycle, immune to the
+    // instantaneous-watt-sign misattribution that power*time suffered on
+    // pulsating loads. A slot with no valid delta this cycle (just (re)connected,
+    // reset, or offline) contributes exactly 0 via BL_MeterCfWh().
+    //
+    // The instantaneous W is still summed for DISPLAY and for the 15-min
+    // estimate ("instant consumption reported by the chip"); it no longer
+    // drives the energy totals or the import/export split.
+
+    // --- Per-meter lifetime accumulators (signed RAW TICKS) for diagnosis ---
+    // Taken straight from each slot's signed CF-CNT tick delta (post-invert,
+    // pre-calibration) — integer accumulation, no float drift over the life
+    // of the device. Read BEFORE BL_MeterCfConsume() below clears the
+    // per-cycle deltas.
+    {
+        int i;
+        for (i = 0; i < 6; i++) meter_acc[i] += BL_MeterCfTicks(i);
+    }
+
+    // --- Utility (grid): L1+L2+L3 signed net ---
+    // Feeds the existing 15-min interval pipeline (real_consumption/real_export
+    // via BL_ProcessUpdate) AND the lifetime/today import+export counters, both
+    // split by sign into always-positive halves exactly like solar/ESS below.
+    {
+        float cons_wh = BL_MeterCfWh(0) + BL_MeterCfWh(1) + BL_MeterCfWh(2); // signed
+        float cons_w  = BL_MeterIntegW(0) + BL_MeterIntegW(1) + BL_MeterIntegW(2);
+        if (cons_wh >= 0.0f) { grid_imp_today +=  cons_wh; grid_imp_total +=  cons_wh; }
+        else                 { grid_exp_today += -cons_wh; grid_exp_total += -cons_wh; }
+        BL_ProcessUpdate(g_meter[0].v, g_meter[0].a, cons_w, g_meter[0].freq, cons_wh);
+    }
+
+    // --- Solar generation: Solar A + Solar B (generation-direction only) ---
+    {
+        float gen_wh = BL_MeterCfWh(3) + BL_MeterCfWh(4);
+        if (gen_wh < 0.0f) gen_wh = 0.0f;
+        gen_today += gen_wh; gen_total += gen_wh;
+        cur_solar += gen_wh;                      // this interval so far
+    }
+
+    // --- ESS (m6) signed: import/charge (>=0) vs export/discharge (<0) ---
+    {
+        float ess_wh = BL_MeterCfWh(5);
+        if (ess_wh >= 0.0f) { ess_imp_today +=  ess_wh; ess_imp_total +=  ess_wh; cur_ess_chg +=  ess_wh; }
+        else                { ess_exp_today += -ess_wh; ess_exp_total += -ess_wh; cur_ess_dis += -ess_wh; }
+    }
+
+    // Fold-in done: clear this cycle's deltas so nothing is counted twice.
+    BL_MeterCfConsume();
+
+    // --- 15-min flash persistence + midnight reset of "today" counters ---
+    // Totals accumulate in RAM every sweep and are flushed to NVS once per
+    // 15-min interval (matching the graph-matrix cadence, ~96 writes/day). At
+    // the local-midnight wrap the "today" counters reset and we flush again so
+    // a reboot just after midnight can't restore the old day.
+    if (TIME_IsTimeSynced()) {
+        static int last_msm  = -1;
+        static int last_qhr  = -1;
+        int msm = TIME_GetHour() * 60 + TIME_GetMinute();
+        int qhr = msm / 15;                         // 15-min interval of the day
+
+        if (last_msm >= 0 && msm < last_msm) {      // local-midnight wrap
+            int i;
+            // UNIFIED midnight roll — every "today" counter and every daily
+            // history now turns over here, on the one (local) midnight, instead
+            // of consumption rolling on a separate UTC day-change elsewhere.
+            // Consumption daily history shifts down a day, then today zeroes.
+            for (i = OBK_CONSUMPTION__DAILY_LAST; i > OBK_CONSUMPTION__DAILY_FIRST; i--)
+                sensors[i].lastReading = sensors[i - 1].lastReading;
+            sensors[OBK_CONSUMPTION_TODAY].lastReading = 0.0;
+            // Export daily history in parallel.
+            export_daily[3] = export_daily[2];
+            export_daily[2] = export_daily[1];
+            export_daily[1] = export_daily[0];
+            export_daily[0] = 0.0f;
+            // Counter-based "today" values (grid / solar / ESS).
+            grid_imp_today = 0; grid_exp_today = 0;
+            gen_today = 0; ess_imp_today = 0; ess_exp_today = 0;
+            actual_mday = TIME_GetMDay();
+            mark_energy_dirty();
+            BL09XX_SaveEmeteringStatistics();       // consumption + export history
+            COUNTERS_Save();                        // grid / solar / ESS counters
+        } else if (last_qhr >= 0 && qhr != last_qhr) {
+            COUNTERS_Save();                        // 15-min boundary
+        }
+        last_msm = msm;
+        last_qhr = qhr;
+    }
+}
+
+void BL_ProcessUpdate(float voltage, float current, float power, float frequency, float energyWh) {
+    int i;
+    time_t ntpTime;
+    struct tm *ltm;
+    char datetime[64];
+    float diff;
+
+    // Capture tick at the very top of the function. This timestamp is used
+    // for two purposes:
+    //   1. loop_interval_ms  – the wall-clock gap between successive calls
+    //      (replaces the old worst-case execution-time metric).
+    //   2. Instantaneous power – Wh delta / elapsed time → Watts.
+    TickType_t now_tick = xTaskGetTickCount();
+
+    // ====================================================================
+    // LOOP INTERVAL + INSTANTANEOUS POWER CALCULATION
+    // ====================================================================
+    // Both calculations are gated on having a previous timestamp to diff
+    // against, so they're silently skipped on the very first call.
+    if (last_processupdate_tick != 0)
+    {
+        // Time between this call and the previous one, in milliseconds.
+        loop_interval_ms = (unsigned int)(
+            (now_tick - last_processupdate_tick) * portTICK_PERIOD_MS);
+
+        // Instantaneous power derived from the Wh the meter accumulated
+        // over that same interval. Guard against zero elapsed time and
+        // non-finite energyWh (stray meter glitch).
+        if (loop_interval_ms > 0 && isfinite(energyWh))
+        {
+            float delta_s = loop_interval_ms / 1000.0f;
+
+            // energyWh is already SIGNED (+ import / - export) — the sign now
+            // comes from the CF-CNT delta, not from a single instantaneous watt
+            // reading. Convert Wh → W over the interval; no smoothing needed.
+            calc_power_w = (energyWh / delta_s) * 3600.0f;
+        }
+    }
+    last_processupdate_tick = now_tick;
+
+    if (TIME_IsTimeSynced())
+    {                                          
+        check_time = TIME_GetMinute();
+        check_hour = TIME_GetHour();
+
+        // ======================================================================================================
+        // 30-SECOND SAMPLER (Battery power + Solar power averages)
+        // ======================================================================================================
+        static TickType_t last_30s_tick = 0;
+        TickType_t current_sys_tick = xTaskGetTickCount();
+        if ((current_sys_tick - last_30s_tick) >= (30000 / portTICK_PERIOD_MS) || last_30s_tick == 0) {
+            last_30s_tick = current_sys_tick;
+
+            // Battery (ESS = meter slot 5): signed power, + charge / - discharge.
+            current_ess_pwr_accum += safe_int(BL_MeterIntegW(5));
+
+            // Solar = meter slots 3 + 4, generation only (clamp negatives to 0).
+            {
+                int solar_w = safe_int(BL_MeterIntegW(3)) + safe_int(BL_MeterIntegW(4));
+                if (solar_w < 0) solar_w = 0;
+                current_solar_pwr_accum += solar_w;
+            }
+            sample_count_30s++;
+        }
+
+        // ------------------------------------------------------------------------------------------------------
+        // THE 15-MINUTE RESET & CIRCULAR MATRIX LOGIC 
+        // ------------------------------------------------------------------------------------------------------
+        {
+            int minutes_since_midnight_tracker = (check_hour * 60) + check_time;
+            int interval_of_day_tracker = minutes_since_midnight_tracker / 15;
+            int current_matrix_index = interval_of_day_tracker % MATRIX_SIZE; 
+
+            if (last_matrix_index == -1) {
+                last_matrix_index = current_matrix_index;
+            }
+
+            if (current_matrix_index != last_matrix_index) {
+                float period_net;
+                int ess_avg_w, solar_period_wh;
+
+                consumption_matrix[last_matrix_index] = safe_int(real_consumption);
+                export_matrix[last_matrix_index] = safe_int(real_export);
+
+                // Push this COMPLETED interval into the last-hour rings. All
+                // values are positive at the saving stage (grid + ESS keep
+                // separate import/export halves; solar is one-way). "Energy last
+                // hour" for each is the sum of the 4 ring entries.
+                lh_grid_imp[lh_pos] = real_consumption;
+                lh_grid_exp[lh_pos] = real_export;
+                lh_solar[lh_pos]    = cur_solar;
+                lh_ess_chg[lh_pos]  = cur_ess_chg;
+                lh_ess_dis[lh_pos]  = cur_ess_dis;
+                lh_pos = (lh_pos + 1) % LH_SLOTS;
+
+                // Full-precision net Wh for this period (includes decimals).
+                period_net = real_consumption - real_export;
+
+                // Store the true net Wh for the period (sanity-clamped to
+                // a wide +/-9999.99 range, not the graph's display range).
+                // OBK_CONSUMPTION_LAST_HOUR and other consumers need the
+                // real value - only the graph gets a capped/scaled copy.
+                {
+                    float net_val = period_net;
+                    if (net_val > 9999.99f)  net_val = 9999.99f;
+                    if (net_val < -9999.99f) net_val = -9999.99f;
+                    net_matrix[last_matrix_index] = net_val;
+                }
+
+                // Graph display copy: cap to -150..+300 Wh (the system
+                // hovers near zero most of the time thanks to battery
+                // buffering; larger swings are rare and simply clipped
+                // here so the graph stays readable), then pack as
+                // (val+150)/2 -> single byte 0..225.
+                {
+                    int graph_val = safe_int(period_net);
+                    if (graph_val > 300)  graph_val = 300;
+                    if (graph_val < -150) graph_val = -150;
+                    net_graph_matrix[last_matrix_index] = (unsigned char)((graph_val + 150) / 2);
+                }
+
+                // Rolling last-hour grid IMPORT total = sum of the 4 most recent
+                // completed intervals' import halves (from the ring). Grid EXPORT,
+                // SOLAR and ESS charge/discharge last-hour totals are computed the
+                // same way and served via req=meters.
+                sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading = lh_sum4(lh_grid_imp);
+
+                // TOP panel: average battery power for the interval, signed
+                // (+ charge / - discharge), clamped to +/-500 W.
+                ess_avg_w = sample_count_30s ? (current_ess_pwr_accum / sample_count_30s) : 0;
+                if (ess_avg_w >  500) ess_avg_w =  500;
+                if (ess_avg_w < -500) ess_avg_w = -500;
+                ess_pwr_matrix[last_matrix_index] = ess_avg_w;
+
+                // BOTTOM panel: solar ENERGY generated this period (Wh) =
+                // average solar power (W) * 0.25 h. Clamped 0..150 to match the
+                // chart's -150..+150 band; drawn as a negative yellow overlay.
+                solar_period_wh = sample_count_30s
+                    ? ((current_solar_pwr_accum / sample_count_30s) / 4)
+                    : 0;
+                if (solar_period_wh > 150) solar_period_wh = 150;
+                if (solar_period_wh < 0)   solar_period_wh = 0;
+                solar_graph_matrix[last_matrix_index] = (unsigned char)solar_period_wh;
+
+                // Apply the period's net energy to the running totals.
+                if (period_net > 0) {
+                    sensors[OBK_CONSUMPTION_TOTAL].lastReading += period_net;
+                    sensors[OBK_CONSUMPTION_TODAY].lastReading += period_net;
+                } else if (period_net < 0) {
+                    float exp_wh = -period_net;
+                    sensors[OBK_GENERATION_TOTAL].lastReading += exp_wh;
+                    export_daily[0] += exp_wh;   /* track today's export separately */
+                }
+                mark_energy_dirty();
+
+                // Single save point for the whole module: right before the
+                // 15-minute accumulators are reset below.
+#if WINDOWS
+#elif PLATFORM_BL602
+#elif PLATFORM_W600 || PLATFORM_W800
+#elif PLATFORM_XR809
+#elif PLATFORM_BK7231N || PLATFORM_BK7231T
+                if (ota_progress() == -1)
+#endif
+                {
+                    lastSavedEnergyCounterValue = sensors[OBK_CONSUMPTION_TOTAL].lastReading;
+                    lastSavedGenerationCounterValue = sensors[OBK_GENERATION_TOTAL].lastReading;
+                    BL09XX_SaveEmeteringStatistics();
+                    lastConsumptionSaveStamp = xTaskGetTickCount();
+#if PLATFORM_ESPIDF
+                    /* Persist the graph matrices so the chart survives power
+                       cuts: net (48 B) + solar (48 B) + battery power
+                       (48 ints). Total NVS write: ~290 bytes every 15 min. */
+                    HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
+                                                   solar_graph_matrix, ess_pwr_matrix,
+                                                   MATRIX_SIZE, last_matrix_index,
+                                                   (unsigned int)TIME_GetCurrentTime());
+#endif
+                }
+
+                // Preserve charger/inverter state across this reset - it will
+                // be restored below so the control logic doesn't see a
+                // transient net_energy near 0 and flip state spuriously.
+                saved_persistent_state = persistent_state;
+                saved_solar_excess = solar_excess;
+                rollover_just_happened = 1;
+
+                // Device-side auto-revert of the "temporary" (purple) overrides:
+                // the temp manual charger mode falls back to AUTO, and a temp
+                // force-on diversion falls back to auto control. Works even if
+                // no browser is connected.
+                if (charger_c_auto == 0 && charger_manual_temp) {
+                    charger_c_auto = 1;
+                    charger_manual_temp = 0;
+                }
+                if (divert_user == 1) divert_user = 0;
+
+                real_export = 0;
+                real_consumption = 0;
+                net_energy = 0;
+                cur_solar = 0; cur_ess_chg = 0; cur_ess_dis = 0;
+                // Point-2 offline policy: any meter still offline at this
+                // boundary drops its CF-CNT baseline, so when it comes back in a
+                // LATER interval it re-baselines (starts fresh from the first new
+                // reading) instead of bridging a stale multi-interval gap. A brief
+                // dropout WITHIN an interval still self-heals via the free-running
+                // counter, so its energy is recovered when the meter returns.
+#if PLATFORM_ESPIDF
+                { int _m; for (_m = 0; _m < 6; _m++)
+                    if (BL_MeterOnlineState(_m) == 0) BL0942_InvalidateBaseline(_m); }
+#endif
+                // Keep the "15min Est." tile in sync with "Now" - both
+                // should drop to 0 together at the rollover, rather than
+                // est. showing the previous period's value until the next
+                // 30-second control tick recomputes it.
+                estimated_energy_period = 0;
+                
+                consumption_matrix[current_matrix_index] = 0;
+                export_matrix[current_matrix_index] = 0;
+                net_matrix[current_matrix_index] = 0;
+                net_graph_matrix[current_matrix_index] = (unsigned char)((0 + 150) / 2); // encodes 0 Wh
+                ess_pwr_matrix[current_matrix_index] = 0;
+                solar_graph_matrix[current_matrix_index] = 0;
+
+                current_ess_pwr_accum   = 0;
+                current_solar_pwr_accum = 0;
+                sample_count_30s = 0;
+
+                last_matrix_index = current_matrix_index;
+            }
+        }
+
+        if (!(check_time == old_time))
+        {
+            old_time = check_time;
+        }
+                                                         
+        net_energy = (real_consumption - real_export);                               
+
+        // ======================================================================================================
+        // CONTROL LOGIC (Target Export, Proportional-Integral Control)
+        // ======================================================================================================
+        static TickType_t last_control_tick = 0;
+        TickType_t current_tick = xTaskGetTickCount();
+        
+        if ((current_tick - last_control_tick) >= (30000 / portTICK_PERIOD_MS) || last_control_tick == 0) 
+        {
+            int min_in_block;
+            int check_time_estimate_mins;
+            char fallback_cmd[64];
+
+            last_control_tick = current_tick;
+            
+            min_in_block = check_time % 15; 
+            check_time_estimate_mins = 15 - min_in_block; 
+            if (check_time_estimate_mins <= 0) check_time_estimate_mins = 1;
+
+            // 1. Predict total Wh accumulated by the end of the 15-minute period
+            estimated_energy_period = safe_int(net_energy) + (safe_int(sensors[OBK_POWER].lastReading) * check_time_estimate_mins) / 60;
+
+            // 2. Update Base Solar State
+            if (net_energy < -((float)target_export + 10.0f)) {
+                solar_available = 1;
+            } else if (net_energy > 10.0f) {
+                solar_available = 0;
+            }
+
+            // Consume the rollover flag here so it doesn't linger if
+            // charger_c_auto is 0 (manual mode) on this tick.
+            int handle_rollover = rollover_just_happened;
+            rollover_just_happened = 0;
+
+            // ====================================================================
+            // ISOLATED LOGIC BLOCK (AUTO / MANUAL)
+            // ====================================================================
+            if (charger_c_auto == 1) {
+                if (handle_rollover) {
+                    // A 15-minute reset happened since the last control tick.
+                    // net_energy is based on a freshly-zeroed (very short)
+                    // window and isn't representative yet - skip the
+                    // decision this cycle and keep whatever state the
+                    // charger/inverter was already in. The next control
+                    // tick (30s later) will have a real sample to evaluate.
+                    persistent_state = saved_persistent_state;
+                    solar_excess = saved_solar_excess;
+                } else if (solar_available == 0) {
+                    if (net_energy < -10.0f) {
+                        persistent_state = 0;
+                    } else if (net_energy > 5.0f) {
+                        persistent_state = 5;
+                    }
+                    solar_excess = 0; 
+                } 
+                else {
+                    if (net_energy > -((float)target_export)) {
+                        solar_excess = 0; 
+                    } else {
+                        int excess_wh, error_w, pwm_step;
+
+                        excess_wh = -(estimated_energy_period + target_export); 
+                        
+                        // Convert Wh error into Watts over the remaining time
+                        error_w = (excess_wh * 60) / check_time_estimate_mins; 
+                        
+                        // Convert Watts to PWM step (10W = 1 PWM unit) dampened by half
+                        pwm_step = (error_w / 10) / 2; 
+                        
+                        solar_excess += pwm_step;
+                    }
+                    
+                    // Enforce absolute constraints
+                    if (solar_excess > 82) solar_excess = 82;
+                    if (solar_excess < 0) solar_excess = 0;
+                    
+                    persistent_state = 18 + solar_excess;
+                    
+                    int active_max = target_power_auto;
+                    if (active_max < 18) active_max = 100;
+                    
+                    if (persistent_state > active_max) persistent_state = active_max;
+                }
+                
+                dump_load_relay[5] = persistent_state;
+
+                /* Fire command to each configured charger IP */
+                { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
+                    const char *_cip = UART_TCP_GetChargerIP(_ci);
+                    if (!_cip) continue;
+                    char fallback_cmd[96];
+                    snprintf(fallback_cmd, sizeof(fallback_cmd),
+                             "SendGet http://%s/cm?cmnd=Channel3%%20%d",
+                             _cip, dump_load_relay[5]);
+                  //  CMD_ExecuteCommand(fallback_cmd, 0);
+                }}
+                ApplyDumpLoadGPIO(dump_load_relay[5]);
+            } // END OF AUTO BLOCK
+        }
+
+        // Diversion (.22 load) control — evaluated every loop while time is synced
+        // (5 s charger delay + hysteresis handled inside).
+        evaluate_diversion();
+    } 
+
+    sensors[OBK_VOLTAGE].lastReading = voltage;
+    sensors[OBK_CURRENT].lastReading = current;
+    sensors[OBK_POWER].lastReading = power;
+    sensors[OBK_POWER_APPARENT].lastReading = sensors[OBK_VOLTAGE].lastReading * sensors[OBK_CURRENT].lastReading;
+    sensors[OBK_POWER_REACTIVE].lastReading = (safe_int(net_energy));
+    sensors[OBK_POWER_FACTOR].lastReading = (sensors[OBK_POWER_APPARENT].lastReading == 0 ? 1 : sensors[OBK_POWER].lastReading / sensors[OBK_POWER_APPARENT].lastReading);
+
+    lastReadingFrequency = frequency;
+// --------------------------------------
+    // Final backstop: even though the BL0942 driver guards energyWh at the
+    // source, never let a non-finite value into the period accumulators
+    // (they feed the lifetime totals, which would be permanently poisoned).
+    if (!isfinite(energyWh)) {
+        energyWh = 0.0f;
+    }
+    // Import/export is now decided by the SIGN OF THE ENERGY that actually
+    // flowed this cycle (CF-CNT delta), not by one instantaneous watt sample.
+    // real_export is kept as a positive magnitude (period_net = consumption -
+    // export), so we add the negated value on the export branch.
+    if (energyWh >= 0.0f)
+    {
+        real_consumption += energyWh;
+    }
+    else
+    {
+        if (CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE))
+        {
+            real_export += -energyWh;
+        }
+    }
+//---------------------------------------
+
+    if (TIME_IsTimeSynced()) {
+        ntpTime = (time_t)TIME_GetCurrentTime();
+        ltm = gmtime(&ntpTime);
+        (void)ltm;
+        if (ConsumptionResetTime == 0)
+            ConsumptionResetTime = (time_t)ntpTime;
+        if (actual_mday == -1)
+            actual_mday = TIME_GetMDay();
+        // Daily "today"/history rollover now happens ONCE, at local midnight,
+        // in BL_ProcessSweep (unified with the grid/solar/ESS counters) - not
+        // here on a separate UTC day-change.
+    }
+
+    for(i = OBK__FIRST; i <= OBK__LAST; i++)
+    {
+        diff = sensors[i].lastSentValue - sensors[i].lastReading;
+        if ( ((fabsf(diff) > sensors[i].changeSendThreshold) &&
+              (sensors[i].noChangeFrame >= changeDoNotSendMinFrames)) ||
+            (sensors[i].noChangeFrame >= changeSendAlwaysFrames) )
+        {
+            enum EventCode eventChangeCode;
+            sensors[i].noChangeFrame = 0;
+
+            switch (i) {
+            case OBK_VOLTAGE:                                   eventChangeCode = CMD_EVENT_CHANGE_VOLTAGE;                       break;
+            case OBK_CURRENT:                                   eventChangeCode = CMD_EVENT_CHANGE_CURRENT;                       break;
+            case OBK_POWER:                                     eventChangeCode = CMD_EVENT_CHANGE_POWER;                         break;
+            case OBK_CONSUMPTION_TOTAL:                         eventChangeCode = CMD_EVENT_CHANGE_CONSUMPTION_TOTAL;             break;
+            case OBK_GENERATION_TOTAL:                          eventChangeCode = CMD_EVENT_CHANGE_GENERATION_TOTAL;              break;
+            case OBK_CONSUMPTION_LAST_HOUR:                     eventChangeCode = CMD_EVENT_CHANGE_CONSUMPTION_LAST_HOUR;         break;
+            default:                                            eventChangeCode = CMD_EVENT_NONE;                                 break;
+            }
+            switch (eventChangeCode) {
+            case CMD_EVENT_NONE:
+                break;
+            case CMD_EVENT_CHANGE_CURRENT: 
+            {
+                int prev_mA = sensors[i].lastSentValue * 1000;
+                int now_mA = sensors[i].lastReading * 1000;
+                EventHandlers_ProcessVariableChange_Integer(eventChangeCode, prev_mA,now_mA);
+                break;
+            }
+            default:
+                EventHandlers_ProcessVariableChange_Integer(eventChangeCode, sensors[i].lastSentValue, sensors[i].lastReading);
+                break;
+            }
+
+            if (MQTT_IsReady() == true)
+            {
+                sensors[i].lastSentValue = sensors[i].lastReading;
+                if (i == OBK_CONSUMPTION_CLEAR_DATE) {
+                    sensors[i].lastReading = ConsumptionResetTime; 
+                    ltm = gmtime(&ConsumptionResetTime);
+                    if (NTP_GetTimesZoneOfsSeconds()>0)
+                    {
+                        snprintf(datetime, sizeof(datetime), "%04i-%02i-%02iT%02i:%02i+%02i:%02i",
+                                 ltm->tm_year+1900, ltm->tm_mon+1, ltm->tm_mday, ltm->tm_hour, ltm->tm_min,
+                                 NTP_GetTimesZoneOfsSeconds()/3600, (NTP_GetTimesZoneOfsSeconds()/60) % 60);
+                    } else {
+                        snprintf(datetime, sizeof(datetime), "%04i-%02i-%02iT%02i:%02i-%02i:%02i",
+                                 ltm->tm_year+1900, ltm->tm_mon+1, ltm->tm_mday, ltm->tm_hour, ltm->tm_min,
+                                 abs(NTP_GetTimesZoneOfsSeconds()/3600), (abs(NTP_GetTimesZoneOfsSeconds())/60) % 60);
+                    }
+                    MQTT_PublishMain_StringString(sensors[i].names.name_mqtt, datetime, 0);
+                } else { 
+                    float val = sensors[i].lastReading;
+                    if (sensors[i].names.units == UNIT_WH) val = BL_ChangeEnergyUnitIfNeeded(val);
+                    MQTT_PublishMain_StringFloat(sensors[i].names.name_mqtt, val, sensors[i].rounding_decimals, 0);
+                }
+                stat_updatesSent++;
+            }
+        } else {
+            sensors[i].noChangeFrame++;
+            stat_updatesSkipped++;
+        }
+    }       
+}
+
+void BL_Shared_Init(void)
+{
+    int i;
+    ENERGY_METERING_DATA data;
+
+    // Restore the dashboard "System Configuration" (meter IPs, MACs,
+    // inv2/bypass octets, boost power) and the persisted sliders/threshold
+    // from flash before anything reads them.
+    SETTINGS_Load();
+    COUNTERS_Load();
+
+    for(i = OBK__FIRST; i <= OBK__LAST; i++)
+    {
+        sensors[i].noChangeFrame = 0;
+        sensors[i].lastReading = 0;
+    }
+
+    // net_graph_matrix encodes Wh as (val+150)/2, so a raw 0 (the default
+    // zero-init) decodes to -150 Wh, not 0 Wh. Initialize every slot to
+    // the byte that represents 0 Wh so an empty history shows a flat
+    // zero line instead of a full -150 Wh plateau.
+    for (i = 0; i < MATRIX_SIZE; i++) {
+        net_graph_matrix[i] = (unsigned char)((0 + 150) / 2);
+    }
+
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER, "Read ENERGYMETER status values. sizeof(ENERGY_METERING_DATA)=%d\n", sizeof(ENERGY_METERING_DATA));
+
+    HAL_GetEnergyMeterStatus(&data);
+    sensors[OBK_CONSUMPTION_TOTAL].lastReading    = data.TotalConsumption;
+    sensors[OBK_GENERATION_TOTAL].lastReading     = HAL_FlashVars_GetEnergyExportTotal();
+    sensors[OBK_CONSUMPTION_TODAY].lastReading    = data.TodayConsumpion;
+    sensors[OBK_CONSUMPTION_YESTERDAY].lastReading = data.YesterdayConsumption;
+    actual_mday = data.actual_mday;
+    lastSavedEnergyCounterValue = data.TotalConsumption;
+    lastSavedGenerationCounterValue = sensors[OBK_GENERATION_TOTAL].lastReading;
+    sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading = data.ConsumptionHistory[0];
+    sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading = data.ConsumptionHistory[1];
+    ConsumptionResetTime = data.ConsumptionResetTime;
+    ConsumptionSaveCounter = data.save_counter;
+    lastConsumptionSaveStamp = xTaskGetTickCount();
+
+    /* Load daily export history */
+    export_daily[0] = HAL_FlashVars_GetEnergyExportDaily(0);
+    export_daily[1] = HAL_FlashVars_GetEnergyExportDaily(1);
+    export_daily[2] = HAL_FlashVars_GetEnergyExportDaily(2);
+    export_daily[3] = HAL_FlashVars_GetEnergyExportDaily(3);
+
+    /* Restore 12-hour graph from NVS so it survives power cuts */
+    {
+        int saved_idx = 0;
+        unsigned int saved_ts = 0;
+        if (HAL_FlashVars_LoadGraphMatrices(net_graph_matrix,
+                                            solar_graph_matrix, ess_pwr_matrix,
+                                            MATRIX_SIZE, &saved_idx, &saved_ts)) {
+            last_matrix_index = saved_idx;
+            addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                      "Graph matrix restored from NVS (idx=%d)\n", saved_idx);
+        }
+        /* If load failed: matrices stay zero-init — correct for a fresh start */
+    }
+
+#if PLATFORM_ESPIDF
+    // ---- Actuation pins: programmatic OBK role + channel assignment ----
+    // This is the whole trick: instead of raw gpio/ledc calls (which fight
+    // the role system) or asking the user to configure pins in the web UI,
+    // we assign the roles ourselves at every boot. From here on the pins
+    // are owned and driven by OBK's proven role/channel machinery, and all
+    // our control code does is CHANNEL_Set().
+    // Channel must be set BEFORE role: applying a role reads the pin's
+    // channel to push the current value out to hardware immediately.
+    {
+        PIN_SetPinChannelForPinIndex(GPIO_CHARGER_ENABLE, CH_CHARGER_ENABLE);
+        PIN_SetPinRoleForPinIndex(GPIO_CHARGER_ENABLE, IOR_Relay);
+
+        PIN_SetPinChannelForPinIndex(GPIO_CHARGER_PWM, CH_CHARGER_PWM);
+        PIN_SetPinRoleForPinIndex(GPIO_CHARGER_PWM, IOR_PWM);
+
+        PIN_SetPinChannelForPinIndex(GPIO_RELAY_ECON, CH_RELAY_ECON);
+        PIN_SetPinRoleForPinIndex(GPIO_RELAY_ECON, IOR_PWM);
+
+        // Onboard LED: IOR_PWM_n (inverted PWM) on the SAME channel as the
+        // economiser. Channel_OnChanged pushes every CH_RELAY_ECON change to
+        // both pins — GPIO0 direct, GPIO8 inverted — so the active-LOW LED
+        // mirrors the inverter duty automatically with zero extra writes.
+        PIN_SetPinChannelForPinIndex(GPIO_INVERTER_LED, CH_RELAY_ECON);
+        PIN_SetPinRoleForPinIndex(GPIO_INVERTER_LED, IOR_PWM_n);
+
+        // Known startup state: everything off.
+        CHANNEL_Set(CH_CHARGER_ENABLE, 0, CHANNEL_SET_FLAG_FORCE | CHANNEL_SET_FLAG_SILENT);
+        CHANNEL_Set(CH_CHARGER_PWM,    0, CHANNEL_SET_FLAG_FORCE | CHANNEL_SET_FLAG_SILENT);
+        CHANNEL_Set(CH_RELAY_ECON,     0, CHANNEL_SET_FLAG_FORCE | CHANNEL_SET_FLAG_SILENT);
+
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "actuation init: GPIO%d=Relay ch%d, GPIO%d=PWM ch%d, GPIO%d=PWM ch%d, GPIO%d=PWM_n ch%d (LED mirror)\n",
+                  GPIO_CHARGER_ENABLE, CH_CHARGER_ENABLE,
+                  GPIO_CHARGER_PWM,    CH_CHARGER_PWM,
+                  GPIO_RELAY_ECON,     CH_RELAY_ECON,
+                  GPIO_INVERTER_LED,   CH_RELAY_ECON);
+    }
+#endif
+
+    CMD_RegisterCommand("SetDumpLoad", BL09XX_SetDumpLoad, NULL);
+#if PLATFORM_ESPIDF
+    CMD_RegisterCommand("TestChargerPinsRaw", BL09XX_TestChargerPinsRaw, NULL);
+    CMD_RegisterCommand("TestChargerPinsRegister", BL09XX_TestChargerPinsRegister, NULL);
+#endif
+    CMD_RegisterCommand("EnergyCntReset", BL09XX_ResetEnergyCounter, NULL);
+    CMD_RegisterCommand("ToggleAuto", BL09XX_ToggleAuto, NULL);
+    CMD_RegisterCommand("SetTargetPower", BL09XX_SetTargetPower, NULL);
+    CMD_RegisterCommand("SetTargetExport", BL09XX_SetTargetExport, NULL);
+    CMD_RegisterCommand("SetChargerMode", BL09XX_SetChargerMode, NULL);
+    CMD_RegisterCommand("SetDivertUser", BL09XX_SetDivertUser, NULL);
+    CMD_RegisterCommand("SetDivertThreshold", BL09XX_SetDivertThreshold, NULL);
+    CMD_RegisterCommand("SetMeterIP", BL09XX_SetMeterIP, NULL);
+    CMD_RegisterCommand("SetMeterInvert", BL09XX_SetMeterInvert, NULL);
+    CMD_RegisterCommand("SetMeterVoltCal", BL09XX_SetMeterVoltCal, NULL);
+    CMD_RegisterCommand("SetMeterCurrentCal", BL09XX_SetMeterCurrentCal, NULL);
+    CMD_RegisterCommand("SetMeterPowerCal", BL09XX_SetMeterPowerCal, NULL);
+    CMD_RegisterCommand("ClearMeteringData", BL09XX_ClearMeteringData, NULL);
+    CMD_RegisterCommand("SetBmsMAC", BL09XX_SetBmsMAC, NULL);
+    CMD_RegisterCommand("SetBms2MAC", BL09XX_SetBms2MAC, NULL);
+    CMD_RegisterCommand("SetInv2IP", BL09XX_SetInv2IP, NULL);
+    CMD_RegisterCommand("SetBypassIP", BL09XX_SetBypassIP, NULL);
+    CMD_RegisterCommand("SetBoostPower", BL09XX_SetBoostPower, NULL);
+    CMD_RegisterCommand("SetInv2", BL09XX_SetInv2, NULL);
+    CMD_RegisterCommand("SaveCfg", BL09XX_SaveCfg, NULL);
+    CMD_RegisterCommand("SetChargerCutoff", BL09XX_SetChargerCutoff, NULL);
+    CMD_RegisterCommand("SetInverterCutoff", BL09XX_SetInverterCutoff, NULL);
+    CMD_RegisterCommand("VCPPublishThreshold", BL09XX_VCPPublishThreshold, NULL);
+    CMD_RegisterCommand("VCPPrecision", BL09XX_VCPPrecision, NULL);
+    CMD_RegisterCommand("VCPPublishIntervals", BL09XX_VCPPublishIntervals, NULL);
+}
+
+float DRV_GetReading(energySensor_t type) 
+{
+    return sensors[type].lastReading;
+}
+
+energySensorNames_t* DRV_GetEnergySensorNames(energySensor_t type)
+{
+    return &sensors[type].names;
+}
+
+// ====================================================================
+// JSON API ENDPOINT
+// ====================================================================
+int http_fn_api_dash(http_request_t *request) {
+    const char *req_param = NULL;
+    if (request->url) req_param = strstr(request->url, "req=");
+
+    http_setup(request, "application/json");
+
+    char buf[640];   /* headroom for the extended req=meters counter payload */
+    int  pos     = 0;
+    int  has_ntp = CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE) && TIME_IsTimeSynced();
+
+#define B(...) pos += snprintf(buf + pos, sizeof(buf) - pos, __VA_ARGS__)
+
+    B("{");
+
+    // ---- CORE (default or req=core) ----
+    // Packed binary layout (26 bytes), little-endian, base64-encoded:
+    //   bytes 0-1:  voltage   (uint16 ×10,  e.g. 2303 = 230.3 V)
+    //   bytes 2-3:  current   (uint16 ×100, e.g. 1500 = 15.00 A)
+    //   bytes 4-5:  power     (int16, whole W, signed)
+    //   bytes 6-7:  calc_pwr  (int16, whole W, signed)
+    //   bytes 8-9:  bal       (int16, whole Wh, signed)
+    //   bytes 10-11:est       (int16, whole Wh, signed)
+    //   byte  12:   dmp       (uint8, 0/5/18..100 — current charger output)
+    //   byte  13:   mode      (uint8, 0=AUTO, 1=MANUAL temp, 2=MANUAL locked)
+    //   byte  14:   t_pwr_a   (uint8, 0..100 — AUTO ceiling)
+    //   byte  15:   t_exp     (uint8, 0..100 — export Wh, global)
+    //   byte  16:   clk_h     (uint8, 0..23)
+    //   byte  17:   clk_m     (uint8, 0..59)
+    //   bytes 18-19:loop_ms   (uint16, ms between BL_ProcessUpdate calls)
+    //   bytes 20-21:ev        (uint16, energy version counter)
+    //   byte  22:   flags     (uint8, bit0 = has_ntp, bit1 = divert_is_on)
+    //   byte  23:   t_pwr_m   (uint8, 0..100 — MANUAL charger output)
+    //   byte  24:   div_user  (uint8, 0=auto, 1=force-on temp, 2=force-on locked)
+    //   byte  25:   div_thr   (uint8, Wh — diversion ON threshold)
+    // chg_v/chg_c/pwr_cls/bal_cls/est_cls are all derived client-side from
+    // the values themselves, saving further bytes.
+    if (!req_param || strncmp(req_param, "req=core", 8) == 0) {
+        unsigned char raw[27];
+        char          b64[((27 + 2) / 3) * 4 + 1];
+        int           b64_len;
+        int           dmp = dump_load_relay[5];
+        int           mode_v = charger_c_auto ? 0 : (charger_manual_temp ? 1 : 2);
+        int           soc_v = 255;   // 255 = BMS offline / unknown
+#ifdef ENABLE_JK_BMS
+        { jk_bms_data_t bd; if (JKBMS_GetData(&bd)) { soc_v = bd.soc; } }
+#endif
+        if (soc_v < 0)   soc_v = 0;
+        if (soc_v > 254) soc_v = (soc_v == 255 ? 255 : 254);
+
+        unsigned int volt_v  = (unsigned int)(sensors[OBK_VOLTAGE].lastReading * 10.0f  + 0.5f);
+        unsigned int curr_v  = (unsigned int)(sensors[OBK_CURRENT].lastReading * 100.0f + 0.5f);
+        int          pwr_v   = safe_int(sensors[OBK_POWER].lastReading);
+        int          cpwr_v  = safe_int(calc_power_w);
+        int          bal_v   = safe_int(sensors[OBK_POWER_REACTIVE].lastReading);
+        int          est_v   = estimated_energy_period;
+        unsigned int lms_v   = loop_interval_ms;
+        unsigned int ev_v    = (unsigned int)(energy_version & 0xFFFF);
+
+        if (volt_v > 0xFFFF) volt_v = 0xFFFF;
+        if (curr_v > 0xFFFF) curr_v = 0xFFFF;
+        if (pwr_v  >  32767) pwr_v  =  32767;
+        if (pwr_v  < -32768) pwr_v  = -32768;
+        if (cpwr_v >  32767) cpwr_v =  32767;
+        if (cpwr_v < -32768) cpwr_v = -32768;
+        if (bal_v  >  32767) bal_v  =  32767;
+        if (bal_v  < -32768) bal_v  = -32768;
+        if (est_v  >  32767) est_v  =  32767;
+        if (est_v  < -32768) est_v  = -32768;
+        if (lms_v  > 0xFFFF) lms_v  = 0xFFFF;
+
+        raw[0]  = (unsigned char)(volt_v  & 0xFF);
+        raw[1]  = (unsigned char)((volt_v  >> 8) & 0xFF);
+        raw[2]  = (unsigned char)(curr_v  & 0xFF);
+        raw[3]  = (unsigned char)((curr_v  >> 8) & 0xFF);
+        raw[4]  = (unsigned char)((unsigned short)pwr_v   & 0xFF);
+        raw[5]  = (unsigned char)(((unsigned short)pwr_v  >> 8) & 0xFF);
+        raw[6]  = (unsigned char)((unsigned short)cpwr_v  & 0xFF);
+        raw[7]  = (unsigned char)(((unsigned short)cpwr_v >> 8) & 0xFF);
+        raw[8]  = (unsigned char)((unsigned short)bal_v   & 0xFF);
+        raw[9]  = (unsigned char)(((unsigned short)bal_v  >> 8) & 0xFF);
+        raw[10] = (unsigned char)((unsigned short)est_v   & 0xFF);
+        raw[11] = (unsigned char)(((unsigned short)est_v  >> 8) & 0xFF);
+        raw[12] = (unsigned char)(dmp < 0 ? 0 : dmp > 255 ? 255 : dmp);
+        raw[13] = (unsigned char)mode_v;
+        raw[14] = (unsigned char)(target_power_auto   < 0 ? 0 : target_power_auto   > 255 ? 255 : target_power_auto);
+        raw[15] = (unsigned char)(target_export       < 0 ? 0 : target_export       > 255 ? 255 : target_export);
+        raw[16] = (unsigned char)TIME_GetHour();
+        raw[17] = (unsigned char)TIME_GetMinute();
+        raw[18] = (unsigned char)(lms_v  & 0xFF);
+        raw[19] = (unsigned char)((lms_v  >> 8) & 0xFF);
+        raw[20] = (unsigned char)(ev_v   & 0xFF);
+        raw[21] = (unsigned char)((ev_v   >> 8) & 0xFF);
+        raw[22] = (unsigned char)((has_ntp ? 1 : 0) | (divert_is_on ? 2 : 0));
+        raw[23] = (unsigned char)(target_power_manual < 0 ? 0 : target_power_manual > 255 ? 255 : target_power_manual);
+        raw[24] = (unsigned char)(divert_user < 0 ? 0 : divert_user > 2 ? 2 : divert_user);
+        raw[25] = (unsigned char)(divert_threshold < 0 ? 0 : divert_threshold > 255 ? 255 : divert_threshold);
+        raw[26] = (unsigned char)soc_v;
+
+        b64_len = base64_encode(raw, sizeof(raw), b64);
+        b64[b64_len] = '\0';
+        B("\"c\":\"%s\"", b64);
+    }
+
+    // ---- ENERGY TOTALS (req=energy) ----
+    // Packed binary layout (19 bytes), little-endian, base64-encoded:
+    //   bytes 0-3:   econs  (uint32, kWh*100)  -- lifetime import (consumption)
+    //   bytes 4-7:   egen   (uint32, kWh*100)  -- lifetime export (generation)
+    //   bytes 8-9:   clh    (uint16, kWh*100)  -- import last hour
+    //   bytes 10-11: ctoday (uint16, kWh*100)
+    //   bytes 12-13: cyest  (uint16, kWh*100)
+    //   bytes 14-15: c2d    (uint16, kWh*100)
+    //   bytes 16-17: c3d    (uint16, kWh*100)
+    //   bytes 18-19: elh    (uint16, kWh*100)  -- export last hour
+    //   bytes 20-21: etoday (uint16, kWh*100)
+    //   bytes 22-23: eyest  (uint16, kWh*100)
+    //   bytes 24-25: e2d    (uint16, kWh*100)
+    //   bytes 26-27: e3d    (uint16, kWh*100)
+    // The browser divides by 100 and renders import/export columns itself.
+    else if (strncmp(req_param, "req=energy", 10) == 0 && has_ntp) {
+        unsigned char raw[28];
+        char          b64[((28 + 2) / 3) * 4 + 1];
+        int           b64_len;
+
+        /* Export last hour: sum of the last 4 fifteen-minute export slots,
+           mirroring how OBK_CONSUMPTION_LAST_HOUR is built for import. */
+        float elh_wh = 0.0f;
+        { int idx = (last_matrix_index < 0) ? 0 : last_matrix_index, k;
+          for (k = 0; k < 4; k++) {
+              elh_wh += (float)export_matrix[idx];
+              idx = (idx - 1 + MATRIX_SIZE) % MATRIX_SIZE;
+          } }
+
+        unsigned long econs_v  = (unsigned long)(0.1 * sensors[OBK_CONSUMPTION_TOTAL].lastReading + 0.5f);
+        unsigned long egen_v   = (unsigned long)(0.1 * sensors[OBK_GENERATION_TOTAL].lastReading + 0.5f);
+        unsigned int  clh_v    = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_LAST_HOUR].lastReading + 0.5f);
+        unsigned int  ctoday_v = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_TODAY].lastReading + 0.5f);
+        unsigned int  cyest_v  = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_YESTERDAY].lastReading + 0.5f);
+        unsigned int  c2d_v    = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading + 0.5f);
+        unsigned int  c3d_v    = (unsigned int)(0.1 * sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading + 0.5f);
+        unsigned int  elh_v    = (unsigned int)(0.1 * elh_wh + 0.5f);
+        unsigned int  etoday_v = (unsigned int)(0.1 * export_daily[0] + 0.5f);
+        unsigned int  eyest_v  = (unsigned int)(0.1 * export_daily[1] + 0.5f);
+        unsigned int  e2d_v    = (unsigned int)(0.1 * export_daily[2] + 0.5f);
+        unsigned int  e3d_v    = (unsigned int)(0.1 * export_daily[3] + 0.5f);
+
+        if (clh_v    > 0xFFFF) clh_v    = 0xFFFF;
+        if (ctoday_v > 0xFFFF) ctoday_v = 0xFFFF;
+        if (cyest_v  > 0xFFFF) cyest_v  = 0xFFFF;
+        if (c2d_v    > 0xFFFF) c2d_v    = 0xFFFF;
+        if (c3d_v    > 0xFFFF) c3d_v    = 0xFFFF;
+        if (elh_v    > 0xFFFF) elh_v    = 0xFFFF;
+        if (etoday_v > 0xFFFF) etoday_v = 0xFFFF;
+        if (eyest_v  > 0xFFFF) eyest_v  = 0xFFFF;
+        if (e2d_v    > 0xFFFF) e2d_v    = 0xFFFF;
+        if (e3d_v    > 0xFFFF) e3d_v    = 0xFFFF;
+
+        raw[0]  = (unsigned char)(econs_v & 0xFF);
+        raw[1]  = (unsigned char)((econs_v >> 8) & 0xFF);
+        raw[2]  = (unsigned char)((econs_v >> 16) & 0xFF);
+        raw[3]  = (unsigned char)((econs_v >> 24) & 0xFF);
+        raw[4]  = (unsigned char)(egen_v & 0xFF);
+        raw[5]  = (unsigned char)((egen_v >> 8) & 0xFF);
+        raw[6]  = (unsigned char)((egen_v >> 16) & 0xFF);
+        raw[7]  = (unsigned char)((egen_v >> 24) & 0xFF);
+        raw[8]  = (unsigned char)(clh_v & 0xFF);
+        raw[9]  = (unsigned char)((clh_v >> 8) & 0xFF);
+        raw[10] = (unsigned char)(ctoday_v & 0xFF);
+        raw[11] = (unsigned char)((ctoday_v >> 8) & 0xFF);
+        raw[12] = (unsigned char)(cyest_v & 0xFF);
+        raw[13] = (unsigned char)((cyest_v >> 8) & 0xFF);
+        raw[14] = (unsigned char)(c2d_v & 0xFF);
+        raw[15] = (unsigned char)((c2d_v >> 8) & 0xFF);
+        raw[16] = (unsigned char)(c3d_v & 0xFF);
+        raw[17] = (unsigned char)((c3d_v >> 8) & 0xFF);
+        raw[18] = (unsigned char)(elh_v & 0xFF);
+        raw[19] = (unsigned char)((elh_v >> 8) & 0xFF);
+        raw[20] = (unsigned char)(etoday_v & 0xFF);
+        raw[21] = (unsigned char)((etoday_v >> 8) & 0xFF);
+        raw[22] = (unsigned char)(eyest_v & 0xFF);
+        raw[23] = (unsigned char)((eyest_v >> 8) & 0xFF);
+        raw[24] = (unsigned char)(e2d_v & 0xFF);
+        raw[25] = (unsigned char)((e2d_v >> 8) & 0xFF);
+        raw[26] = (unsigned char)(e3d_v & 0xFF);
+        raw[27] = (unsigned char)((e3d_v >> 8) & 0xFF);
+
+        b64_len = base64_encode(raw, sizeof(raw), b64);
+        b64[b64_len] = '\0';
+
+        B("\"e\":\"%s\",\"ev\":%d", b64, energy_version);
+    }
+
+    // ---- BMS (req=bms) ----
+    // {"b":"<base64 23 bytes>","mac":"AA:BB:.."}  -- iOS-5 safe (XHR + base64).
+    // Packed layout (23 bytes), little-endian:
+    //   byte 0:     flags (bit0 chg, bit1 dis, bit2 bal, bit3 connected)
+    //   byte 1:     soc (0..100)
+    //   bytes 2-3:  voltage   (uint16 ×100)
+    //   bytes 4-5:  current   (int16  ×100, signed)
+    //   bytes 6-7:  remaining (uint16 ×10, Ah)
+    //   bytes 8-9:  full      (uint16 ×10, Ah)
+    //   bytes 10-11:cell_min  (uint16 ×1000, V)
+    //   bytes 12-13:cell_max  (uint16 ×1000, V)
+    //   bytes 14-15:temp_1    (int16  ×10, signed)
+    //   bytes 16-17:temp_2    (int16  ×10, signed)
+    //   bytes 18-19:temp_mos  (int16  ×10, signed)
+    //   bytes 20-21:bal_curr  (int16  ×100, signed)
+    //   byte 22:    cell_count
+    else if (req_param && strncmp(req_param, "req=bms", 7) == 0) {
+        unsigned char raw[23];
+        char          b64[((23 + 2) / 3) * 4 + 1];
+        int           b64_len, connected = 0;
+        const char   *mac = "--";
+
+        memset(raw, 0, sizeof(raw));
+#ifdef ENABLE_JK_BMS
+        {
+            jk_bms_data_t d;
+            mac = JKBMS_GetMac();
+            if (JKBMS_GetData(&d)) {
+                int   soc   = d.soc;
+                if (soc < 0)   soc = 0;
+                if (soc > 100) soc = 100;
+                int   volt  = (int)(d.total_voltage * 100.0f + 0.5f);
+                int   rem   = (int)(d.remaining_ah   * 10.0f + 0.5f);
+                int   full  = (int)(d.full_charge_ah * 10.0f + 0.5f);
+                int   cmin  = (int)(d.cell_min * 1000.0f + 0.5f);
+                int   cmax  = (int)(d.cell_max * 1000.0f + 0.5f);
+                /* signed values: round away from zero so negatives are correct */
+                int   curr  = (int)(d.current     * 100.0f + (d.current     < 0 ? -0.5f : 0.5f));
+                int   t1    = (int)(d.temp_1      * 10.0f  + (d.temp_1      < 0 ? -0.5f : 0.5f));
+                int   t2    = (int)(d.temp_2      * 10.0f  + (d.temp_2      < 0 ? -0.5f : 0.5f));
+                int   tmos  = (int)(d.temp_mosfet * 10.0f  + (d.temp_mosfet < 0 ? -0.5f : 0.5f));
+                int   bcur  = (int)(d.balance_current * 100.0f + (d.balance_current < 0 ? -0.5f : 0.5f));
+                if (volt < 0) volt = 0;
+                if (volt > 0xFFFF) volt = 0xFFFF;
+                if (rem  < 0) rem  = 0;
+                if (rem  > 0xFFFF) rem  = 0xFFFF;
+                if (full < 0) full = 0;
+                if (full > 0xFFFF) full = 0xFFFF;
+                if (cmin < 0) cmin = 0;
+                if (cmin > 0xFFFF) cmin = 0xFFFF;
+                if (cmax < 0) cmax = 0;
+                if (cmax > 0xFFFF) cmax = 0xFFFF;
+
+                connected = 1;
+                raw[0]  = (unsigned char)((d.charge_enabled?1:0) | (d.discharge_enabled?2:0)
+                                          | (d.balancer_enabled?4:0) | 8 /*connected*/);
+                raw[1]  = (unsigned char)soc;
+                raw[2]  = (unsigned char)(volt & 0xFF);   raw[3]  = (unsigned char)((volt >> 8) & 0xFF);
+                raw[4]  = (unsigned char)(curr & 0xFF);   raw[5]  = (unsigned char)((curr >> 8) & 0xFF);
+                raw[6]  = (unsigned char)(rem & 0xFF);    raw[7]  = (unsigned char)((rem >> 8) & 0xFF);
+                raw[8]  = (unsigned char)(full & 0xFF);   raw[9]  = (unsigned char)((full >> 8) & 0xFF);
+                raw[10] = (unsigned char)(cmin & 0xFF);   raw[11] = (unsigned char)((cmin >> 8) & 0xFF);
+                raw[12] = (unsigned char)(cmax & 0xFF);   raw[13] = (unsigned char)((cmax >> 8) & 0xFF);
+                raw[14] = (unsigned char)(t1 & 0xFF);     raw[15] = (unsigned char)((t1 >> 8) & 0xFF);
+                raw[16] = (unsigned char)(t2 & 0xFF);     raw[17] = (unsigned char)((t2 >> 8) & 0xFF);
+                raw[18] = (unsigned char)(tmos & 0xFF);   raw[19] = (unsigned char)((tmos >> 8) & 0xFF);
+                raw[20] = (unsigned char)(bcur & 0xFF);   raw[21] = (unsigned char)((bcur >> 8) & 0xFF);
+                raw[22] = (unsigned char)(d.cell_count & 0xFF);
+            }
+        }
+#endif
+        (void)connected;
+        b64_len = base64_encode(raw, sizeof(raw), b64);
+        b64[b64_len] = '\0';
+        B("\"b\":\"%s\",\"mac\":\"%s\"", b64, mac);
+    }
+
+    // ---- CONFIG (req=cfg) ----
+    // Returns the RAM-stored "System Configuration" for the dashboard's
+    // Retrieve button. IP fields are last-octet strings ("" = unset so the
+    // input keeps its placeholder); MACs are full strings.
+    else if (req_param && strncmp(req_param, "req=cfg", 7) == 0) {
+        int i;
+        B("\"bms1\":\"%s\",\"bms2\":\"%s\",", g_bms_mac, g_bms2_mac);
+        for (i = 0; i < 6; i++) {
+            if (g_meter_ip[i]) B("\"m%d\":\"%d\",", i + 1, g_meter_ip[i]);
+            else               B("\"m%d\":\"\",", i + 1);
+        }
+        B("\"minv\":[");
+        for (i = 0; i < 6; i++) B("%s%d", i ? "," : "", g_meter_invert[i]);
+        B("],");
+        if (g_inv2_ip)   B("\"inv2\":\"%d\",", g_inv2_ip);  else B("\"inv2\":\"\",");
+        if (g_bypass_ip) B("\"byp\":\"%d\",", g_bypass_ip); else B("\"byp\":\"\",");
+        B("\"boost\":%d,\"dthr\":%d", g_boost_power, divert_threshold);
+    }
+
+    // ---- METERS (req=meters) ----
+    // Per-meter live readings for the Sensor Data panel, fetched on the slow
+    // (6/12 s) sweep timer. mt[] slots: 0-2 = L1/L2/L3, 3-4 = Solar A/B,
+    // 5 = ESS (w signed; page shows import grey / export green). v=volts*10
+    // (1 dp), w=signed watts, o=online. Totals (import/solar/ess) are summed
+    // client-side. Also returns the Solar/ESS energy counters in Wh.
+    else if (req_param && strncmp(req_param, "req=meters", 10) == 0) {
+        int i;
+        float v, a, w; int on;
+        B("\"mt\":[");
+        for (i = 0; i < 6; i++) {
+            v = a = w = 0; on = 0;
+            BL_GetMeter(i, &v, &a, &w, &on);
+            // e = this meter's lifetime accumulated energy (signed Wh, derived
+            // from the raw tick accumulator) for the per-meter diagnostic
+            // readout on the settings page.
+            B("%s{\"v\":%d,\"w\":%d,\"o\":%d,\"e\":%d}",
+              i ? "," : "", (int)(v * 10.0f + 0.5f), (int)w, on,
+              safe_int(MeterAccToWh(i, meter_acc[i])));
+        }
+        // Per-type counters: today (d), total (t), last-hour (lh). NOTE the key
+        // is "lh" (last hour) and is a SCALAR - distinct from the frontend's "h"
+        // daily-history arrays. lh = sum of the 4 most recent completed 15-min
+        // intervals. Grid & ESS carry separate positive import/export halves;
+        // solar is one-way.
+        //   gen  = solar (one-way)         grid = utility import(i*)/export(e*)
+        //   imp/exp = ESS charge/discharge
+        B("],\"gen\":{\"d\":%d,\"t\":%d,\"lh\":%d}",
+          (int)(gen_today + 0.5f), (int)(gen_total + 0.5f),
+          safe_int(lh_sum4(lh_solar)));
+        B(",\"grid\":{\"id\":%d,\"it\":%d,\"ilh\":%d,\"ed\":%d,\"et\":%d,\"elh\":%d}",
+          (int)(grid_imp_today + 0.5f), (int)(grid_imp_total + 0.5f), safe_int(lh_sum4(lh_grid_imp)),
+          (int)(grid_exp_today + 0.5f), (int)(grid_exp_total + 0.5f), safe_int(lh_sum4(lh_grid_exp)));
+        B(",\"imp\":{\"d\":%d,\"t\":%d,\"lh\":%d},\"exp\":{\"d\":%d,\"t\":%d,\"lh\":%d}",
+          (int)(ess_imp_today + 0.5f), (int)(ess_imp_total + 0.5f), safe_int(lh_sum4(lh_ess_chg)),
+          (int)(ess_exp_today + 0.5f), (int)(ess_exp_total + 0.5f), safe_int(lh_sum4(lh_ess_dis)));
+    }
+
+    // ---- GRAPH ARRAYS (req=net | req=batt) ----
+    // req=net: {"net":"b64_48","sol":"b64_48"} — bottom panel, bundled.
+    //   net: 1 byte/slot = (clamp(net_Wh,-150,300)+150)/2. JS splits by sign:
+    //        positive=total energy import (red up), negative=export (green down).
+    //   sol: 1 byte/slot = solar Wh this period, 0..150. JS draws it negated
+    //        (yellow, downward) as a semi-transparent overlay.
+    // req=batt: {"batt":"b64_96"} — top panel, battery power.
+    //   2 bytes/slot, little-endian 10-bit sign+magnitude:
+    //   enc = (|W| & 0x1FF) | (W<0 ? 0x200 : 0), |W| clamped to 500.
+    //   JS: mag = enc & 0x1FF; if (enc & 0x200) mag = -mag.  + = charge, - = discharge.
+    else if (has_ntp && req_param) {
+        unsigned int msm = TIME_GetHour() * 60 + TIME_GetMinute();
+
+        if (strncmp(req_param, "req=net", 7) == 0) {
+            unsigned char rn[MATRIX_SIZE], rs[MATRIX_SIZE];
+            char          bn[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            char          bs[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            int           rn_len = 0, rs_len = 0, l;
+            int           net_live   = safe_int(real_consumption - real_export);
+            int           solar_live = sample_count_30s
+                                       ? ((current_solar_pwr_accum / sample_count_30s) / 4) : 0;
+
+            for (int i = 47; i >= 0; i--) {
+                int idx  = (msm / net_metering_period - i + 96) % 96;
+                int slot = idx % MATRIX_SIZE;
+                if (i == 0) {
+                    int val = net_live;
+                    if (val > 300)  val = 300;
+                    if (val < -150) val = -150;
+                    rn[rn_len++] = (unsigned char)((val + 150) / 2);
+                    if (solar_live > 150) solar_live = 150;
+                    if (solar_live < 0)   solar_live = 0;
+                    rs[rs_len++] = (unsigned char)solar_live;
+                } else {
+                    rn[rn_len++] = net_graph_matrix[slot];
+                    rs[rs_len++] = solar_graph_matrix[slot];
+                }
+            }
+            l = base64_encode(rn, rn_len, bn); bn[l] = '\0';
+            l = base64_encode(rs, rs_len, bs); bs[l] = '\0';
+            B("\"net\":\"%s\",\"sol\":\"%s\"", bn, bs);
+
+        } else if (strncmp(req_param, "req=batt", 8) == 0) {
+            unsigned char raw[MATRIX_SIZE * 2];
+            char          b64[((MATRIX_SIZE * 2) + 2) / 3 * 4 + 1];
+            int           raw_len = 0, b64_len;
+            int           has_live = (sample_count_30s > 0);
+            int           batt_live = has_live ? (current_ess_pwr_accum / sample_count_30s) : 0;
+
+            for (int i = 47; i >= 0; i--) {
+                int idx  = (msm / net_metering_period - i + 96) % 96;
+                int slot = idx % MATRIX_SIZE;
+                int w    = (i == 0 && has_live) ? batt_live : ess_pwr_matrix[slot];
+                int mag, enc;
+                if (w >  500) w =  500;
+                if (w < -500) w = -500;
+                mag = (w < 0) ? -w : w;
+                enc = (mag & 0x1FF) | ((w < 0) ? 0x200 : 0);
+                raw[raw_len++] = (unsigned char)(enc & 0xFF);
+                raw[raw_len++] = (unsigned char)((enc >> 8) & 0x03);
+            }
+            b64_len = base64_encode(raw, raw_len, b64);
+            b64[b64_len] = '\0';
+            B("\"batt\":\"%s\"", b64);
+        }
+    }
+
+    B("}");
+    buf[pos] = '\0';
+    poststr(request, buf);
+    poststr(request, NULL);
+
+#undef B
+    return 0;
+}
+
+// Dashboard HTML/CSS/JS frontend has been moved to dash_frontend.c
+// (see http_fn_custom_dash). This file only serves the JSON data
+// via http_fn_api_dash, consumed by that frontend's polling JS.
+
+/* =========================================================================
+   Functions declared in drv_public.h and called by hass.c / http_fns.c.
+   Our build uses a single flat sensors[] array (no ENABLE_BL_TWIN).
+   ========================================================================= */
+
+energySensorNames_t* DRV_GetEnergySensorNamesEx(int asensdatasetix, energySensor_t type)
+{
+    if (asensdatasetix != BL_SENSORS_IX_0) return NULL;
+    if (type < OBK__FIRST || type > OBK__LAST) return NULL;
+    return &sensors[type].names;
+}
+
+int BL_HasEnergySensorReadingEx(int asensdatasetix, energySensor_t type)
+{
+    if (asensdatasetix != BL_SENSORS_IX_0) return 0;
+    if (type < OBK__FIRST || type > OBK__LAST) return 0;
+    return !isnan((float)sensors[type].lastReading);
+}
+
+int BL_HasEnergySensorReading(energySensor_t type)
+{
+    return BL_HasEnergySensorReadingEx(BL_SENSORS_IX_0, type);
+}
