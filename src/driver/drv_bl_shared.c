@@ -112,6 +112,7 @@ int charger_c_auto = 1;
 #define LEDC_CH_CHARGER         4        // LEDC channel for GPIO2
 #define LEDC_CH_RELAY           5        // LEDC channel for GPIO0
 #define LEDC_CH_LED             3        // LEDC channel for GPIO8 (inverted)
+#define LEDC_CH_ENABLE          2        // LEDC channel for GPIO4 (charger enable, driven as full-on/off duty)
 #define LEDC_TIMER_ACTUATION    1        // LEDC timer index (0 may be used by OBK)
 #define LEDC_FREQ_HZ_ACT        1000
 #define LEDC_RES_ACT            LEDC_TIMER_8_BIT
@@ -676,7 +677,8 @@ static void ApplyDumpLoadGPIO(int state)
         if (duty < 0)   duty = 0;
         if (duty > 255) duty = 255;
 
-        gpio_set_level(GPIO_CHARGER_ENABLE, 1);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_ENABLE, 255);   // GPIO4 enable ON
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_ENABLE);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, (uint32_t)duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
@@ -692,7 +694,8 @@ static void ApplyDumpLoadGPIO(int state)
 
     } else if (inverter_active) {
         // ----- INVERTER MODE -----
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_ENABLE, 0);   // GPIO4 enable OFF
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_ENABLE);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
@@ -722,7 +725,8 @@ static void ApplyDumpLoadGPIO(int state)
 
     } else {
         // ----- OFF (state == 0, 1, or 2) -----
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_ENABLE, 0);   // GPIO4 enable OFF
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_ENABLE);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
@@ -775,9 +779,11 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
             target_power_auto = val;
         } else {
             // MANUAL: this is the actual charger output, applied instantly.
-            if (val > 5 && val < 18) val = 18;
-            if (val > 100) val = 100;
-            if (val < 0)   val = 0;
+            // 1-9 snaps up to the pre-charge floor; 10-17 = enabled/no PWM
+            // yet; 18-100 drives real PWM duty directly; 0 stays off.
+            if (val > 0 && val < CHARGER_MIN_PWM) val = CHARGER_MIN_PWM;
+            if (val > CHARGER_MAX_PWM) val = CHARGER_MAX_PWM;
+            if (val < 0)               val = 0;
             target_power_manual = val;
 
             dump_load_relay[5] = target_power_manual;
@@ -1984,18 +1990,8 @@ void BL_Shared_Init(void)
 #if PLATFORM_ESPIDF
     // ---- GPIO / LEDC hardware init (charger enable + relay economiser outputs) ----
     {
-        // GPIO4 — charger enable (digital output, start LOW / disabled)
-        gpio_config_t io_conf;
-        memset(&io_conf, 0, sizeof(io_conf));
-        io_conf.pin_bit_mask = (1ULL << GPIO_CHARGER_ENABLE);
-        io_conf.mode         = GPIO_MODE_OUTPUT;
-        io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
-        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-        io_conf.intr_type    = GPIO_INTR_DISABLE;
-        gpio_config(&io_conf);
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
-
-        // Shared LEDC timer: 1 kHz, 8-bit resolution
+        // Shared LEDC timer: 1 kHz, 8-bit resolution (configure first so all
+        // channels below can bind to it)
         ledc_timer_config_t tmr;
         memset(&tmr, 0, sizeof(tmr));
         tmr.speed_mode      = LEDC_LOW_SPEED_MODE;
@@ -2004,6 +2000,21 @@ void BL_Shared_Init(void)
         tmr.freq_hz         = LEDC_FREQ_HZ_ACT;
         tmr.clk_cfg         = LEDC_AUTO_CLK;
         ledc_timer_config(&tmr);
+
+        // GPIO4 — charger enable, driven as an LEDC channel (same path as the
+        // working GPIO0/GPIO8 pins). Used full-on (255) / full-off (0) only;
+        // it's a switch, but routed through LEDC so it inits identically to
+        // the pins that work. Starts at 0 (disabled).
+        ledc_channel_config_t ch_en;
+        memset(&ch_en, 0, sizeof(ch_en));
+        ch_en.gpio_num   = GPIO_CHARGER_ENABLE;
+        ch_en.speed_mode = LEDC_LOW_SPEED_MODE;
+        ch_en.channel    = LEDC_CH_ENABLE;
+        ch_en.timer_sel  = LEDC_TIMER_ACTUATION;
+        ch_en.duty       = 0;
+        ch_en.hpoint     = 0;
+        ch_en.intr_type  = LEDC_INTR_DISABLE;
+        ledc_channel_config(&ch_en);
 
         // GPIO2 — charger PWM (LEDC channel 4, starts at 0)
         ledc_channel_config_t ch_chg;
