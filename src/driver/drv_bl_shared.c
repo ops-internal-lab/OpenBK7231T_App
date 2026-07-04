@@ -670,10 +670,18 @@ static void ApplyDumpLoadGPIO(int state)
 
     if (charger_active) {
         // ----- CHARGER MODE -----
-        int duty = ((state - 18) * 255) / 82;
-        if (duty < 0)   duty = 0;
-        if (duty > 255) duty = 255;
-
+        int duty = 0;
+        if (state < 12) {
+        duty = 0;
+	    } else {
+	        // (state * 5) / 2 is the exact same as state * 2.5 
+	        // but uses fast integer math
+	        duty = (state * 5) / 2;
+	    }
+    
+    	// Optional: Keep this if your hardware still requires 
+   		// the output to cap at a maximum of 255.
+   		if (duty > 255) duty = 255; 
         gpio_set_level(GPIO_CHARGER_ENABLE, 1);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, (uint32_t)duty);
@@ -766,12 +774,12 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
 
         if (charger_c_auto == 1) {
             // AUTO: this is the ceiling the loop may regulate up to.
-            if (val < 18)  val = 18;
+            if (val < 12)  val = 12;
             if (val > 100) val = 100;
             target_power_auto = val;
         } else {
             // MANUAL: this is the actual charger output, applied instantly.
-            if (val > 5 && val < 18) val = 18;
+            if (val > 5 && val < 12) val = 12;
             if (val > 100) val = 100;
             if (val < 0)   val = 0;
             target_power_manual = val;
@@ -1774,13 +1782,13 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     }
                     
                     // Enforce absolute constraints
-                    if (solar_excess > 82) solar_excess = 82;
+                    if (solar_excess > 88) solar_excess = 88;
                     if (solar_excess < 0) solar_excess = 0;
                     
-                    persistent_state = 18 + solar_excess;
+                    persistent_state = 12 + solar_excess;
                     
                     int active_max = target_power_auto;
-                    if (active_max < 18) active_max = 100;
+                    if (active_max < 12) active_max = 100;
                     
                     if (persistent_state > active_max) persistent_state = active_max;
                 }
@@ -2110,7 +2118,7 @@ int http_fn_api_dash(http_request_t *request) {
     //   bytes 6-7:  calc_pwr  (int16, whole W, signed)
     //   bytes 8-9:  bal       (int16, whole Wh, signed)
     //   bytes 10-11:est       (int16, whole Wh, signed)
-    //   byte  12:   dmp       (uint8, 0/5/18..100 — current charger output)
+    //   byte  12:   dmp       (uint8, 0/5/12..100 — current charger output)
     //   byte  13:   mode      (uint8, 0=AUTO, 1=MANUAL temp, 2=MANUAL locked)
     //   byte  14:   t_pwr_a   (uint8, 0..100 — AUTO ceiling)
     //   byte  15:   t_exp     (uint8, 0..100 — export Wh, global)
