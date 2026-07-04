@@ -43,19 +43,6 @@ static esp_netif_ip_info_t g_ip_info;
 esp_event_handler_instance_t instance_any_id, instance_got_ip;
 bool handlers_registered = false;
 
-#if PLATFORM_ESPIDF
-// Static IP, staged by HAL_ConnectToWiFi() before esp_wifi_start() and
-// applied inside event_handler()'s WIFI_EVENT_STA_START case, BEFORE
-// esp_wifi_connect() is called. This has to happen there rather than right
-// after esp_wifi_start() returns: that event fires (and calls
-// esp_wifi_connect()) via the event-loop task and can beat our own code
-// back from esp_wifi_start(), racing esp_netif_dhcpc_stop()/
-// esp_netif_set_ip_info() against a connection attempt already under way.
-static int g_pendingStaticIP = 0;
-static esp_netif_ip_info_t g_pendingIpInfo;
-static esp_netif_dns_info_t g_pendingDnsInfo;
-#endif
-
 // This must return correct IP for both SOFT_AP and STATION modes,
 // because, for example, javascript control panel requires it
 const char* HAL_GetMyIPString()
@@ -153,16 +140,6 @@ void event_handler(void* arg, esp_event_base_t event_base,
 {
 	if(event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START && !g_bOpenAccessPointMode)
 	{
-#if PLATFORM_ESPIDF
-		if (g_pendingStaticIP) {
-			esp_netif_dhcpc_stop(sta_netif);
-			esp_netif_set_ip_info(sta_netif, &g_pendingIpInfo);
-			esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &g_pendingDnsInfo);
-			ADDLOG_INFO(LOG_FEATURE_MAIN, "Applied static IP %d.%d.%d.%d",
-				(int)(g_pendingIpInfo.ip.addr & 0xFF), (int)((g_pendingIpInfo.ip.addr >> 8) & 0xFF),
-				(int)((g_pendingIpInfo.ip.addr >> 16) & 0xFF), (int)((g_pendingIpInfo.ip.addr >> 24) & 0xFF));
-		}
-#endif
 		if(g_wifiStatusCallback != NULL)
 		{
 			g_wifiStatusCallback(WIFI_STA_CONNECTING);
@@ -198,37 +175,6 @@ void event_handler(void* arg, esp_event_base_t event_base,
 
 void HAL_ConnectToWiFi(const char* oob_ssid, const char* connect_key, obkStaticIP_t* ip)
 {
-#if PLATFORM_ESPIDF
-	// Stage static IP for the STA_START handler above to apply, BEFORE
-	// esp_wifi_connect() is ever called (see the comment on
-	// g_pendingStaticIP for why it can't be done here, after
-	// esp_wifi_start()). localIPAddr[0]==0 means "use DHCP", matching the
-	// convention the /cfg_ip page and every other HAL's HAL_ConnectToWiFi
-	// already use. Also require netMask/gatewayIPAddr to be non-zero: a
-	// static IP saved without those (e.g. only ever set once, partially)
-	// is not a usable config, and pushing a 0.0.0.0 netmask to the network
-	// stack breaks the interface rather than falling back to DHCP.
-	if (ip && ip->localIPAddr[0] != 0
-		&& (ip->netMask[0] | ip->netMask[1] | ip->netMask[2] | ip->netMask[3])
-		&& (ip->gatewayIPAddr[0] | ip->gatewayIPAddr[1] | ip->gatewayIPAddr[2] | ip->gatewayIPAddr[3])) {
-		memset(&g_pendingIpInfo, 0, sizeof(g_pendingIpInfo));
-		g_pendingIpInfo.ip.addr = ip->localIPAddr[0] | (ip->localIPAddr[1] << 8)
-			| (ip->localIPAddr[2] << 16) | (ip->localIPAddr[3] << 24);
-		g_pendingIpInfo.netmask.addr = ip->netMask[0] | (ip->netMask[1] << 8)
-			| (ip->netMask[2] << 16) | (ip->netMask[3] << 24);
-		g_pendingIpInfo.gw.addr = ip->gatewayIPAddr[0] | (ip->gatewayIPAddr[1] << 8)
-			| (ip->gatewayIPAddr[2] << 16) | (ip->gatewayIPAddr[3] << 24);
-
-		memset(&g_pendingDnsInfo, 0, sizeof(g_pendingDnsInfo));
-		g_pendingDnsInfo.ip.type = ESP_IPADDR_TYPE_V4;
-		g_pendingDnsInfo.ip.u_addr.ip4.addr = ip->dnsServerIpAddr[0] | (ip->dnsServerIpAddr[1] << 8)
-			| (ip->dnsServerIpAddr[2] << 16) | (ip->dnsServerIpAddr[3] << 24);
-
-		g_pendingStaticIP = 1;
-	} else {
-		g_pendingStaticIP = 0;
-	}
-#endif
 #if PLATFORM_ESPIDF
 	if(sta_netif != NULL)
 #else
