@@ -108,6 +108,18 @@ int charger_c_auto = 1;
 #define GPIO_CHARGER_PWM        2        // charger duty   (LEDC PWM, 8-bit, 1 kHz)
 #define GPIO_RELAY_ECON         0        // relay economiser (LEDC PWM, 8-bit)
 #define GPIO_INVERTER_LED       8        // onboard LED mirrors GPIO0 (inverted, active LOW)
+#define GPIO_INVERTER0
+#define GPIO_INVERTER1
+#define GPIO_INVERTER2
+#define GPIO_INVERTER3
+#define GPIO_INVERTER4
+#define GPIO_INVERTER5
+#define GPIO_INVERTER6
+#define GPIO_INVERTER7
+#define GPIO_INVERTER8
+#define GPIO_INVERTER9
+#define GPIO_INVERTER10
+#define GPIO_INVERTER11
 
 #define LEDC_CH_CHARGER         4        // LEDC channel for GPIO2
 #define LEDC_CH_RELAY           5        // LEDC channel for GPIO0
@@ -786,6 +798,7 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
                          "SendGet http://%s/cm?cmnd=Channel3%%20%d",
                          _cip, dump_load_relay[5]);
                // CMD_ExecuteCommand(fallback_cmd, 0);
+				cycle_inverter_pins_c3();
             }}
             ApplyDumpLoadGPIO(dump_load_relay[5]);
         }
@@ -2028,17 +2041,29 @@ void BL_Shared_Init(void)
         // GPIO8 — onboard LED mirrors relay economiser (LEDC channel 3, inverted)
         // LED is active-LOW (wired to 3V3), so output_invert=1 maps duty 0→off,
         // duty 255→full brightness without any logic inversion in software.
-        ledc_channel_config_t ch_led;
-        memset(&ch_led, 0, sizeof(ch_led));
-        ch_led.gpio_num          = GPIO_INVERTER_LED;
-        ch_led.speed_mode        = LEDC_LOW_SPEED_MODE;
-        ch_led.channel           = LEDC_CH_LED;
-        ch_led.timer_sel         = LEDC_TIMER_ACTUATION;
-        ch_led.duty              = 0;
-        ch_led.hpoint            = 0;
-        ch_led.intr_type         = LEDC_INTR_DISABLE;
-        ch_led.flags.output_invert = 1;
-        ledc_channel_config(&ch_led);
+        // Map the 12 inverter GPIOs sequentially
+        const int inverter_gpios[] = {
+            GPIO_INVERTER0,  GPIO_INVERTER1,  GPIO_INVERTER2,  GPIO_INVERTER3,
+            GPIO_INVERTER4,  GPIO_INVERTER5,  GPIO_INVERTER6,  GPIO_INVERTER7,
+            GPIO_INVERTER8,  GPIO_INVERTER9,  GPIO_INVERTER10, GPIO_INVERTER11
+        };
+
+        // Loop through all 12 pins to map them to channels 0 through 11
+        for (int i = 0; i < 12; i++) {
+            ledc_channel_config_t ch_led;
+            memset(&ch_led, 0, sizeof(ch_led));
+            
+            ch_led.gpio_num            = inverter_gpios[i];
+            ch_led.speed_mode          = LEDC_LOW_SPEED_MODE;
+            ch_led.channel             = (ledc_channel_t)i; 
+            ch_led.timer_sel           = LEDC_TIMER_ACTUATION;
+            ch_led.duty                = 0;
+            ch_led.hpoint              = 0;
+            ch_led.intr_type           = LEDC_INTR_DISABLE;
+            ch_led.flags.output_invert = 1;
+            
+            ledc_channel_config(&ch_led);
+        }
 
         addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
                   "GPIO actuation init: enable=GPIO%d, chargerPWM=GPIO%d ch%d, relay=GPIO%d ch%d\n",
@@ -2492,7 +2517,36 @@ int http_fn_api_dash(http_request_t *request) {
 // Dashboard HTML/CSS/JS frontend has been moved to dash_frontend.c
 // (see http_fn_custom_dash). This file only serves the JSON data
 // via http_fn_api_dash, consumed by that frontend's polling JS.
+// ====================================================================
+// MANUAL INVERTER PIN SCROLLER (ESP32-C3 Safe Map)
+// ====================================================================
+#if PLATFORM_ESPIDF
+#include "driver/gpio.h"
+#endif
 
+// Array of valid pins 0-20, skipping 12-17 (SPI Flash) and 18-19 (USB JTAG)
+static const int c3_inverter_pins[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20};
+static int current_c3_pin_idx = 0;
+
+void cycle_inverter_pins_c3(void) {
+#if PLATFORM_ESPIDF
+    // 1. Cleanly reset and turn OFF the currently active pin
+    gpio_reset_pin((gpio_num_t)c3_inverter_pins[current_c3_pin_idx]);
+    gpio_set_direction((gpio_num_t)c3_inverter_pins[current_c3_pin_idx], GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)c3_inverter_pins[current_c3_pin_idx], 0);
+
+    // 2. Increment the variable and wrap around safely
+    current_c3_pin_idx++;
+    if (current_c3_pin_idx >= (sizeof(c3_inverter_pins) / sizeof(c3_inverter_pins[0]))) {
+        current_c3_pin_idx = 0;
+    }
+
+    // 3. Turn ON the newly selected pin
+    gpio_reset_pin((gpio_num_t)c3_inverter_pins[current_c3_pin_idx]);
+    gpio_set_direction((gpio_num_t)c3_inverter_pins[current_c3_pin_idx], GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)c3_inverter_pins[current_c3_pin_idx], 1);
+#endif
+}
 /* =========================================================================
    Functions declared in drv_public.h and called by hass.c / http_fns.c.
    Our build uses a single flat sensors[] array (no ENABLE_BL_TWIN).
