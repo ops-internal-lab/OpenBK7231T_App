@@ -9,6 +9,12 @@
 // Pull them in up front so the type is defined at first use.
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+// Register-level GPIO access (soc/gpio_struct.h = the memory-mapped GPIO
+// peripheral struct, soc/io_mux_reg.h = PIN_FUNC_SELECT/IO_MUX_GPIOn_REG).
+// Used only by BL09XX_TestChargerPinsRegister(), which bypasses driver/gpio.h
+// entirely for hardware-level debugging.
+#include "soc/gpio_struct.h"
+#include "soc/io_mux_reg.h"
 #endif
 #include "dash_frontend.h"
 
@@ -102,27 +108,26 @@ static int last_matrix_index = -1;
 int charger_c_auto = 1;
 
 // ====================================================================
-// LOCAL GPIO / PWM ACTUATION  (ESP32-C3 hardware — replaces SendGet)
+// LOCAL GPIO / PWM ACTUATION (ESP32-C3, via OBK's own HAL_PIN_* functions —
+// the same mechanism OBK's native IOR_Relay/IOR_PWM roles use, and the one
+// confirmed working on this board through Configure Module / GPIO Finder /
+// SetChannel. Channel allocation for the PWM pins is handled internally by
+// HAL_PIN_PWM_Start(), not hand-managed here.)
 // ====================================================================
 #define GPIO_CHARGER_ENABLE     4        // charger enable (digital output, active HIGH)
-#define GPIO_CHARGER_PWM        2        // charger duty   (LEDC PWM, 8-bit, 1 kHz)
-#define GPIO_RELAY_ECON         0        // relay economiser (LEDC PWM, 8-bit)
+#define GPIO_CHARGER_PWM        2        // charger duty   (PWM via HAL_PIN_PWM_*, 0-100%)
+#define GPIO_RELAY_ECON         0        // relay economiser (PWM via HAL_PIN_PWM_*, 0-100%)
 #define GPIO_INVERTER_LED       8        // onboard LED mirrors GPIO0 (inverted, active LOW)
 
-#define LEDC_CH_CHARGER         4        // LEDC channel for GPIO2
-#define LEDC_CH_RELAY           5        // LEDC channel for GPIO0
-#define LEDC_CH_LED             3        // LEDC channel for GPIO8 (inverted)
-#define LEDC_TIMER_ACTUATION    1        // LEDC timer index (0 may be used by OBK)
 #define LEDC_FREQ_HZ_ACT        1000
-#define LEDC_RES_ACT            LEDC_TIMER_8_BIT
 
-#define RELAY_ECON_DUTY_FULL    255      // 100 % — initial relay pull-in
-#define RELAY_ECON_DUTY_HOLD    204      // ~80 % — economiser hold (204/255 ≈ 80.4 %)
+#define RELAY_ECON_DUTY_FULL    100      // 100% — initial relay pull-in
+#define RELAY_ECON_DUTY_HOLD    80       // 80%  — economiser hold
 #define RELAY_ECON_PULSE_MS     500      // ms at 100 % before dropping to hold
 
 // Shadow variables — last duty written to each output (available for debug/MQTT)
-static int charger_pwm      = 0;   // 0-255, mirrors GPIO2
-static int relay_economiser = 0;   // 0 / RELAY_ECON_DUTY_HOLD / RELAY_ECON_DUTY_FULL, mirrors GPIO0
+static int charger_pwm      = 0;   // 0-100%, mirrors GPIO2
+static int relay_economiser = 0;   // 0 / RELAY_ECON_DUTY_HOLD / RELAY_ECON_DUTY_FULL (percent), mirrors GPIO0
 
 // Economiser edge-detection state (persistent across ApplyDumpLoadGPIO calls)
 static int          inverter_was_active  = 0;
@@ -268,6 +273,7 @@ static float lh_sum4(const float *ring) {
     return ring[0] + ring[1] + ring[2] + ring[3];
 }
 
+#include "../hal/hal_pins.h"
 #include "drv_bl_shared.h"
 
 #include "../new_cfg.h"
@@ -620,21 +626,19 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
 // state <  3          : everything off  (GPIO4 LOW, GPIO2 duty 0, GPIO0 duty 0)
 // state  3..5         : inverter on     (GPIO4 LOW, GPIO2 0,
 //                                        GPIO0 100% for 500ms then 80% hold)
-//                       Pulse fires only on the 0→active rising edge.
-//                       If state remains inverter-active, holds at 80%.
-// state  18..100      : charger on      (GPIO4 HIGH, GPIO2 PWM 0-255, GPIO0 0)
-//                       Duty scaled linearly: 18→0, 100→255.
+//                       Ramp happens inline (blocking) on the 0→active rising
+//                       edge. If state remains inverter-active, stays at 80%.
+// state  10..100      : charger power-on (GPIO4 HIGH). Two sub-ranges:
+//                         10..17  : fixed 10% duty floor, not yet switching
+//                         18..100 : GPIO2 PWM duty tracks state (percent)
+//                                   directly: duty_8bit = state * 2.5,
+//                                   e.g. 18% -> 45, 50% -> 125, 100% -> 250
 //
 // charger_pwm and relay_economiser are updated to reflect what was last
 // written to hardware (shadow state, useful for diagnostics).
 static void ApplyDumpLoadGPIO(int state)
 {
 #if PLATFORM_ESPIDF
-    // Declared static local so TickType_t is resolved after the FreeRTOS
-    // headers are included above; retains value between calls like a file-
-    // scope static would.
-    static TickType_t inverter_engage_tick = 0;
-
     // ---- BMS voltage gate (skipped entirely if BMS offline) ----
     // Re-evaluates the hysteresis latches from live cell voltages, then forces
     // the requested state off if the relevant device is latched. dump_load_relay
@@ -659,74 +663,72 @@ static void ApplyDumpLoadGPIO(int state)
             else if (bd.cell_min >= inverter_cutoff_v + INVERTER_HYST_V) inverter_gated = 0;
         }
         // ALWAYS apply the (possibly held) latch state.
-        if (charger_gated  && state >= 18)              state = 0;
+        if (charger_gated  && state >= CHARGER_MIN_PWM)  state = 0;
         if (inverter_gated && state >= 3 && state <= 5) state = 0;
     }
 #endif
 
-    int inverter_active = (state >= 3 && state <= 5);
-    int charger_active  = (state >= 18);
-    TickType_t now    = xTaskGetTickCount();
+    int inverter_active   = (state >= 3 && state <= 5);
+    // Power-on range (10-100) is wider than the PWM range (18-100): 10-17
+    // enables the supply at a fixed pre-charge floor with no switching yet.
+    int charger_power_on = (state >= CHARGER_MIN_PWM && state <= CHARGER_MAX_PWM);
 
-    if (charger_active) {
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "ApplyDumpLoadGPIO(state=%d): inverter_active=%d charger_power_on=%d\n",
+              state, inverter_active, charger_power_on);
+
+    if (charger_power_on) {
         // ----- CHARGER MODE -----
-        int duty = ((state - 18) * 255) / 82;
-        if (duty < 0)   duty = 0;
-        if (duty > 255) duty = 255;
+        // state IS the target percentage. 10-17: fixed 10% floor (enabled,
+        // not yet switching). 18-100: duty tracks state directly.
+        int pct = (state < 18) ? 10 : state;
+        if (pct < 0)   pct = 0;
+        if (pct > 100) pct = 100;
 
-        gpio_set_level(GPIO_CHARGER_ENABLE, 1);
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "CHARGER branch: pct=%d -> HAL_PIN_SetOutputValue(GPIO%d,1), HAL_PIN_PWM_Update(GPIO%d,%d)\n",
+                  pct, GPIO_CHARGER_ENABLE, GPIO_CHARGER_PWM, pct);
 
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, (uint32_t)duty);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
+        HAL_PIN_SetOutputValue(GPIO_CHARGER_ENABLE, 1);
 
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
+        HAL_PIN_PWM_Update(GPIO_CHARGER_PWM, (float)pct);
+        HAL_PIN_PWM_Update(GPIO_RELAY_ECON, 0.0f);
+        HAL_PIN_PWM_Update(GPIO_INVERTER_LED, 100.0f);   // inverted: 0% duty = 100% arg
 
-        charger_pwm         = duty;
+        charger_pwm         = pct;
         relay_economiser    = 0;
         inverter_was_active = 0;
 
     } else if (inverter_active) {
         // ----- INVERTER MODE -----
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
-
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
+        HAL_PIN_SetOutputValue(GPIO_CHARGER_ENABLE, 0);
+        HAL_PIN_PWM_Update(GPIO_CHARGER_PWM, 0.0f);
         charger_pwm = 0;
 
         if (!inverter_was_active) {
-            // Rising edge (0 → active): start 100 % pull-in pulse
-            inverter_engage_tick = now;
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_FULL);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, RELAY_ECON_DUTY_FULL);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
-            relay_economiser = RELAY_ECON_DUTY_FULL;
-        } else if ((now - inverter_engage_tick) >= (RELAY_ECON_PULSE_MS / portTICK_PERIOD_MS)) {
-            // 500 ms elapsed: drop to economiser hold duty
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, RELAY_ECON_DUTY_HOLD);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, RELAY_ECON_DUTY_HOLD);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
+            // Rising edge (0 → active): 100 % pull-in pulse, then hold at 80 %.
+            // Blocking is fine here — this only runs on the rare off->active
+            // transition, from a command handler or the 30s AUTO tick, never
+            // from an ISR or a tight sampling loop.
+            HAL_PIN_PWM_Update(GPIO_RELAY_ECON, (float)RELAY_ECON_DUTY_FULL);
+            HAL_PIN_PWM_Update(GPIO_INVERTER_LED, 100.0f - (float)RELAY_ECON_DUTY_FULL);   // inverted
+
+            vTaskDelay(pdMS_TO_TICKS(RELAY_ECON_PULSE_MS));   // 500 ms hold at 100%
+
+            HAL_PIN_PWM_Update(GPIO_RELAY_ECON, (float)RELAY_ECON_DUTY_HOLD);
+            HAL_PIN_PWM_Update(GPIO_INVERTER_LED, 100.0f - (float)RELAY_ECON_DUTY_HOLD);   // inverted
             relay_economiser = RELAY_ECON_DUTY_HOLD;
         }
-        // else: still within 500 ms window — LEDC retains FULL duty, no write needed
+        // else: already active and already holding at 80% — nothing to do
 
         inverter_was_active = 1;
 
     } else {
         // ----- OFF (state == 0, 1, or 2) -----
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
-
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
-
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RELAY);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LED);
+        HAL_PIN_SetOutputValue(GPIO_CHARGER_ENABLE, 0);
+        HAL_PIN_PWM_Update(GPIO_CHARGER_PWM, 0.0f);
+        HAL_PIN_PWM_Update(GPIO_RELAY_ECON, 0.0f);
+        HAL_PIN_PWM_Update(GPIO_INVERTER_LED, 100.0f);   // inverted: 0% duty = 100% arg
 
         charger_pwm         = 0;
         relay_economiser    = 0;
@@ -735,14 +737,103 @@ static void ApplyDumpLoadGPIO(int state)
 #endif
 }
 
+#if PLATFORM_ESPIDF
+// ====================================================================
+// TestChargerPinsRaw <0|1> — bypasses everything: no BL_Shared_Init,
+// no ApplyDumpLoadGPIO, no charger_c_auto, no LEDC. Just gpio_config +
+// gpio_set_level directly on GPIO2 and GPIO4, nothing else. Reconfigures
+// the pins as plain digital outputs every call (so it doesn't matter what
+// state the LEDC channel config left them in) and logs the actual
+// esp_err_t from every step. If this doesn't move the pins, it's not
+// this file's logic — it's the pin itself or the board.
+// ====================================================================
+commandResult_t BL09XX_TestChargerPinsRaw(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int level = (args && *args) ? atoi(args) : 1;
+
+    gpio_config_t conf;
+    memset(&conf, 0, sizeof(conf));
+    conf.pin_bit_mask = (1ULL << GPIO_NUM_2) | (1ULL << GPIO_NUM_4);
+    conf.mode         = GPIO_MODE_OUTPUT;
+    conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+    conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    conf.intr_type    = GPIO_INTR_DISABLE;
+    esp_err_t e_conf = gpio_config(&conf);
+
+    esp_err_t e_lvl2 = gpio_set_level(GPIO_NUM_2, level);
+    esp_err_t e_lvl4 = gpio_set_level(GPIO_NUM_4, level);
+
+    int rd2 = gpio_get_level(GPIO_NUM_2);
+    int rd4 = gpio_get_level(GPIO_NUM_4);
+
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "TestChargerPinsRaw(level=%d): gpio_config=%d set_level(GPIO2)=%d set_level(GPIO4)=%d | readback GPIO2=%d GPIO4=%d\n",
+              level, (int)e_conf, (int)e_lvl2, (int)e_lvl4, rd2, rd4);
+
+    return CMD_RES_OK;
+}
+
+// ====================================================================
+// TestChargerPinsRegister <0|1> — true register-level access. No
+// driver/gpio.h calls at all (not gpio_config, not gpio_set_level).
+// Writes the actual memory-mapped GPIO peripheral struct (soc/gpio_struct.h)
+// and the IO_MUX pin-function-select macro (soc/io_mux_reg.h) directly.
+// This is as low as it goes without hand-typing raw hex addresses — these
+// are the SDK's own register definitions, not the driver abstraction.
+// If this doesn't move the pins either, it's not a software layer at all.
+// ====================================================================
+commandResult_t BL09XX_TestChargerPinsRegister(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    int level = (args && *args) ? atoi(args) : 1;
+
+    // Route GPIO2 and GPIO4's IO_MUX to the plain GPIO function, bypassing
+    // gpio_config()/gpio_set_direction() entirely.
+    PIN_FUNC_SELECT(IO_MUX_GPIO2_REG, PIN_FUNC_GPIO);
+    PIN_FUNC_SELECT(IO_MUX_GPIO4_REG, PIN_FUNC_GPIO);
+
+    // Enable both as outputs by writing the peripheral's ENABLE set-register
+    // directly (bit N = 1 -> GPIO N becomes an output).
+    GPIO.enable_w1ts.val = (1u << 2) | (1u << 4);
+
+    // Drive the level via the OUT set/clear registers directly.
+    if (level) {
+        GPIO.out_w1ts.val = (1u << 2) | (1u << 4);
+    } else {
+        GPIO.out_w1tc.val = (1u << 2) | (1u << 4);
+    }
+
+    // Read back what the peripheral itself now holds — not a pin read,
+    // the actual OUT register content.
+    uint32_t out_val    = GPIO.out.val;
+    uint32_t enable_val = GPIO.enable.val;
+    int bit2 = (out_val >> 2) & 1;
+    int bit4 = (out_val >> 4) & 1;
+
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "TestChargerPinsRegister(level=%d): GPIO.out.val=0x%08X (bit2=%d bit4=%d) GPIO.enable.val=0x%08X\n",
+              level, (unsigned int)out_val, bit2, bit4, (unsigned int)enable_val);
+
+    return CMD_RES_OK;
+}
+#endif
+
 commandResult_t BL09XX_SetDumpLoad(const void *context, const char *cmd, const char *args, int cmdFlags)
 {
-    if (charger_c_auto == 1) return CMD_RES_OK; 
-    
+    if (charger_c_auto == 1) {
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "SetDumpLoad %s ignored: charger_c_auto=1 (AUTO mode) - switch to manual with SetChargerMode 1 or 2 first\n",
+                  args ? args : "");
+        return CMD_RES_OK;
+    }
+
     if(args && *args) {
         char fallback_cmd[64];
 
         dump_load_relay[5] = atoi(args);
+
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "SetDumpLoad %d applied (manual mode), calling ApplyDumpLoadGPIO\n",
+                  dump_load_relay[5]);
 
         /* Fire command to each configured charger IP */
         { int _ci; for (_ci = 0; _ci < UART_TCP_CHARGER_MAX; _ci++) {
@@ -771,9 +862,11 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
             target_power_auto = val;
         } else {
             // MANUAL: this is the actual charger output, applied instantly.
-            if (val > 5 && val < 18) val = 18;
-            if (val > 100) val = 100;
-            if (val < 0)   val = 0;
+            // 1-9 snaps up to the pre-charge floor; 10-17 = enabled/no PWM
+            // yet; 18-100 drives real PWM duty directly; 0 stays off.
+            if (val > 0 && val < CHARGER_MIN_PWM) val = CHARGER_MIN_PWM;
+            if (val > CHARGER_MAX_PWM) val = CHARGER_MAX_PWM;
+            if (val < 0)               val = 0;
             target_power_manual = val;
 
             dump_load_relay[5] = target_power_manual;
@@ -1978,76 +2071,51 @@ void BL_Shared_Init(void)
     }
 
 #if PLATFORM_ESPIDF
-    // ---- GPIO / LEDC hardware init (charger enable + relay economiser outputs) ----
+    // ---- Actuation pin init, routed through OBK's own HAL_PIN_* functions ----
+    // These are the exact same calls OBK's native IOR_Relay/IOR_PWM roles use
+    // (see PIN_SetPinRoleForPinIndex in new_pins.c) — the mechanism directly
+    // confirmed working on this board via Configure Module / GPIO Finder and
+    // SetChannel. Using them here instead of our own separate gpio_config/
+    // ledc_channel_config calls means "our call" and "the proven call" are
+    // now literally the same function, not two independent implementations
+    // of the same idea. On ESP32-C3, pin index == physical GPIO number, so
+    // GPIO_CHARGER_ENABLE/GPIO_CHARGER_PWM/GPIO_RELAY_ECON/GPIO_INVERTER_LED
+    // are used directly as the index argument.
     {
-        // GPIO4 — charger enable (digital output, start LOW / disabled)
-        gpio_config_t io_conf;
-        memset(&io_conf, 0, sizeof(io_conf));
-        io_conf.pin_bit_mask = (1ULL << GPIO_CHARGER_ENABLE);
-        io_conf.mode         = GPIO_MODE_OUTPUT;
-        io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
-        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-        io_conf.intr_type    = GPIO_INTR_DISABLE;
-        gpio_config(&io_conf);
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+        // GPIO4 — charger enable, plain digital output. Same call as
+        // OBK's IOR_Relay case: HAL_PIN_Setup_Output() + HAL_PIN_SetOutputValue().
+        HAL_PIN_Setup_Output(GPIO_CHARGER_ENABLE);
+        HAL_PIN_SetOutputValue(GPIO_CHARGER_ENABLE, 0);
 
-        // Shared LEDC timer: 1 kHz, 8-bit resolution
-        ledc_timer_config_t tmr;
-        memset(&tmr, 0, sizeof(tmr));
-        tmr.speed_mode      = LEDC_LOW_SPEED_MODE;
-        tmr.timer_num       = LEDC_TIMER_ACTUATION;
-        tmr.duty_resolution = LEDC_RES_ACT;
-        tmr.freq_hz         = LEDC_FREQ_HZ_ACT;
-        tmr.clk_cfg         = LEDC_AUTO_CLK;
-        ledc_timer_config(&tmr);
+        // GPIO2/GPIO0/GPIO8 — variable duty outputs, via OBK's own PWM
+        // role mechanism: HAL_PIN_PWM_Start() allocates + configures an
+        // LEDC channel from OBK's own pool (no more hand-managed channel
+        // numbers on our side), HAL_PIN_PWM_Update() takes a plain 0-100
+        // percentage (not a raw 8-bit duty) and handles the hardware scaling.
+        HAL_PIN_PWM_Start(GPIO_CHARGER_PWM, LEDC_FREQ_HZ_ACT);
+        HAL_PIN_PWM_Update(GPIO_CHARGER_PWM, 0.0f);
 
-        // GPIO2 — charger PWM (LEDC channel 4, starts at 0)
-        ledc_channel_config_t ch_chg;
-        memset(&ch_chg, 0, sizeof(ch_chg));
-        ch_chg.gpio_num   = GPIO_CHARGER_PWM;
-        ch_chg.speed_mode = LEDC_LOW_SPEED_MODE;
-        ch_chg.channel    = LEDC_CH_CHARGER;
-        ch_chg.timer_sel  = LEDC_TIMER_ACTUATION;
-        ch_chg.duty       = 0;
-        ch_chg.hpoint     = 0;
-        ch_chg.intr_type  = LEDC_INTR_DISABLE;
-        ledc_channel_config(&ch_chg);
+        HAL_PIN_PWM_Start(GPIO_RELAY_ECON, LEDC_FREQ_HZ_ACT);
+        HAL_PIN_PWM_Update(GPIO_RELAY_ECON, 0.0f);
 
-        // GPIO0 — relay economiser PWM (LEDC channel 5, starts at 0)
-        ledc_channel_config_t ch_rel;
-        memset(&ch_rel, 0, sizeof(ch_rel));
-        ch_rel.gpio_num   = GPIO_RELAY_ECON;
-        ch_rel.speed_mode = LEDC_LOW_SPEED_MODE;
-        ch_rel.channel    = LEDC_CH_RELAY;
-        ch_rel.timer_sel  = LEDC_TIMER_ACTUATION;
-        ch_rel.duty       = 0;
-        ch_rel.hpoint     = 0;
-        ch_rel.intr_type  = LEDC_INTR_DISABLE;
-        ledc_channel_config(&ch_rel);
-
-        // GPIO8 — onboard LED mirrors relay economiser (LEDC channel 3, inverted)
-        // LED is active-LOW (wired to 3V3), so output_invert=1 maps duty 0→off,
-        // duty 255→full brightness without any logic inversion in software.
-        ledc_channel_config_t ch_led;
-        memset(&ch_led, 0, sizeof(ch_led));
-        ch_led.gpio_num          = GPIO_INVERTER_LED;
-        ch_led.speed_mode        = LEDC_LOW_SPEED_MODE;
-        ch_led.channel           = LEDC_CH_LED;
-        ch_led.timer_sel         = LEDC_TIMER_ACTUATION;
-        ch_led.duty              = 0;
-        ch_led.hpoint            = 0;
-        ch_led.intr_type         = LEDC_INTR_DISABLE;
-        ch_led.flags.output_invert = 1;
-        ledc_channel_config(&ch_led);
+        // GPIO8 LED is active-LOW (wired to 3V3); OBK's PWM_Update doesn't
+        // take an invert flag, so we invert the percentage ourselves at
+        // every call site instead (100-value), same effect as the old
+        // hardware output_invert=1 we used to set on the raw LEDC channel.
+        HAL_PIN_PWM_Start(GPIO_INVERTER_LED, LEDC_FREQ_HZ_ACT);
+        HAL_PIN_PWM_Update(GPIO_INVERTER_LED, 100.0f - 0.0f);
 
         addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
-                  "GPIO actuation init: enable=GPIO%d, chargerPWM=GPIO%d ch%d, relay=GPIO%d ch%d\n",
-                  GPIO_CHARGER_ENABLE, GPIO_CHARGER_PWM, LEDC_CH_CHARGER,
-                  GPIO_RELAY_ECON, LEDC_CH_RELAY);
+                  "actuation init via OBK HAL: enable=GPIO%d(HAL_PIN_Setup_Output), chargerPWM=GPIO%d, relayPWM=GPIO%d, ledPWM=GPIO%d (HAL_PIN_PWM_Start, freq=%d)\n",
+                  GPIO_CHARGER_ENABLE, GPIO_CHARGER_PWM, GPIO_RELAY_ECON, GPIO_INVERTER_LED, LEDC_FREQ_HZ_ACT);
     }
 #endif
 
     CMD_RegisterCommand("SetDumpLoad", BL09XX_SetDumpLoad, NULL);
+#if PLATFORM_ESPIDF
+    CMD_RegisterCommand("TestChargerPinsRaw", BL09XX_TestChargerPinsRaw, NULL);
+    CMD_RegisterCommand("TestChargerPinsRegister", BL09XX_TestChargerPinsRegister, NULL);
+#endif
     CMD_RegisterCommand("EnergyCntReset", BL09XX_ResetEnergyCounter, NULL);
     CMD_RegisterCommand("ToggleAuto", BL09XX_ToggleAuto, NULL);
     CMD_RegisterCommand("SetTargetPower", BL09XX_SetTargetPower, NULL);
