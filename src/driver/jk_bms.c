@@ -47,6 +47,15 @@ static volatile bool s_subscribed   = false;
 static volatile bool s_kick_pending = false;
 static float s_balance_start        = 0.0f;
 static volatile uint32_t s_last_rx_ticks = 0; // Watchdog timer
+static volatile uint32_t s_last_connect_attempt_ticks = 0; // Boot/reconnect watchdog
+
+// If we're still not connected this long after the last connect attempt,
+// poll_task() will kick off another one (see poll_task below). This covers
+// the case where ble_gap_connect() failed synchronously - e.g. the BLE
+// controller wasn't fully up yet at boot - so no BLE_GAP_EVENT_CONNECT or
+// BLE_GAP_EVENT_DISCONNECT ever fires and the normal retry paths in
+// gap_event() never trigger, leaving the BMS stuck showing "Not paired".
+#define JKBMS_RECONNECT_TIMEOUT_MS 60000
 
 /* ---- decode helpers ------------------------------------------------------ */
 static inline uint16_t u16(const uint8_t* d, int i){ return d[i] | (d[i+1] << 8); }
@@ -250,6 +259,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
 static void start_connect(void)
 {
+    // Record the attempt regardless of outcome so the poll_task watchdog
+    // knows when we last tried, even if ble_gap_connect() below fails
+    // synchronously and never generates a GAP event of its own.
+    s_last_connect_attempt_ticks = xTaskGetTickCount();
+
     int rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY)
         ESP_LOGE(TAG, "ble_gap_connect rc=%d", rc);
@@ -297,6 +311,20 @@ static void poll_task(void *param)
                                                 REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
                 }
                 s_last_rx_ticks = xTaskGetTickCount();
+            }
+        } else if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            // Boot/reconnect watchdog: we're not connected at the GAP level
+            // at all. Normally a failed/aborted connect attempt is retried
+            // from inside gap_event() (BLE_GAP_EVENT_CONNECT/DISCONNECT).
+            // But if ble_gap_connect() itself failed synchronously (most
+            // commonly right at boot, before the BLE controller is fully
+            // ready), no GAP event ever fires and those retry paths never
+            // run - the BMS is then stuck showing "Not paired" forever.
+            // As a backstop, retry once a minute in that situation.
+            if ((xTaskGetTickCount() - s_last_connect_attempt_ticks) > pdMS_TO_TICKS(JKBMS_RECONNECT_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "Still not connected after %d s; retrying connect to BMS...",
+                         JKBMS_RECONNECT_TIMEOUT_MS / 1000);
+                start_connect();
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100)); // Yield to freeRTOS
