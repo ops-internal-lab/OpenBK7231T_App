@@ -1831,10 +1831,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     }
     else
     {
-        if (CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE))
-        {
-            real_export += -energyWh;
-        }
+        real_export += -energyWh;
     }
 //---------------------------------------
 
@@ -2096,7 +2093,7 @@ int http_fn_api_dash(http_request_t *request) {
 
     char buf[640];   /* headroom for the extended req=meters counter payload */
     int  pos     = 0;
-    int  has_ntp = CFG_HasFlag(OBK_FLAG_POWER_ALLOW_NEGATIVE) && TIME_IsTimeSynced();
+    int  has_ntp = TIME_IsTimeSynced();
 
 #define B(...) pos += snprintf(buf + pos, sizeof(buf) - pos, __VA_ARGS__)
 
