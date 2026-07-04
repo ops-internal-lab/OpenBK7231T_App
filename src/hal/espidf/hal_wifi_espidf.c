@@ -225,6 +225,38 @@ void HAL_ConnectToWiFi(const char* oob_ssid, const char* connect_key, obkStaticI
 	esp_wifi_start();
 
 	esp_netif_set_hostname(sta_netif, CFG_GetDeviceName());
+
+#if PLATFORM_ESPIDF
+	// Apply static IP if one is configured (localIPAddr[0]==0 means "use
+	// DHCP", matching the convention the /cfg_ip page and every other HAL's
+	// HAL_ConnectToWiFi already use). esp_netif_create_default_wifi_sta()
+	// above always starts the interface in DHCP-client mode; without this
+	// block a configured static IP is silently ignored and the interface
+	// stays on DHCP regardless of what was saved.
+	if (ip && ip->localIPAddr[0] != 0) {
+		esp_netif_dhcpc_stop(sta_netif);
+
+		esp_netif_ip_info_t ip_info;
+		memset(&ip_info, 0, sizeof(ip_info));
+		ip_info.ip.addr = ip->localIPAddr[0] | (ip->localIPAddr[1] << 8)
+			| (ip->localIPAddr[2] << 16) | (ip->localIPAddr[3] << 24);
+		ip_info.netmask.addr = ip->netMask[0] | (ip->netMask[1] << 8)
+			| (ip->netMask[2] << 16) | (ip->netMask[3] << 24);
+		ip_info.gw.addr = ip->gatewayIPAddr[0] | (ip->gatewayIPAddr[1] << 8)
+			| (ip->gatewayIPAddr[2] << 16) | (ip->gatewayIPAddr[3] << 24);
+		esp_netif_set_ip_info(sta_netif, &ip_info);
+
+		esp_netif_dns_info_t dns_info;
+		memset(&dns_info, 0, sizeof(dns_info));
+		dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+		dns_info.ip.u_addr.ip4.addr = ip->dnsServerIpAddr[0] | (ip->dnsServerIpAddr[1] << 8)
+			| (ip->dnsServerIpAddr[2] << 16) | (ip->dnsServerIpAddr[3] << 24);
+		esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+
+		ADDLOG_INFO(LOG_FEATURE_MAIN, "Applied static IP %d.%d.%d.%d",
+			ip->localIPAddr[0], ip->localIPAddr[1], ip->localIPAddr[2], ip->localIPAddr[3]);
+	}
+#endif
 }
 
 void HAL_DisconnectFromWifi()
