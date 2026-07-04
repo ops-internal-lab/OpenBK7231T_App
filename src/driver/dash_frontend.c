@@ -981,7 +981,16 @@ int http_fn_custom_dash(http_request_t *request) {
         "if(d.exp.h&&d.exp.h.length===3){"
         "setV('h-ee1',_wh2(d.exp.h[0])+' kWh');"
         "setV('h-ee2',_wh2(d.exp.h[1])+' kWh');"
-        "setV('h-ee3',_wh2(d.exp.h[2])+' kWh');}}}"
+        "setV('h-ee3',_wh2(d.exp.h[2])+' kWh');}}"
+        // Grid — now served by req=meters (d.grid), the per-meter store. i*=import,
+        // e*=export. Feeds the Energy Details panel (today/last-hour/total) and the
+        // modal's grid history rows (h-ci*/h-ce*).
+        "if(d.grid){var g=d.grid;"
+        "setV('d-ctoday-i',_wh2(g.id));setV('d-ctoday-e',_wh2(g.ed));"
+        "setV('d-clh-i',_wh2(g.ilh));setV('d-clh-e',_wh2(g.elh));"
+        "setV('d-tot-i',_wh1(g.it));setV('d-tot-e',_wh1(g.et));"
+        "if(g.ih&&g.ih.length===3){setV('h-ci1',_wh2(g.ih[0]));setV('h-ci2',_wh2(g.ih[1]));setV('h-ci3',_wh2(g.ih[2]));}"
+        "if(g.eh&&g.eh.length===3){setV('h-ce1',_wh2(g.eh[0]));setV('h-ce2',_wh2(g.eh[1]));setV('h-ce3',_wh2(g.eh[2]));}}}"
         "function _decodeBatt(s){var b=_b64toBytes(s),n=(b.length/2)|0,i;var chg=new Array(n),dis=new Array(n);for(i=0;i<n;i++){var enc=b[i*2]|(b[i*2+1]<<8);var mag=enc&0x1FF;var neg=(enc&0x200)!==0;var px=mag/5;chg[i]=neg?0:px;dis[i]=neg?px:0;}return {chg:chg,dis:dis};}"
         "function applyGraph(d){_decodeNet(d);if(d.batt){var bt=_decodeBatt(d.batt);state_chg=bt.chg;state_dis=bt.dis;}renderGraph();}"
         "function runCycle(){"
@@ -990,16 +999,15 @@ int http_fn_custom_dash(http_request_t *request) {
         "var needEnergy=false;if(d&&d.c){var ev=applyCore(d);needEnergy=(ev!==null)&&(ev!==lastEv||now-lastEnergyT>=60000);}"
         "xhr('/api_dash?req=bms',function(bd){if(bd)applyBms(bd);"
         "function doGraph(){if(now-lastGraphT<20000){busy=false;return;}xhr('/api_dash?req='+GTYPES[graphIdx%2],function(gd){if(gd){applyGraph(gd);lastGraphT=Date.now();graphIdx++;}busy=false;});}"
-        "function afterMeters(){if(needEnergy){xhr('/api_dash?req=energy',function(ed){if(ed)applyEnergy(ed);doGraph();});}else{doGraph();}}"
+        "function afterMeters(){doGraph();}"
         "if(now-lastMetersT>=6000){xhr('/api_dash?req=meters',function(md){if(md)applyMeters(md);lastMetersT=Date.now();afterMeters();});}else{afterMeters();}"
         "});});}"
         "function loadAll(){busy=true;busySince=Date.now();"
         "xhr('/api_dash?req=core',function(d){if(d&&d.c)applyCore(d);"
-        "xhr('/api_dash?req=energy',function(ed){if(ed)applyEnergy(ed);"
         "xhr('/api_dash?req=bms',function(bd){if(bd)applyBms(bd);"
         "xhr('/api_dash?req=meters',function(md){if(md){applyMeters(md);lastMetersT=Date.now();}"
         "xhr('/api_dash?req=net',function(g){if(g)applyGraph(g);"
-        "xhr('/api_dash?req=batt',function(g2){if(g2)applyGraph(g2);lastGraphT=Date.now();graphIdx=0;busy=false;});});});});});});}"
+        "xhr('/api_dash?req=batt',function(g2){if(g2)applyGraph(g2);lastGraphT=Date.now();graphIdx=0;busy=false;});});});});});}"
         "</script>"
     );
     rtos_delay_milliseconds(1);
