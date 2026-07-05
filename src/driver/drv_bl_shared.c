@@ -699,6 +699,25 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
 //
 // charger_pwm and relay_economiser are updated to reflect what was last
 // written to hardware (shadow state, useful for diagnostics).
+// Idempotent drive for IO4 (charger enable). Re-asserts the pad as a push-pull
+// output on EVERY write, so if anything re-muxes IO4 between actuations we
+// reclaim it before setting the level. The first few calls log the return of
+// gpio_set_direction so we can see whether the re-assert ever fails.
+#if PLATFORM_ESPIDF
+static void drive_charger_enable(int level)
+{
+    static int _log_left = 3;
+    esp_err_t e = gpio_set_direction(GPIO_CHARGER_ENABLE, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_CHARGER_ENABLE, level ? 1 : 0);
+    if (_log_left > 0) {
+        _log_left--;
+        addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                  "drive_charger_enable(%d): set_direction=%s\n",
+                  level, esp_err_to_name(e));
+    }
+}
+#endif
+
 static void ApplyDumpLoadGPIO(int state)
 {
 #if PLATFORM_ESPIDF
@@ -754,7 +773,7 @@ static void ApplyDumpLoadGPIO(int state)
     	// the output to cap at a maximum of 255.
     	if (duty > 255) duty = 255;
 
-        gpio_set_level(GPIO_CHARGER_ENABLE, 1);
+        drive_charger_enable(1);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, (uint32_t)duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
@@ -770,7 +789,7 @@ static void ApplyDumpLoadGPIO(int state)
 
     } else if (inverter_active) {
         // ----- INVERTER MODE -----
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+        drive_charger_enable(0);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
@@ -798,7 +817,7 @@ static void ApplyDumpLoadGPIO(int state)
 
     } else {
         // ----- OFF (state == 0, 1, or 2) -----
-        gpio_set_level(GPIO_CHARGER_ENABLE, 0);
+        drive_charger_enable(0);
 
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_CHARGER);
