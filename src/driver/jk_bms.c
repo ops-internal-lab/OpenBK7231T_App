@@ -52,10 +52,31 @@ static volatile uint32_t s_last_connect_attempt_ticks = 0; // Boot/reconnect wat
 static volatile uint32_t s_disconnect_ticks = 0; // when the last disconnect happened
 static volatile uint32_t s_connect_ticks = 0; // when the GATT link came up (handshake watchdog)
 static volatile int      s_stream_rekicks = 0; // consecutive 0x96 re-kicks with no data
+static volatile int      s_connect_fails  = 0; // consecutive failed connect ATTEMPTS (reset on success)
 
-// Wait this long after a disconnect before trying to reconnect (avoids
-// thrashing if the peer briefly drops and comes straight back).
-#define JKBMS_DISCONNECT_RETRY_MS 1000
+// Reconnect backoff schedule, indexed by consecutive failed connect attempts.
+// A single drop of a previously-working link retries after 1 s as before; but
+// if the BMS is genuinely away (attempt after attempt fails), we back off so
+// the radio spends most of its time IDLE instead of initiating. This matters
+// because on a single-radio part (ESP32-C3) the *initiating* state occupies
+// the receiver for scan_window out of every scan_itvl (see start_connect) and
+// competes with WiFi for antenna time via the SW coexistence arbiter -- a
+// permanent back-to-back connect loop visibly degrades WiFi/HTTP.
+static const uint32_t s_backoff_ms[] = { 1000, 2000, 5000, 15000, 30000 };
+#define JKBMS_BACKOFF_STEPS (sizeof(s_backoff_ms) / sizeof(s_backoff_ms[0]))
+
+static uint32_t jkbms_retry_delay_ms(void)
+{
+    int f = s_connect_fails;
+    if (f < 0) f = 0;
+    if (f >= (int)JKBMS_BACKOFF_STEPS) f = (int)JKBMS_BACKOFF_STEPS - 1;
+    return s_backoff_ms[f];
+}
+
+// One direct-connect attempt window. 10 s of listening is plenty for a JK
+// that advertises every ~1 s; keeping the window short (vs the old 30 s)
+// means the backoff gaps between attempts actually free the radio.
+#define JKBMS_CONNECT_ATTEMPT_MS 10000
 
 // If we're still not connected this long after the last connect attempt,
 // poll_task() will kick off another one (see poll_task below). This covers
@@ -237,11 +258,24 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_connect_ticks = xTaskGetTickCount(); // arm handshake watchdog
+            s_connect_fails = 0;                   // peer reachable: reset backoff
             ESP_LOGI(TAG, "Connected; exchanging MTU...");
             ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
         } else {
-            ESP_LOGW(TAG, "Connect failed (status=%d); retrying", event->connect.status);
-            start_connect();
+            // Do NOT call start_connect() from here. Two reasons:
+            //  1. Same host-task re-entry hazard the DISCONNECT handler below
+            //     already documents -- this callback runs on the NimBLE host
+            //     task, and re-entering ble_gap_connect() from inside a GAP
+            //     event risks stalling the host's event processing.
+            //  2. An immediate retry produces a back-to-back initiating loop
+            //     (each attempt = scan_window/scan_itvl receiver duty) with no
+            //     idle gap for WiFi whenever the BMS is away. Scheduling the
+            //     retry through poll_task applies the backoff instead.
+            ESP_LOGW(TAG, "Connect failed (status=%d); retry in %u ms",
+                     event->connect.status, (unsigned)jkbms_retry_delay_ms());
+            s_connect_fails++;
+            s_disconnect_ticks  = xTaskGetTickCount();
+            s_reconnect_pending = true;
         }
         return 0;
 
@@ -303,11 +337,47 @@ static void start_connect(void)
     // synchronously and never generates a GAP event of its own.
     s_last_connect_attempt_ticks = xTaskGetTickCount();
 
-    int rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, gap_event, NULL);
-    if (rc != 0 && rc != BLE_HS_EALREADY)
-        ESP_LOGE(TAG, "ble_gap_connect rc=%d", rc);
-    else
-        ESP_LOGI(TAG, "Attempting direct connect to BMS...");
+    // Explicit connection parameters. The key pair is scan_itvl/scan_window:
+    // a "direct connect by MAC" still puts the controller in the INITIATING
+    // state, where it listens for the peer's advertising packets exactly like
+    // a scan (just address-filtered) -- these two fields set that listening
+    // duty cycle. NimBLE's defaults (NULL params) are itvl == window == 10 ms,
+    // i.e. the receiver is on 100% of the attempt window, which starves WiFi
+    // on a shared-radio chip. 10 ms every 60 ms (~17%) still catches a JK
+    // advertising at ~1 Hz within a few seconds, but leaves the antenna free.
+    //
+    // The link parameters are deliberately relaxed too: a 45-90 ms connection
+    // interval is far more than fast enough for a 300-byte frame every 2 s,
+    // and a 5 s supervision timeout rides out WiFi-induced jitter that would
+    // drop the link at NimBLE's default 640 ms -- fewer drops means fewer
+    // reconnect cycles in the first place.
+    struct ble_gap_conn_params cp = {
+        .scan_itvl           = 0x0060,   /* 96  * 0.625 ms = 60 ms            */
+        .scan_window         = 0x0010,   /* 16  * 0.625 ms = 10 ms (~17% duty)*/
+        .itvl_min            = 36,       /* 36  * 1.25 ms  = 45 ms            */
+        .itvl_max            = 72,       /* 72  * 1.25 ms  = 90 ms            */
+        .latency             = 0,
+        .supervision_timeout = 500,      /* 500 * 10 ms    = 5 s              */
+        .min_ce_len          = 0,
+        .max_ce_len          = 0,
+    };
+
+    int rc = ble_gap_connect(s_own_addr_type, &s_peer,
+                             JKBMS_CONNECT_ATTEMPT_MS, &cp, gap_event, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        // Synchronous failure: no GAP event will ever fire for this attempt,
+        // so nothing else would retry until the 60 s watchdog. Schedule a
+        // backoff retry ourselves (poll_task picks it up), same as an async
+        // connect failure.
+        ESP_LOGE(TAG, "ble_gap_connect rc=%d; retry in %u ms",
+                 rc, (unsigned)jkbms_retry_delay_ms());
+        s_connect_fails++;
+        s_disconnect_ticks  = xTaskGetTickCount();
+        s_reconnect_pending = true;
+    } else {
+        ESP_LOGI(TAG, "Attempting direct connect to BMS (attempt fails so far: %d)...",
+                 s_connect_fails);
+    }
 }
 
 /* ---- host lifecycle ------------------------------------------------------ */
@@ -396,11 +466,16 @@ static void poll_task(void *param)
             }
         } else /* s_conn_handle == BLE_HS_CONN_HANDLE_NONE */ {
             if (s_reconnect_pending) {
-                // Fast path: a disconnect just happened (see gap_event's
-                // BLE_GAP_EVENT_DISCONNECT). Wait out the short cooldown,
-                // then reconnect - from this task, not the NimBLE host task.
-                if ((xTaskGetTickCount() - s_disconnect_ticks) >= pdMS_TO_TICKS(JKBMS_DISCONNECT_RETRY_MS)) {
-                    ESP_LOGI(TAG, "Reconnecting after disconnect...");
+                // A disconnect or a failed connect attempt scheduled a retry
+                // (see gap_event). Wait out the backoff, then reconnect --
+                // from this task, not the NimBLE host task. The delay grows
+                // with consecutive failed attempts (1 s ... 30 s) so a BMS
+                // that is genuinely away doesn't keep the radio initiating
+                // full-time; a one-off drop of a working link still retries
+                // after 1 s exactly as before.
+                if ((xTaskGetTickCount() - s_disconnect_ticks) >= pdMS_TO_TICKS(jkbms_retry_delay_ms())) {
+                    ESP_LOGI(TAG, "Reconnecting (backoff was %u ms)...",
+                             (unsigned)jkbms_retry_delay_ms());
                     start_connect();
                 }
             } else if ((xTaskGetTickCount() - s_last_connect_attempt_ticks) > pdMS_TO_TICKS(JKBMS_RECONNECT_TIMEOUT_MS)) {
