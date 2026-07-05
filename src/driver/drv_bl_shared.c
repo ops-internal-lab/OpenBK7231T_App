@@ -255,13 +255,24 @@ static int64_t meter_acc[N_METERS] = {0,0,0,0,0,0};
 #define GRP_GRID  0
 #define GRP_SOLAR 1
 #define GRP_BATT  2
+// Per-GROUP accounting store. Compact running totals instead of 4x96 raw
+// slots: at each 15-min commit the interval net is added straight into today's
+// gross import/export, pushed into a 4-slot last-hour ring, and rolled into
+// the lifetime buckets. Daily history is a direct read; the graph keeps its
+// own separate FlashVars matrices. ~41 B/group vs the old ~768 B, so it
+// persists to NVS as easily as the lifetime totals do (this is what fixes the
+// "everything but totals zeroed on power-up" symptom).
+//   day_imp/day_exp : gross ticks, [0]=today .. [3]=3 days ago. int32 because
+//                     a single day can reach ~257k ticks (~50 kWh), well past
+//                     int16 (6.4 kWh) / uint16 (12.8 kWh).
+//   lh              : last 4 COMPLETED interval nets (ring) -> last hour.
 typedef struct {
-    int16_t slots[DAY_SLOTS];   // today   (group-net ticks per 15-min)
-    int16_t day1[DAY_SLOTS];    // yesterday
-    int16_t day2[DAY_SLOTS];    // 2 days ago
-    int16_t day3[DAY_SLOTS];    // 3 days ago
-} group_day_store_t;
-static group_day_store_t g_grp[N_GROUPS];
+    int32_t day_imp[4];
+    int32_t day_exp[4];
+    int16_t lh[4];
+    uint8_t lh_head;
+} group_acct_t;
+static group_acct_t g_grp[N_GROUPS];
 
 // Live per-GROUP accumulator for the interval in progress (raw signed ticks,
 // int32 headroom). Folded into Today and Total on the fly; frozen into the
@@ -296,44 +307,27 @@ static int16_t ticks_to_slot(long v) {
 
 // ---- Derive helpers: everything the UI shows is summed from group slots ----
 // Pick a group's day array by age: 0=today 1=yesterday 2=2d 3=3d.
-static const int16_t *grp_day(int grp, int age) {
-    const group_day_store_t *g = &g_grp[grp];
-    switch (age) { case 0: return g->slots; case 1: return g->day1;
-                   case 2: return g->day2; default: return g->day3; }
+// GROSS import/export ticks for a group/day — now a direct read of the running
+// daily accumulators, not a per-slot sum. For today (age 0) the in-progress
+// interval (g_cur_ticks) is folded in with its sign, so Today reflects energy
+// up to this instant (same rule as before). History days are stored pre-summed.
+static long grp_import(int grp, int age) {
+    long s = g_grp[grp].day_imp[age];
+    if (age == 0) { long c = g_cur_ticks[grp]; if (c > 0) s += c; }
+    return s;
 }
-
-// GROSS import (positive slots) or export (|negative slots|) for a group/day,
-// split PER SLOT — so a slot's import never nets against another slot's export.
-// dir: +1 = sum positive slots, -1 = sum |negative slots|.
-// For today (age 0) the in-progress interval (g_cur_ticks) is folded in with
-// its own running sign, so Today reflects energy up to this instant. Slots up
-// to g_cur_slot-1 are complete; the slot at g_cur_slot is still filling, so we
-// use the live accumulator for it instead of the (stale/zero) slot.
-static long grp_gross(int grp, int age, int dir) {
-    const int16_t *d = grp_day(grp, age);
-    long s = 0; int i;
-    int last = (age == 0)
-             ? ((g_cur_slot < 0) ? -1 : g_cur_slot - 1)   // completed slots only
-             : DAY_SLOTS - 1;
-    for (i = 0; i <= last; i++) {
-        long v = d[i];
-        if (dir > 0) { if (v > 0) s += v; }
-        else         { if (v < 0) s += -v; }
-    }
-    if (age == 0) {                          // fold in the live interval
-        long cur = g_cur_ticks[grp];
-        if (dir > 0) { if (cur > 0) s += cur; }
-        else         { if (cur < 0) s += -cur; }
-    }
+static long grp_export(int grp, int age) {
+    long s = g_grp[grp].day_exp[age];
+    if (age == 0) { long c = g_cur_ticks[grp]; if (c < 0) s += -c; }
     return s;
 }
 
-// Today (with current interval folded in).
-static long grid_import(int age)  { return grp_gross(GRP_GRID,  age, +1); }
-static long grid_export(int age)  { return grp_gross(GRP_GRID,  age, -1); }
-static long solar_gen(int age)    { return grp_gross(GRP_SOLAR, age, +1); }   // one-way
-static long ess_charge(int age)   { return grp_gross(GRP_BATT,  age, +1); }
-static long ess_discharge(int age){ return grp_gross(GRP_BATT,  age, -1); }
+// Today (with current interval folded in) / history (direct).
+static long grid_import(int age)  { return grp_import(GRP_GRID,  age); }
+static long grid_export(int age)  { return grp_export(GRP_GRID,  age); }
+static long solar_gen(int age)    { return grp_import(GRP_SOLAR, age); }   // one-way
+static long ess_charge(int age)   { return grp_import(GRP_BATT,  age); }
+static long ess_discharge(int age){ return grp_export(GRP_BATT,  age); }
 
 // Lifetime TOTAL = permanent bucket + the current in-progress interval, so a
 // total never lags a partial interval behind (same rule as Today).
@@ -344,14 +338,14 @@ static long ess_charge_total(void)   { long c = g_cur_ticks[GRP_BATT];  return (
 static long ess_discharge_total(void){ long c = g_cur_ticks[GRP_BATT];  return (long)life_ess_dis  + (c < 0 ? -c : 0); }
 
 // Last hour = the 4 most-recently-COMPLETED today slots, GROSS per slot.
+// Last hour = the 4 most recent COMPLETED interval nets (ring), split by sign.
+// The in-progress interval is intentionally excluded (matches the old "last 4
+// completed slots" behaviour). Ring order is irrelevant to a sum.
 static long grp_lasthour(int grp, int dir) {
-    const int16_t *d = g_grp[grp].slots;
+    const group_acct_t *a = &g_grp[grp];
     long s = 0; int k;
-    int last = g_cur_slot - 1;
     for (k = 0; k < 4; k++) {
-        int idx = last - k;
-        if (idx < 0) break;
-        long v = d[idx];
+        long v = a->lh[k];
         if (dir > 0) { if (v > 0) s += v; }
         else         { if (v < 0) s += -v; }
     }
@@ -1018,12 +1012,16 @@ static void COUNTERS_Save(void)
 {
     nvs_handle_t h = 0;
     if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
-    /* Per-GROUP store: today + 3 days of 96 int16 slots, one blob per group
-       (keys grp0..grp2, ~768 B each). */
+    /* Per-GROUP store: compact accounting struct, one blob per group
+       (keys grp0..grp2, ~41 B each — reuses the old keys so the previous
+       ~768 B blobs are superseded and their NVS space reclaimed). */
     { int g; char k[8];
       for (g = 0; g < N_GROUPS; g++) {
           snprintf(k, sizeof(k), "grp%d", g);
-          nvs_set_blob(h, k, &g_grp[g], sizeof(group_day_store_t));
+          esp_err_t rc = nvs_set_blob(h, k, &g_grp[g], sizeof(group_acct_t));
+          if (rc != ESP_OK)
+              addLogAdv(LOG_ERROR, LOG_FEATURE_ENERGYMETER,
+                        "COUNTERS_Save: grp%d blob write failed rc=%d\n", g, rc);
       } }
     /* Lifetime buckets (totals forever, gross). */
     nvs_set_i64(h, "glImp",  life_grid_imp);
@@ -1050,8 +1048,11 @@ static void COUNTERS_Load(void)
     { int g; char k[8]; size_t sz;
       for (g = 0; g < N_GROUPS; g++) {
           snprintf(k, sizeof(k), "grp%d", g);
-          sz = sizeof(group_day_store_t);
-          nvs_get_blob(h, k, &g_grp[g], &sz);    /* leaves zeroed if absent */
+          sz = sizeof(group_acct_t);
+          /* Absent, OR an old-format (~768 B) blob whose size no longer
+             matches -> left zeroed. History resets once on upgrade; totals
+             and graph are unaffected. Re-saved in the new format next commit. */
+          nvs_get_blob(h, k, &g_grp[g], &sz);
       } }
     if (nvs_get_i64(h, "glImp",  &v64) == ESP_OK) life_grid_imp = v64;
     if (nvs_get_i64(h, "glExp",  &v64) == ESP_OK) life_grid_exp = v64;
@@ -1527,14 +1528,14 @@ void BL_ProcessSweep(void) {
     // Fold-in done: clear this cycle's deltas so nothing is counted twice.
     BL_MeterCfConsume();
 
-    // --- 15-min slot commit + local-midnight roll (per-meter store) ---
-    // Every completed 15-min interval, each meter's accumulated calibrated Wh
-    // (g_cur_ticks) is written into today's current slot and the accumulator is
-    // reset. At local midnight the whole 96-slot arrays shift down a day
-    // (3d<-2d<-1d<-today) and today is zeroed. The store is the single source
-    // of truth: everything displayed is re-summed from these slots, so a save
-    // here (COUNTERS_Save persists all 4 days x 6 meters + the tick totals)
-    // fully captures state — no separate running accumulators to keep in sync.
+    // --- 15-min interval commit + local-midnight roll (per-GROUP store) ---
+    // Every completed 15-min interval, each group's net (g_cur_ticks) is added
+    // straight into today's gross import/export accumulator, pushed into the
+    // 4-slot last-hour ring, and rolled into the lifetime bucket; then the
+    // accumulator is reset. At local midnight the small day_imp/day_exp arrays
+    // shift down a day (3d<-2d<-1d<-today) and today is zeroed. Today/Total/
+    // Last-Hour are direct reads of these running totals, so a save here
+    // (COUNTERS_Save) fully captures state.
     if (TIME_IsTimeSynced()) {
         static int last_qhr = -1;
         int msm  = TIME_GetHour() * 60 + TIME_GetMinute();
@@ -1546,29 +1547,38 @@ void BL_ProcessSweep(void) {
             g_cur_slot = qhr;
         } else if (qhr != last_qhr) {
             int g;
-            int completed = last_qhr;               // the slot we were filling
 
-            // Freeze each GROUP's interval net into its slot, and roll that same
-            // net into the sign-appropriate LIFETIME bucket (gross: import never
-            // cancels export across intervals). One 15-min commit does slot +
-            // lifetime together, so Today/Total/Last-Hour can never disagree.
+            // Commit each GROUP's completed interval net: gross into today,
+            // into the last-hour ring, and into the sign-appropriate LIFETIME
+            // bucket (gross: import never cancels export across intervals). One
+            // 15-min commit does all three together, so Today/Total/Last-Hour
+            // can never disagree. (For solar the export side is never read —
+            // one-way — same as the old store's negative slots.)
             for (g = 0; g < N_GROUPS; g++) {
                 long net = g_cur_ticks[g];
-                if (completed >= 0 && completed < DAY_SLOTS)
-                    g_grp[g].slots[completed] = ticks_to_slot(net);
+                if (net > 0) g_grp[g].day_imp[0] += net;
+                else         g_grp[g].day_exp[0] += -net;
+                g_grp[g].lh[g_grp[g].lh_head] = ticks_to_slot(net);
+                g_grp[g].lh_head = (uint8_t)((g_grp[g].lh_head + 1) & 3);
                 if (g == GRP_GRID)  { if (net > 0) life_grid_imp += net; else life_grid_exp += -net; }
                 else if (g == GRP_SOLAR) { if (net > 0) life_solar += net; }   // one-way
                 else /* GRP_BATT */ { if (net > 0) life_ess_chg += net; else life_ess_dis += -net; }
                 g_cur_ticks[g] = 0;
             }
 
-            // Local-midnight wrap: new interval index went backwards.
+            // Local-midnight wrap: new interval index went backwards. Shift the
+            // daily totals down one day and clear today (the last-hour ring is
+            // left intact so last-hour can span midnight).
             if (qhr < last_qhr) {
                 for (g = 0; g < N_GROUPS; g++) {
-                    memcpy(g_grp[g].day3, g_grp[g].day2, sizeof(g_grp[g].day2));
-                    memcpy(g_grp[g].day2, g_grp[g].day1, sizeof(g_grp[g].day1));
-                    memcpy(g_grp[g].day1, g_grp[g].slots, sizeof(g_grp[g].slots));
-                    memset(g_grp[g].slots, 0, sizeof(g_grp[g].slots));
+                    g_grp[g].day_imp[3] = g_grp[g].day_imp[2];
+                    g_grp[g].day_imp[2] = g_grp[g].day_imp[1];
+                    g_grp[g].day_imp[1] = g_grp[g].day_imp[0];
+                    g_grp[g].day_imp[0] = 0;
+                    g_grp[g].day_exp[3] = g_grp[g].day_exp[2];
+                    g_grp[g].day_exp[2] = g_grp[g].day_exp[1];
+                    g_grp[g].day_exp[1] = g_grp[g].day_exp[0];
+                    g_grp[g].day_exp[0] = 0;
                 }
                 actual_mday = TIME_GetMDay();
             }
