@@ -699,21 +699,42 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
 //
 // charger_pwm and relay_economiser are updated to reflect what was last
 // written to hardware (shadow state, useful for diagnostics).
-// Idempotent drive for IO4 (charger enable). Re-asserts the pad as a push-pull
-// output on EVERY write, so if anything re-muxes IO4 between actuations we
-// reclaim it before setting the level. The first few calls log the return of
-// gpio_set_direction so we can see whether the re-assert ever fails.
+// Register-level drive for IO4 (charger enable). Bypasses gpio_set_level and
+// the peripheral GPIO-matrix bindings entirely. On EVERY call it:
+//   1) re-selects the pad as a plain GPIO in the IO MUX,
+//   2) routes the simple GPIO-out signal to it (detaching any peripheral,
+//      e.g. LEDC, that may have grabbed the pad in the matrix),
+//   3) turns the pad's output driver on,
+//   4) writes the atomic set/clear output register directly.
+// Idempotent at the register level — whatever re-muxed IO4 in between is undone
+// here before the level is written. Readback comes from GPIO.in (actual pad).
 #if PLATFORM_ESPIDF
+#include "soc/gpio_struct.h"    // GPIO.out_w1ts / out_w1tc / enable_w1ts / in
+#include "soc/gpio_sig_map.h"   // SIG_GPIO_OUT_IDX
+#include "esp_rom_gpio.h"       // esp_rom_gpio_pad_select_gpio / connect_out_signal
+
 static void drive_charger_enable(int level)
 {
     static int _log_left = 3;
-    esp_err_t e = gpio_set_direction(GPIO_CHARGER_ENABLE, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_CHARGER_ENABLE, level ? 1 : 0);
+    const uint32_t mask = (1U << GPIO_CHARGER_ENABLE);
+
+    // 1) + 2) reclaim the pad from any peripheral and give it back to plain GPIO
+    esp_rom_gpio_pad_select_gpio(GPIO_CHARGER_ENABLE);
+    esp_rom_gpio_connect_out_signal(GPIO_CHARGER_ENABLE, SIG_GPIO_OUT_IDX, false, false);
+
+    // 3) enable this pad's output driver (ESP32-C3: <=32 GPIOs, single register)
+    GPIO.enable_w1ts.val = mask;
+
+    // 4) drive high/low via the write-1-to-set / write-1-to-clear registers
+    if (level) GPIO.out_w1ts.val = mask;
+    else       GPIO.out_w1tc.val = mask;
+
     if (_log_left > 0) {
         _log_left--;
+        int rb = (GPIO.in.val >> GPIO_CHARGER_ENABLE) & 1;   // actual pad level
         addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
-                  "drive_charger_enable(%d): set_direction=%s\n",
-                  level, esp_err_to_name(e));
+                  "drive_charger_enable(%d) RAW: wrote=%d readback=%d\n",
+                  level, level ? 1 : 0, rb);
     }
 }
 #endif
