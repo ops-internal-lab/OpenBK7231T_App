@@ -2649,3 +2649,53 @@ int BL_HasEnergySensorReading(energySensor_t type)
 {
     return BL_HasEnergySensorReadingEx(BL_SENSORS_IX_0, type);
 }
+
+/* ===========================================================================
+   MQTT publish snapshot  (see bl_pub_snapshot_t in drv_bl_shared.h)
+   Called from the MQTT streamer task (drv_mqtt_stream.c). Reads only.
+   All group/controller values live as file-scope statics above, so this
+   accessor exists purely to hand them across the module boundary.
+   =========================================================================== */
+void BL_GetPublishSnapshot(bl_pub_snapshot_t *s)
+{
+    int   i;
+    float v, a, w; int on;
+
+    if (!s) return;
+
+    /* --- grid phase voltages (NAN when offline so the streamer skips them) --- */
+    BL_GetMeter(0, &v, &a, &w, &on); s->grid_l1_v = on ? v : NAN;
+    BL_GetMeter(1, &v, &a, &w, &on); s->grid_l2_v = on ? v : NAN;
+    BL_GetMeter(2, &v, &a, &w, &on); s->grid_l3_v = on ? v : NAN;
+
+    /* --- instant group power: signed sum of ONLINE meter watts --- */
+    s->grid_power = 0.0f;
+    for (i = 0; i < 3; i++) if (BL_MeterOnlineState(i)) s->grid_power += g_meter[i].w;
+    s->solar_power = 0.0f;
+    for (i = 3; i < 5; i++) if (BL_MeterOnlineState(i)) s->solar_power += g_meter[i].w;
+    s->ess_ac_power = BL_MeterOnlineState(5) ? g_meter[5].w : 0.0f;
+
+    /* --- net energy (Wh) --- */
+    s->net_energy = net_energy;
+
+    /* --- group energy counters (Wh) --- */
+    s->grid_import_total_wh    = ticks_to_wh(grid_import_total());
+    s->grid_export_total_wh    = ticks_to_wh(grid_export_total());
+    s->grid_import_lasthour_wh = ticks_to_wh(grid_imp_lh());
+    s->grid_import_today_wh    = ticks_to_wh(grid_import(0));
+    s->grid_export_lasthour_wh = ticks_to_wh(grid_exp_lh());
+    s->grid_export_today_wh    = ticks_to_wh(grid_export(0));
+    s->solar_lasthour_wh       = ticks_to_wh(solar_lh());
+    s->solar_today_wh          = ticks_to_wh(solar_gen(0));
+    s->solar_total_wh          = ticks_to_wh(solar_total());
+
+    /* --- ESS / controller state --- */
+    s->ess_charger_mode   = charger_c_auto ? 0 : (charger_manual_temp ? 1 : 2);
+    s->ess_divert_mode    = divert_user;
+    s->ess_inverter1_on   = (persistent_state >= 3 && persistent_state <= 5) ? 1 : 0;
+    s->ess_inverter2_on   = g_inv2_on ? 1 : 0;
+    s->ess_charger_pwm    = (persistent_state < 10) ? 0 : persistent_state;
+    s->ess_divert_on      = divert_is_on ? 1 : 0;
+    s->ess_inverter_gated = inverter_gated ? 1 : 0;
+    s->ess_charger_gated  = charger_gated ? 1 : 0;
+}

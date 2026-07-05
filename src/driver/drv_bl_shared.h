@@ -42,3 +42,38 @@ void BL_ProcessSweep(void);                                       /* once per fu
 void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState);
 void BL09XX_SaveEmeteringStatistics();
 
+
+/* ===========================================================================
+   MQTT publish snapshot  (consumed by drv_mqtt_stream.c)
+   ---------------------------------------------------------------------------
+   One-shot copy of every drv_bl_shared-owned value the MQTT streamer pushes,
+   so the streamer never reaches into this driver's file-scope statics.
+   Offline phase voltages come back as NAN so the streamer can skip them
+   (a frozen/offline meter must not republish).
+   =========================================================================== */
+typedef struct {
+    /* grid */
+    float grid_l1_v, grid_l2_v, grid_l3_v;   /* NAN when that phase is offline  */
+    float grid_power;                        /* signed sum of ONLINE phase W     */
+    float net_energy;                        /* Wh (repurposed reactive slot)    */
+    int   grid_import_total_wh, grid_export_total_wh;
+    int   grid_import_lasthour_wh, grid_import_today_wh;
+    int   grid_export_lasthour_wh, grid_export_today_wh;
+    /* solar */
+    float solar_power;                       /* signed sum of ONLINE solar W      */
+    int   solar_lasthour_wh, solar_today_wh, solar_total_wh;
+    /* ess / controller */
+    float ess_ac_power;                      /* slot 5 W, signed (0 if offline)   */
+    int   ess_charger_mode;                  /* 0 auto / 1 man-temp / 2 man-lock  */
+    int   ess_divert_mode;                   /* 0 auto / 1 temp / 2 lock          */
+    int   ess_inverter1_on;                  /* derived from persistent_state     */
+    int   ess_inverter2_on;                  /* g_inv2_on                         */
+    int   ess_charger_pwm;                   /* 0, or 10..100                     */
+    int   ess_divert_on;                     /* divert_is_on                      */
+    int   ess_inverter_gated;                /* BMS min-cell cut                  */
+    int   ess_charger_gated;                 /* BMS max-cell cut                  */
+} bl_pub_snapshot_t;
+
+/* Fill *out with the current grouped values. Read-only; safe to call from
+   another task (each field is a single-word copy). */
+void BL_GetPublishSnapshot(bl_pub_snapshot_t *out);
