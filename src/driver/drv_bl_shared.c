@@ -743,6 +743,7 @@ static void ApplyDumpLoadGPIO(int state)
     if (charger_active) {
         // ----- CHARGER MODE -----
         // Linear map of the 12..100 duty range onto 0..255: 12->0, 100->255.
+		int duty = 0;
 		if (state < 12) {
         duty = 0;
 	    } else {
