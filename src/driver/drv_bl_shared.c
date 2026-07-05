@@ -195,6 +195,12 @@ static unsigned char g_inv2_ip      = 0;     // Boost Inverter (remote), last oc
 static unsigned char g_bypass_ip    = 0;     // Diversion Load (remote), last octet
 static int           g_boost_power   = 10;   // Boost net-energy trigger (Wh)
 static int           g_inv2_on       = 0;    // Boost Inverter desired state
+// Gauge Ranges panel (top-bar gear icon): full-scale wattage for the solar
+// and battery ESS rings. Unlike per-phase/net-bar/deadband (pure client-side
+// display prefs), these two are flash-persisted like the rest of "System
+// Configuration" above, via SetSolarPowerRange/SetBattPowerRange + SaveCfg.
+static int           g_solar_power_range_w = 5000;   // Gauge Ranges: solar ring full-scale (W)
+static int           g_batt_power_range_w  = 5000;   // Gauge Ranges: battery ESS ring full-scale (W)
 static void SETTINGS_Save(void);             // defined after the NVS includes below
 static void COUNTERS_Save(void);             // defined after the NVS includes below
 
@@ -961,6 +967,8 @@ static void SETTINGS_Save(void)
     nvs_set_i32(h, "tpa",     target_power_auto);
     nvs_set_i32(h, "ccut",    (int)(charger_cutoff_v  * 100.0f + 0.5f));
     nvs_set_i32(h, "icut",    (int)(inverter_cutoff_v * 100.0f + 0.5f));
+    nvs_set_i32(h, "solrng",  g_solar_power_range_w);
+    nvs_set_i32(h, "battrng", g_batt_power_range_w);
     nvs_set_str(h, "bmsmac",  g_bms_mac);
     nvs_set_str(h, "bms2mac", g_bms2_mac);
     nvs_commit(h);
@@ -996,6 +1004,8 @@ static void SETTINGS_Load(void)
     if (nvs_get_i32(h, "tpa",     &i32v) == ESP_OK) target_power_auto = i32v;
     if (nvs_get_i32(h, "ccut",    &i32v) == ESP_OK) charger_cutoff_v  = i32v / 100.0f;
     if (nvs_get_i32(h, "icut",    &i32v) == ESP_OK) inverter_cutoff_v = i32v / 100.0f;
+    if (nvs_get_i32(h, "solrng",  &i32v) == ESP_OK) g_solar_power_range_w = i32v;
+    if (nvs_get_i32(h, "battrng", &i32v) == ESP_OK) g_batt_power_range_w  = i32v;
     len = sizeof(g_bms_mac);  nvs_get_str(h, "bmsmac",  g_bms_mac,  &len);
     len = sizeof(g_bms2_mac); nvs_get_str(h, "bms2mac", g_bms2_mac, &len);
     nvs_close(h);
@@ -1167,6 +1177,23 @@ commandResult_t BL09XX_SetBypassIP(const void *context, const char *cmd, const c
 commandResult_t BL09XX_SetBoostPower(const void *context, const char *cmd, const char *args, int cmdFlags)
 {
     if (args && *args) { int v = atoi(args); if (v < 0) v = 0; if (v > 500) v = 500; g_boost_power = v; }
+    return CMD_RES_OK;
+}
+
+// SetSolarPowerRange <W> — Gauge Ranges panel: solar ring full-scale wattage.
+// RAM-only, like SetBoostPower above: the panel's Save button pushes this
+// (and SetBattPowerRange) then calls SaveCfg once, in one flash write.
+commandResult_t BL09XX_SetSolarPowerRange(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { int v = atoi(args); if (v < 500) v = 500; if (v > 30000) v = 30000; g_solar_power_range_w = v; }
+    return CMD_RES_OK;
+}
+
+// SetBattPowerRange <W> — Gauge Ranges panel: battery ESS ring full-scale wattage.
+// RAM-only; see SetSolarPowerRange.
+commandResult_t BL09XX_SetBattPowerRange(const void *context, const char *cmd, const char *args, int cmdFlags)
+{
+    if (args && *args) { int v = atoi(args); if (v < 500) v = 500; if (v > 20000) v = 20000; g_batt_power_range_w = v; }
     return CMD_RES_OK;
 }
 
@@ -2135,6 +2162,8 @@ void BL_Shared_Init(void)
     CMD_RegisterCommand("SetInv2IP", BL09XX_SetInv2IP, NULL);
     CMD_RegisterCommand("SetBypassIP", BL09XX_SetBypassIP, NULL);
     CMD_RegisterCommand("SetBoostPower", BL09XX_SetBoostPower, NULL);
+    CMD_RegisterCommand("SetSolarPowerRange", BL09XX_SetSolarPowerRange, NULL);
+    CMD_RegisterCommand("SetBattPowerRange", BL09XX_SetBattPowerRange, NULL);
     CMD_RegisterCommand("SetInv2", BL09XX_SetInv2, NULL);
     CMD_RegisterCommand("SaveCfg", BL09XX_SaveCfg, NULL);
     CMD_RegisterCommand("SetChargerCutoff", BL09XX_SetChargerCutoff, NULL);
@@ -2457,6 +2486,7 @@ int http_fn_api_dash(http_request_t *request) {
         if (g_inv2_ip)   B("\"inv2\":\"%d\",", g_inv2_ip);  else B("\"inv2\":\"\",");
         if (g_bypass_ip) B("\"byp\":\"%d\",", g_bypass_ip); else B("\"byp\":\"\",");
         B("\"boost\":%d,\"dthr\":%d", g_boost_power, divert_threshold);
+        B(",\"solrng\":%d,\"battrng\":%d", g_solar_power_range_w, g_batt_power_range_w);
         // Device IP — static, for the SYSTEM panel (served once with the config
         // the page fetches on load; it doesn't change at runtime).
         { const char *ip = HAL_GetMyIPString(); B(",\"ip\":\"%s\"", ip ? ip : ""); }

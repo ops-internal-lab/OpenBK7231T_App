@@ -50,6 +50,8 @@ static float s_balance_start        = 0.0f;
 static volatile uint32_t s_last_rx_ticks = 0; // Watchdog timer
 static volatile uint32_t s_last_connect_attempt_ticks = 0; // Boot/reconnect watchdog
 static volatile uint32_t s_disconnect_ticks = 0; // when the last disconnect happened
+static volatile uint32_t s_connect_ticks = 0; // when the GATT link came up (handshake watchdog)
+static volatile int      s_stream_rekicks = 0; // consecutive 0x96 re-kicks with no data
 
 // Wait this long after a disconnect before trying to reconnect (avoids
 // thrashing if the peer briefly drops and comes straight back).
@@ -62,6 +64,23 @@ static volatile uint32_t s_disconnect_ticks = 0; // when the last disconnect hap
 // BLE_GAP_EVENT_DISCONNECT ever fires and the normal retry paths in
 // gap_event() never trigger, leaving the BMS stuck showing "Not paired".
 #define JKBMS_RECONNECT_TIMEOUT_MS 60000
+
+// Handshake watchdog: once GAP-connected, the GATT bring-up (MTU exchange,
+// service/char/CCCD discovery, CCCD write, first stream kick) must finish
+// within this window. If it stalls - discovery returns without finding
+// 0xFFE0/0xFFE1/CCCD, a callback fires with an unexpected error status, or a
+// ble_gattc_*() call fails synchronously so no callback ever runs - the
+// connection stays up but s_subscribed never becomes true. None of the other
+// watchdogs cover that state (the reconnect logic only runs when there is NO
+// connection). When this fires we terminate the link so the normal
+// disconnect -> reconnect path takes over.
+#define JKBMS_HANDSHAKE_TIMEOUT_MS 15000
+
+// Stream watchdog escalation: after this many consecutive 0x96 re-kicks with
+// still no data, stop kicking a link that clearly won't stream and terminate
+// it so we reconnect from scratch (a fresh connection often revives a JK that
+// has silently stopped notifying).
+#define JKBMS_STREAM_REKICK_LIMIT 3
 
 /* ---- decode helpers ------------------------------------------------------ */
 static inline uint16_t u16(const uint8_t* d, int i){ return d[i] | (d[i+1] << 8); }
@@ -117,6 +136,7 @@ static void feed(const uint8_t *data, int len)
 {
     // Feed resets the watchdog timer
     s_last_rx_ticks = xTaskGetTickCount();
+    s_stream_rekicks = 0; // healthy data clears the escalation counter
 
     if (len >= 4 && data[0]==0x55 && data[1]==0xAA && data[2]==0xEB && data[3]==0x90)
         s_len = 0;                                   
@@ -216,6 +236,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            s_connect_ticks = xTaskGetTickCount(); // arm handshake watchdog
             ESP_LOGI(TAG, "Connected; exchanging MTU...");
             ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
         } else {
@@ -229,6 +250,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_subscribed  = false;
         s_kick_pending = false;
+        s_stream_rekicks = 0;
         s_len = 0;
         // Do NOT reconnect from here: this callback runs on the NimBLE host
         // task, and blocking it (this used to vTaskDelay here) or re-entering
@@ -322,14 +344,57 @@ static void poll_task(void *param)
         } else if (s_subscribed && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             // Watchdog: If no data has been received for 5 seconds, the stream stopped.
             if ((xTaskGetTickCount() - s_last_rx_ticks) > pdMS_TO_TICKS(5000)) {
-                ESP_LOGW(TAG, "Stream stalled. Re-sending 0x96 kick...");
-                if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_val_handle != 0) {
-                    ble_gattc_write_no_rsp_flat(s_conn_handle, s_val_handle,
-                                                REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
+                if (s_stream_rekicks >= JKBMS_STREAM_REKICK_LIMIT) {
+                    // Re-kicking isn't reviving the stream; drop the link and
+                    // reconnect from scratch via the disconnect path.
+                    ESP_LOGW(TAG, "Stream dead after %d re-kicks; terminating to force reconnect",
+                             s_stream_rekicks);
+                    s_stream_rekicks = 0;
+                    s_last_rx_ticks  = xTaskGetTickCount();
+                    ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                } else {
+                    ESP_LOGW(TAG, "Stream stalled. Re-sending 0x96 kick (attempt %d)...",
+                             s_stream_rekicks + 1);
+                    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_val_handle != 0) {
+                        ble_gattc_write_no_rsp_flat(s_conn_handle, s_val_handle,
+                                                    REQ_CELL_INFO, sizeof(REQ_CELL_INFO));
+                    }
+                    s_stream_rekicks++;
+                    s_last_rx_ticks = xTaskGetTickCount();
                 }
-                s_last_rx_ticks = xTaskGetTickCount();
             }
-        } else if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        } else if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            // Connected at the GAP level but the GATT handshake never finished
+            // (s_subscribed still false, no kick pending). This is the state
+            // none of the other branches see: the reconnect logic below only
+            // runs when there is NO connection, and the stream watchdog above
+            // requires s_subscribed. If the handshake stalls here - service /
+            // characteristic / CCCD not found, a discovery callback fired with
+            // an unexpected error status, or a ble_gattc_*() call failed
+            // synchronously so no callback ever ran - nothing else recovers.
+            // Tear the link down after a timeout; BLE_GAP_EVENT_DISCONNECT then
+            // sets s_reconnect_pending and the reconnect branch takes over.
+            if ((xTaskGetTickCount() - s_connect_ticks) > pdMS_TO_TICKS(JKBMS_HANDSHAKE_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "Handshake stalled (connected but not subscribed after %d s); "
+                              "terminating link to force reconnect",
+                         JKBMS_HANDSHAKE_TIMEOUT_MS / 1000);
+                // Push the timer forward so we don't re-fire every 100 ms while
+                // the disconnect event is in flight.
+                s_connect_ticks = xTaskGetTickCount();
+                int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                if (rc != 0) {
+                    // Terminate didn't take (e.g. handle already gone). Force
+                    // our own state to disconnected so the reconnect branch
+                    // runs next tick instead of us spinning here forever.
+                    ESP_LOGW(TAG, "terminate rc=%d; forcing disconnected state", rc);
+                    s_conn_handle       = BLE_HS_CONN_HANDLE_NONE;
+                    s_subscribed        = false;
+                    s_kick_pending      = false;
+                    s_disconnect_ticks  = xTaskGetTickCount();
+                    s_reconnect_pending = true;
+                }
+            }
+        } else /* s_conn_handle == BLE_HS_CONN_HANDLE_NONE */ {
             if (s_reconnect_pending) {
                 // Fast path: a disconnect just happened (see gap_event's
                 // BLE_GAP_EVENT_DISCONNECT). Wait out the short cooldown,
