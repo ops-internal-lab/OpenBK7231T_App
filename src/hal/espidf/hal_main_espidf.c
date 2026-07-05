@@ -19,6 +19,7 @@ void HAL_BTProxy_OnEverySecond(void);
 #endif
 #ifdef ENABLE_JK_BMS
 #include "../../driver/drv_jkbms.h"
+#include "../../driver/drv_mqtt_stream.h"
 #endif
 #include "../../driver/drv_uart_tcp_client.h"
 float g_wifi_temperature = 0;
@@ -73,6 +74,10 @@ void app_main(void)
     /* Start BLE connection to JK-BMS (NVS must be init'd by Main_Init first) */
     JKBMS_AutoStart();
 #endif
+
+    /* Start grouped BMS + energy + system MQTT streamer (no-op if MQTT off).
+       Safe to start now: it waits for MQTT_IsReady() before publishing. */
+    MQTTStream_Start();
 
     while(1)
     {
