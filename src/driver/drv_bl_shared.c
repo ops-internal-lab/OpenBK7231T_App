@@ -743,9 +743,15 @@ static void ApplyDumpLoadGPIO(int state)
     if (charger_active) {
         // ----- CHARGER MODE -----
         // Linear map of the 12..100 duty range onto 0..255: 12->0, 100->255.
-        int duty = ((state - 12) * 255) / 88;
-        if (duty < 0)   duty = 0;
-        if (duty > 255) duty = 255;
+		if (state < 12) {
+        duty = 0;
+	    } else {
+	        // (state * 5) / 2 is the exact same as state * 2.5  but uses fast integer math
+	        duty = (state * 5) / 2;
+	    }
+		// Optional: Keep this if your hardware still requires 
+    	// the output to cap at a maximum of 255.
+    	if (duty > 255) duty = 255;
 
         gpio_set_level(GPIO_CHARGER_ENABLE, 1);
 
