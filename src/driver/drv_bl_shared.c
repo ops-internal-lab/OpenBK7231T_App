@@ -220,43 +220,56 @@ static meter_slot_t g_meter[6];
 #define METER_HOLD_TICKS  ((TickType_t)(30000 / portTICK_PERIOD_MS))
 
 // =====================================================================
-// PER-METER ENERGY STORE — the single source of truth
+// PER-METER / PER-GROUP ENERGY STORE
 // =====================================================================
-// One entry per PHYSICAL meter (6 BL0942s). Each day is a full 96-slot
-// array of signed net Wh, one slot per completed 15-min interval, taken
-// straight from that meter's calibrated signed CF-CNT delta (BL_MeterCfWh,
-// which already applies per-meter calibration + reverse-wire invert).
-//
-//   slots[]   = today   (live, filled one 15-min slot at a time)
-//   day1[]    = yesterday          day2[] = 2 days ago    day3[] = 3 days ago
-//
-// At local midnight the whole arrays shift  day3<-day2<-day1<-today, and
-// today is zeroed and reused. EVERYTHING displayed (today/yesterday/2d/3d
-// totals, last hour, grid/solar/battery sums) is RECONSTRUCTED by summing
-// these slots — never a separately-trusted running accumulator. Slot type
-// is int16 Wh: +-32.767 kWh per 15 min headroom (system ceiling ~11 kW ->
-// 2.75 kWh/interval), and halves the NVS footprint vs int32.
-//
-// Sign convention (per slot, per meter): + = import / charge / generation,
-// - = export / discharge. Meter roles: 0,1,2 = grid L1/L2/L3 (signed);
-// 3,4 = solar A/B (one-way, clamped >=0 upstream); 5 = ESS (signed).
+// Two layers (see the detailed comments at the declarations below):
+//   meter_acc[6]  — per-METER lifetime ticks, diagnostic reference only.
+//   g_grp[3]      — per-GROUP (grid/solar/battery) accounting store: 96-slot
+//                   group-net days (today + 3), plus lifetime gross buckets.
+// Net metering is applied once per 15-min interval, per group; everything
+// above the slot is gross (import/export tracked independently, forever).
 #define DAY_SLOTS 96
 #define N_METERS  6
+
+// ---- Per-METER reference store (diagnostic only) ----------------------
+// meter_acc[6] = signed lifetime CF-CNT ticks per physical meter. "What has
+// this meter seen, ever." Never used for billing/display accounting — that's
+// the per-GROUP store below. Persisted (keys macc0..5), shown on the meter
+// settings page. Kept for our own reference.
+static int64_t meter_acc[N_METERS] = {0,0,0,0,0,0};
+
+// ---- Per-GROUP accounting store (the real numbers) --------------------
+// Net metering is applied ONCE, at the 15-min boundary, PER GROUP: the phases
+// (and A/B solar) are combined into a single signed group-net for the interval
+// (this is the net_metering value the charger loop uses), then that one value
+// is frozen into the group's slot. Above the slot everything is GROSS: a slot's
+// own sign decides import vs export, and imports never cancel a different
+// slot's export. Groups: 0=grid (L1+L2+L3), 1=solar (A+B, one-way), 2=battery.
+#define N_GROUPS 3
+#define GRP_GRID  0
+#define GRP_SOLAR 1
+#define GRP_BATT  2
 typedef struct {
-    int16_t slots[DAY_SLOTS];   // today
+    int16_t slots[DAY_SLOTS];   // today   (group-net ticks per 15-min)
     int16_t day1[DAY_SLOTS];    // yesterday
     int16_t day2[DAY_SLOTS];    // 2 days ago
     int16_t day3[DAY_SLOTS];    // 3 days ago
-} meter_day_store_t;
-static meter_day_store_t g_store[N_METERS];
+} group_day_store_t;
+static group_day_store_t g_grp[N_GROUPS];
 
-// Live accumulator for the interval in progress, per meter — RAW signed
-// CF-CNT ticks (int32 headroom; a slot only ever holds one 15-min interval,
-// max ~6.4k ticks at the 5 kW/meter ceiling, well inside int16). Written to
-// the int16 slot at each boundary.
-static int32_t g_cur_ticks[N_METERS] = {0};
-// Which today-slot index we are currently filling (0..95), from wall clock.
-static int    g_cur_slot = -1;
+// Live per-GROUP accumulator for the interval in progress (raw signed ticks,
+// int32 headroom). Folded into Today and Total on the fly; frozen into the
+// current slot and rolled into the lifetime buckets at the boundary.
+static int32_t g_cur_ticks[N_GROUPS] = {0};
+static int    g_cur_slot = -1;      // today-slot index being filled (0..95)
+
+// ---- Lifetime buckets (totals forever, GROSS, never reset) ------------
+// Bumped once per 15-min commit by that interval's group-net, into the sign-
+// appropriate bucket. Raw signed-magnitude ticks (always >= 0; each is one
+// direction). Persisted as i64 (keys glImp/glExp/slLife/blChg/blDis).
+static int64_t life_grid_imp = 0, life_grid_exp = 0;   // grid import / export
+static int64_t life_solar    = 0;                      // solar generation
+static int64_t life_ess_chg  = 0, life_ess_dis  = 0;   // battery charge / discharge
 
 // Datasheet default tick->Wh factor (no per-meter calibration — that's a
 // future job, applied at this one serve-time conversion point). Derived from
@@ -268,15 +281,6 @@ static int ticks_to_wh(long ticks) {
     return (int)(wh >= 0 ? wh + 0.5f : wh - 0.5f);
 }
 
-// ---- Per-meter lifetime accumulated energy (signed RAW TICKS), diagnosis --
-// Shown on the meter settings page. Fed straight from each slot's signed
-// CF-CNT tick delta (post-invert, pre-calibration) — the BL0942's native
-// resolution. Integer accumulation only: no float ever touches this value,
-// so it runs for the life of the device with zero drift. Converted to Wh
-// (with per-meter calibration) only at read time. Persisted (keys macc0..5),
-// cleared by ClearMeteringData. Independent of the 96-slot store above.
-static int64_t meter_acc[N_METERS] = {0,0,0,0,0,0};
-
 // Clamp a signed tick sum to the int16 slot range defensively before storing.
 static int16_t ticks_to_slot(long v) {
     if (v >  32767) v =  32767;
@@ -284,58 +288,74 @@ static int16_t ticks_to_slot(long v) {
     return (int16_t)v;
 }
 
-// ---- Derive helpers: everything the UI shows is summed from the slots ----
-// Sum a single meter's day array over [0..upto] (upto<0 => whole day).
-static long store_day_sum(const int16_t *day, int upto) {
-    int n = (upto < 0 || upto >= DAY_SLOTS) ? DAY_SLOTS - 1 : upto;
+// ---- Derive helpers: everything the UI shows is summed from group slots ----
+// Pick a group's day array by age: 0=today 1=yesterday 2=2d 3=3d.
+static const int16_t *grp_day(int grp, int age) {
+    const group_day_store_t *g = &g_grp[grp];
+    switch (age) { case 0: return g->slots; case 1: return g->day1;
+                   case 2: return g->day2; default: return g->day3; }
+}
+
+// GROSS import (positive slots) or export (|negative slots|) for a group/day,
+// split PER SLOT — so a slot's import never nets against another slot's export.
+// dir: +1 = sum positive slots, -1 = sum |negative slots|.
+// For today (age 0) the in-progress interval (g_cur_ticks) is folded in with
+// its own running sign, so Today reflects energy up to this instant. Slots up
+// to g_cur_slot-1 are complete; the slot at g_cur_slot is still filling, so we
+// use the live accumulator for it instead of the (stale/zero) slot.
+static long grp_gross(int grp, int age, int dir) {
+    const int16_t *d = grp_day(grp, age);
     long s = 0; int i;
-    for (i = 0; i <= n; i++) s += day[i];
-    return s;
-}
-// Pick a meter's day array by age: 0=today 1=yesterday 2=2d 3=3d.
-static const int16_t *store_day(int meter, int age) {
-    const meter_day_store_t *m = &g_store[meter];
-    switch (age) { case 0: return m->slots; case 1: return m->day1;
-                   case 2: return m->day2; default: return m->day3; }
-}
-// Signed net Wh for a set of meters, for a given day age. `upto` limits
-// today to the filled slots (pass g_cur_slot); ignored for past days.
-static long store_group_net(const int *meters, int nm, int age, int upto) {
-    long s = 0; int i;
-    int lim = (age == 0) ? upto : -1;
-    for (i = 0; i < nm; i++) s += store_day_sum(store_day(meters[i], age), lim);
-    return s;
-}
-
-// Meter groupings (never mixed across types).
-static const int GRID_METERS[3]  = {0, 1, 2};
-static const int SOLAR_METERS[2] = {3, 4};
-static const int ESS_METERS[1]   = {5};
-
-// Grid/ESS split a signed group-net into positive import/export halves; solar
-// is one-way. `age` selects the day; today uses g_cur_slot as the fill limit.
-static long grid_import(int age)  { long n = store_group_net(GRID_METERS,3,age,g_cur_slot);  return n > 0 ?  n : 0; }
-static long grid_export(int age)  { long n = store_group_net(GRID_METERS,3,age,g_cur_slot);  return n < 0 ? -n : 0; }
-static long solar_gen(int age)    { long n = store_group_net(SOLAR_METERS,2,age,g_cur_slot); return n > 0 ?  n : 0; }
-static long ess_charge(int age)   { long n = store_group_net(ESS_METERS,1,age,g_cur_slot);   return n > 0 ?  n : 0; }
-static long ess_discharge(int age){ long n = store_group_net(ESS_METERS,1,age,g_cur_slot);   return n < 0 ? -n : 0; }
-
-// Last hour = the 4 most-recently-COMPLETED today slots for a meter group.
-// (If fewer than 4 slots have completed since midnight, sums what's there.)
-static long store_group_lasthour_net(const int *meters, int nm) {
-    long s = 0; int i, k;
-    int last = g_cur_slot - 1;                 // last completed slot
-    for (i = 0; i < nm; i++) {
-        const int16_t *d = g_store[meters[i]].slots;
-        for (k = 0; k < 4; k++) { int idx = last - k; if (idx >= 0) s += d[idx]; }
+    int last = (age == 0)
+             ? ((g_cur_slot < 0) ? -1 : g_cur_slot - 1)   // completed slots only
+             : DAY_SLOTS - 1;
+    for (i = 0; i <= last; i++) {
+        long v = d[i];
+        if (dir > 0) { if (v > 0) s += v; }
+        else         { if (v < 0) s += -v; }
+    }
+    if (age == 0) {                          // fold in the live interval
+        long cur = g_cur_ticks[grp];
+        if (dir > 0) { if (cur > 0) s += cur; }
+        else         { if (cur < 0) s += -cur; }
     }
     return s;
 }
-static long grid_imp_lh(void)  { long n = store_group_lasthour_net(GRID_METERS,3);  return n > 0 ?  n : 0; }
-static long grid_exp_lh(void)  { long n = store_group_lasthour_net(GRID_METERS,3);  return n < 0 ? -n : 0; }
-static long solar_lh(void)     { long n = store_group_lasthour_net(SOLAR_METERS,2); return n > 0 ?  n : 0; }
-static long ess_chg_lh(void)   { long n = store_group_lasthour_net(ESS_METERS,1);   return n > 0 ?  n : 0; }
-static long ess_dis_lh(void)   { long n = store_group_lasthour_net(ESS_METERS,1);   return n < 0 ? -n : 0; }
+
+// Today (with current interval folded in).
+static long grid_import(int age)  { return grp_gross(GRP_GRID,  age, +1); }
+static long grid_export(int age)  { return grp_gross(GRP_GRID,  age, -1); }
+static long solar_gen(int age)    { return grp_gross(GRP_SOLAR, age, +1); }   // one-way
+static long ess_charge(int age)   { return grp_gross(GRP_BATT,  age, +1); }
+static long ess_discharge(int age){ return grp_gross(GRP_BATT,  age, -1); }
+
+// Lifetime TOTAL = permanent bucket + the current in-progress interval, so a
+// total never lags a partial interval behind (same rule as Today).
+static long grid_import_total(void)  { long c = g_cur_ticks[GRP_GRID];  return (long)life_grid_imp + (c > 0 ?  c : 0); }
+static long grid_export_total(void)  { long c = g_cur_ticks[GRP_GRID];  return (long)life_grid_exp + (c < 0 ? -c : 0); }
+static long solar_total(void)        { long c = g_cur_ticks[GRP_SOLAR]; return (long)life_solar    + (c > 0 ?  c : 0); }
+static long ess_charge_total(void)   { long c = g_cur_ticks[GRP_BATT];  return (long)life_ess_chg  + (c > 0 ?  c : 0); }
+static long ess_discharge_total(void){ long c = g_cur_ticks[GRP_BATT];  return (long)life_ess_dis  + (c < 0 ? -c : 0); }
+
+// Last hour = the 4 most-recently-COMPLETED today slots, GROSS per slot.
+static long grp_lasthour(int grp, int dir) {
+    const int16_t *d = g_grp[grp].slots;
+    long s = 0; int k;
+    int last = g_cur_slot - 1;
+    for (k = 0; k < 4; k++) {
+        int idx = last - k;
+        if (idx < 0) break;
+        long v = d[idx];
+        if (dir > 0) { if (v > 0) s += v; }
+        else         { if (v < 0) s += -v; }
+    }
+    return s;
+}
+static long grid_imp_lh(void)  { return grp_lasthour(GRP_GRID,  +1); }
+static long grid_exp_lh(void)  { return grp_lasthour(GRP_GRID,  -1); }
+static long solar_lh(void)     { return grp_lasthour(GRP_SOLAR, +1); }
+static long ess_chg_lh(void)   { return grp_lasthour(GRP_BATT,  +1); }
+static long ess_dis_lh(void)   { return grp_lasthour(GRP_BATT,  -1); }
 
 #include "drv_bl_shared.h"
 
@@ -631,8 +651,10 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
 
     // Per-meter store: all 4 days x 6 meters, the in-progress interval, and the
     // lifetime tick accumulators.
-    memset(g_store, 0, sizeof(g_store));
-    for (i = 0; i < N_METERS; i++) { g_cur_ticks[i] = 0; meter_acc[i] = 0; }
+    memset(g_grp, 0, sizeof(g_grp));
+    { int g; for (g = 0; g < N_GROUPS; g++) g_cur_ticks[g] = 0; }
+    { int i; for (i = 0; i < N_METERS; i++) meter_acc[i] = 0; }
+    life_grid_imp = life_grid_exp = life_solar = life_ess_chg = life_ess_dis = 0;
 
     // Live control-loop interval accumulators + the 15-min estimate.
     real_consumption = real_export = net_energy = 0;
@@ -978,12 +1000,22 @@ static void COUNTERS_Save(void)
 {
     nvs_handle_t h = 0;
     if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
-    /* Per-meter store: today + 3 days of 96 int16 slots, one blob per meter
-       (keys mst0..mst5, ~768 B each). Plus the lifetime tick accumulators. */
+    /* Per-GROUP store: today + 3 days of 96 int16 slots, one blob per group
+       (keys grp0..grp2, ~768 B each). */
+    { int g; char k[8];
+      for (g = 0; g < N_GROUPS; g++) {
+          snprintf(k, sizeof(k), "grp%d", g);
+          nvs_set_blob(h, k, &g_grp[g], sizeof(group_day_store_t));
+      } }
+    /* Lifetime buckets (totals forever, gross). */
+    nvs_set_i64(h, "glImp",  life_grid_imp);
+    nvs_set_i64(h, "glExp",  life_grid_exp);
+    nvs_set_i64(h, "slLife", life_solar);
+    nvs_set_i64(h, "blChg",  life_ess_chg);
+    nvs_set_i64(h, "blDis",  life_ess_dis);
+    /* Per-meter lifetime ticks (diagnostic reference). */
     { int i; char k[8];
       for (i = 0; i < N_METERS; i++) {
-          snprintf(k, sizeof(k), "mst%d", i);
-          nvs_set_blob(h, k, &g_store[i], sizeof(meter_day_store_t));
           snprintf(k, sizeof(k), "macc%d", i);
           nvs_set_i64(h, k, meter_acc[i]);
       } }
@@ -995,13 +1027,21 @@ static void COUNTERS_Save(void)
 static void COUNTERS_Load(void)
 {
     nvs_handle_t h = 0;
-    int32_t v;
+    int32_t v; int64_t v64;
     if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return;
-    { int i; char k[8]; int64_t v64; size_t sz;
+    { int g; char k[8]; size_t sz;
+      for (g = 0; g < N_GROUPS; g++) {
+          snprintf(k, sizeof(k), "grp%d", g);
+          sz = sizeof(group_day_store_t);
+          nvs_get_blob(h, k, &g_grp[g], &sz);    /* leaves zeroed if absent */
+      } }
+    if (nvs_get_i64(h, "glImp",  &v64) == ESP_OK) life_grid_imp = v64;
+    if (nvs_get_i64(h, "glExp",  &v64) == ESP_OK) life_grid_exp = v64;
+    if (nvs_get_i64(h, "slLife", &v64) == ESP_OK) life_solar    = v64;
+    if (nvs_get_i64(h, "blChg",  &v64) == ESP_OK) life_ess_chg  = v64;
+    if (nvs_get_i64(h, "blDis",  &v64) == ESP_OK) life_ess_dis  = v64;
+    { int i; char k[8];
       for (i = 0; i < N_METERS; i++) {
-          snprintf(k, sizeof(k), "mst%d", i);
-          sz = sizeof(meter_day_store_t);
-          nvs_get_blob(h, k, &g_store[i], &sz);   /* leaves zeroed if absent */
           snprintf(k, sizeof(k), "macc%d", i);
           if (nvs_get_i64(h, k, &v64) == ESP_OK) meter_acc[i] = v64;
       } }
@@ -1420,20 +1460,23 @@ void BL_ProcessSweep(void) {
     // estimate ("instant consumption reported by the chip"); it no longer
     // drives the energy totals or the import/export split.
 
-    // --- Per-meter accumulation, RAW CF-CNT TICKS only ---
+    // --- Accumulation, RAW CF-CNT TICKS only ---
     // Read each meter's signed tick delta for this ~10 s cycle BEFORE
-    // BL_MeterCfConsume() clears it. meter_acc = lifetime ticks (diagnosis).
-    // g_cur_ticks = ticks summed across the interval in progress, written to
-    // the meter's current 96-slot at the boundary below. No Wh, no calibration
-    // here — that happens once, at serve time. A slot that just (re)connected /
-    // reset / is offline contributes 0.
+    // BL_MeterCfConsume() clears it. Two independent layers:
+    //   meter_acc[m]     = per-METER lifetime ticks (diagnostic reference only).
+    //   g_cur_ticks[grp] = per-GROUP interval accumulator. NET METERING happens
+    //     HERE: the grid phases (m0+m1+m2) net into one grid value, solar A+B
+    //     (m3+m4) into one, battery (m5) its own. That single group-net is what
+    //     gets frozen into the slot + bucketed at the boundary below. No Wh, no
+    //     calibration here — that's a serve-time job. Offline/reset slots give 0.
     {
-        int i;
-        for (i = 0; i < N_METERS; i++) {
-            int64_t t = BL_MeterCfTicks(i);
-            meter_acc[i]   += t;
-            g_cur_ticks[i] += (int32_t)t;
-        }
+        int64_t t0 = BL_MeterCfTicks(0), t1 = BL_MeterCfTicks(1), t2 = BL_MeterCfTicks(2);
+        int64_t t3 = BL_MeterCfTicks(3), t4 = BL_MeterCfTicks(4), t5 = BL_MeterCfTicks(5);
+        meter_acc[0] += t0; meter_acc[1] += t1; meter_acc[2] += t2;
+        meter_acc[3] += t3; meter_acc[4] += t4; meter_acc[5] += t5;
+        g_cur_ticks[GRP_GRID]  += (int32_t)(t0 + t1 + t2);   // net across phases
+        g_cur_ticks[GRP_SOLAR] += (int32_t)(t3 + t4);
+        g_cur_ticks[GRP_BATT]  += (int32_t)(t5);
     }
 
     // --- Instantaneous W for DISPLAY + the 15-min estimate only ---
@@ -1467,30 +1510,37 @@ void BL_ProcessSweep(void) {
             // fill target without committing a bogus partial slot.
             g_cur_slot = qhr;
         } else if (qhr != last_qhr) {
-            int i;
+            int g;
             int completed = last_qhr;               // the slot we were filling
 
-            // Commit each meter's interval ticks into the slot it belongs to.
-            if (completed >= 0 && completed < DAY_SLOTS) {
-                for (i = 0; i < N_METERS; i++)
-                    g_store[i].slots[completed] = ticks_to_slot(g_cur_ticks[i]);
+            // Freeze each GROUP's interval net into its slot, and roll that same
+            // net into the sign-appropriate LIFETIME bucket (gross: import never
+            // cancels export across intervals). One 15-min commit does slot +
+            // lifetime together, so Today/Total/Last-Hour can never disagree.
+            for (g = 0; g < N_GROUPS; g++) {
+                long net = g_cur_ticks[g];
+                if (completed >= 0 && completed < DAY_SLOTS)
+                    g_grp[g].slots[completed] = ticks_to_slot(net);
+                if (g == GRP_GRID)  { if (net > 0) life_grid_imp += net; else life_grid_exp += -net; }
+                else if (g == GRP_SOLAR) { if (net > 0) life_solar += net; }   // one-way
+                else /* GRP_BATT */ { if (net > 0) life_ess_chg += net; else life_ess_dis += -net; }
+                g_cur_ticks[g] = 0;
             }
-            for (i = 0; i < N_METERS; i++) g_cur_ticks[i] = 0;
 
             // Local-midnight wrap: new interval index went backwards.
             if (qhr < last_qhr) {
-                for (i = 0; i < N_METERS; i++) {
-                    memcpy(g_store[i].day3, g_store[i].day2, sizeof(g_store[i].day2));
-                    memcpy(g_store[i].day2, g_store[i].day1, sizeof(g_store[i].day1));
-                    memcpy(g_store[i].day1, g_store[i].slots, sizeof(g_store[i].slots));
-                    memset(g_store[i].slots, 0, sizeof(g_store[i].slots));
+                for (g = 0; g < N_GROUPS; g++) {
+                    memcpy(g_grp[g].day3, g_grp[g].day2, sizeof(g_grp[g].day2));
+                    memcpy(g_grp[g].day2, g_grp[g].day1, sizeof(g_grp[g].day1));
+                    memcpy(g_grp[g].day1, g_grp[g].slots, sizeof(g_grp[g].slots));
+                    memset(g_grp[g].slots, 0, sizeof(g_grp[g].slots));
                 }
                 actual_mday = TIME_GetMDay();
             }
 
             g_cur_slot = qhr;
             mark_energy_dirty();
-            COUNTERS_Save();                        // persist store + tick totals
+            COUNTERS_Save();                        // persist store + lifetime + meter_acc
 
             // Persist the 12-hour visual graph matrices too (unchanged role).
 #if PLATFORM_ESPIDF
@@ -2414,28 +2464,28 @@ int http_fn_api_dash(http_request_t *request) {
         // Solar (one-way).
         B("],\"gen\":{\"d\":%d,\"t\":%d,\"lh\":%d,\"h\":[%d,%d,%d]}",
           ticks_to_wh(solar_gen(0)),
-          ticks_to_wh(solar_gen(0)+solar_gen(1)+solar_gen(2)+solar_gen(3)),
+          ticks_to_wh(solar_total()),
           ticks_to_wh(solar_lh()),
           ticks_to_wh(solar_gen(1)), ticks_to_wh(solar_gen(2)), ticks_to_wh(solar_gen(3)));
         // Grid import (i*) / export (e*).
         B(",\"grid\":{\"id\":%d,\"it\":%d,\"ilh\":%d,\"ih\":[%d,%d,%d],\"ed\":%d,\"et\":%d,\"elh\":%d,\"eh\":[%d,%d,%d]}",
           ticks_to_wh(grid_import(0)),
-          ticks_to_wh(grid_import(0)+grid_import(1)+grid_import(2)+grid_import(3)),
+          ticks_to_wh(grid_import_total()),
           ticks_to_wh(grid_imp_lh()),
           ticks_to_wh(grid_import(1)), ticks_to_wh(grid_import(2)), ticks_to_wh(grid_import(3)),
           ticks_to_wh(grid_export(0)),
-          ticks_to_wh(grid_export(0)+grid_export(1)+grid_export(2)+grid_export(3)),
+          ticks_to_wh(grid_export_total()),
           ticks_to_wh(grid_exp_lh()),
           ticks_to_wh(grid_export(1)), ticks_to_wh(grid_export(2)), ticks_to_wh(grid_export(3)));
         // ESS charge (imp) / discharge (exp).
         B(",\"imp\":{\"d\":%d,\"t\":%d,\"lh\":%d,\"h\":[%d,%d,%d]}",
           ticks_to_wh(ess_charge(0)),
-          ticks_to_wh(ess_charge(0)+ess_charge(1)+ess_charge(2)+ess_charge(3)),
+          ticks_to_wh(ess_charge_total()),
           ticks_to_wh(ess_chg_lh()),
           ticks_to_wh(ess_charge(1)), ticks_to_wh(ess_charge(2)), ticks_to_wh(ess_charge(3)));
         B(",\"exp\":{\"d\":%d,\"t\":%d,\"lh\":%d,\"h\":[%d,%d,%d]}",
           ticks_to_wh(ess_discharge(0)),
-          ticks_to_wh(ess_discharge(0)+ess_discharge(1)+ess_discharge(2)+ess_discharge(3)),
+          ticks_to_wh(ess_discharge_total()),
           ticks_to_wh(ess_dis_lh()),
           ticks_to_wh(ess_discharge(1)), ticks_to_wh(ess_discharge(2)), ticks_to_wh(ess_discharge(3)));
     }
