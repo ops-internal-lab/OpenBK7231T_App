@@ -42,8 +42,17 @@
 #endif
 
 /* ---- tuning -------------------------------------------------------------- */
-#define STREAM_TICK_MS   10000    /* evaluation cadence                         */
-#define STREAM_HB_MS    120000    /* heartbeat: min republish period per item   */
+#define STREAM_TICK_MS    1000    /* one evaluation per second                   */
+#define STREAM_HB_MS    120000    /* heartbeat: min republish period per item    */
+#define STREAM_MAX_PER_TICK   1   /* send at most ONE message per tick -> one per
+                                     second maximum. lwIP's MQTT ring is tiny
+                                     (~256 B); bursting fills it, returns ERR_MEM
+                                     and stalls the stack. OpenBeken paces its own
+                                     channels the same way (one per second).      */
+#define STREAM_MIN_ITEM_MS 5000   /* min spacing between sends of the SAME item
+                                     (first publish + heartbeat are exempt) so a
+                                     jittery analog value can't hog the one-per-
+                                     second budget.                               */
 
 /* Sentinel: a T_INT current value of INT_MIN means "skip this item". */
 #define SKIP_I ((double)INT_MIN)
@@ -144,6 +153,7 @@ static TickType_t s_lastpub[ITEM_COUNT];
 /* system IP (string) tracked separately */
 static char       s_last_ip[40];
 static unsigned char s_have_ip;
+static int        s_cursor = 0;   /* round-robin start so no item is starved */
 static TickType_t s_lastpub_ip;
 
 /* ---- gather one full snapshot into cur[] + ipbuf ------------------------- */
@@ -222,19 +232,38 @@ static void gather(double *cur, char *ipbuf, int ipbuflen)
 }
 
 /* ---- evaluate the table and publish what is due ------------------------- */
+/* Publish one item. Everything goes QoS 0 (retain flag independent) so we
+   never consume lwIP's scarce in-flight QoS-1 slots; a dropped sample self-
+   heals at the next change or heartbeat, and retained topics still keep their
+   last value on the broker. */
+static OBK_Publish_Result publish_item(int i, double v)
+{
+    const pub_item_t *it = &s_items[i];
+    int flags = OBK_PUBLISH_FLAG_QOS_ZERO | (it->retain ? OBK_PUBLISH_FLAG_RETAIN : 0);
+    if (it->type == T_FLOAT)
+        return MQTT_PublishMain_StringFloat(it->name, (float)v, it->dec, flags);
+    return MQTT_PublishMain_StringInt(it->name, (int)v, flags);
+}
+
 static void eval_and_publish(void)
 {
     static double cur[ITEM_COUNT];
     static char   ipbuf[40];
     TickType_t now = xTaskGetTickCount();
-    int i;
+    int n, sent = 0;
 
     gather(cur, ipbuf, (int)sizeof(ipbuf));
 
-    for (i = 0; i < ITEM_COUNT; i++) {
+    /* Evaluate every item for change each tick, but SEND at most
+       STREAM_MAX_PER_TICK of them, starting from a rotating cursor so nothing
+       is starved. Stop the tick on the first publish failure so lwIP's outbox
+       can drain before we push more — this is what prevents the burst that was
+       freezing MQTT. */
+    for (n = 0; n < ITEM_COUNT; n++) {
+        int i = (s_cursor + n) % ITEM_COUNT;
         const pub_item_t *it = &s_items[i];
         double v = cur[i];
-        int changed, hb, due, flags;
+        int changed, hb, due;
 
         if (it->type == T_FLOAT) {
             if (isnan(v)) continue;                       /* offline / no data  */
@@ -248,21 +277,31 @@ static void eval_and_publish(void)
         due = it->hb_only ? hb : (changed || hb);
         if (!due) continue;
 
-        flags = it->retain ? OBK_PUBLISH_FLAG_RETAIN : 0;
-        if (it->type == T_FLOAT)
-            MQTT_PublishMain_StringFloat(it->name, (float)v, it->dec, flags);
-        else
-            MQTT_PublishMain_StringInt(it->name, (int)v, flags);
+        /* Per-item min spacing (first publish + heartbeat exempt). */
+        if (s_have[i] && !hb &&
+            (now - s_lastpub[i]) < pdMS_TO_TICKS(STREAM_MIN_ITEM_MS))
+            continue;
 
+        if (publish_item(i, v) != OBK_PUBLISH_OK) {
+            s_cursor = i;                 /* retry this one first next tick */
+            return;
+        }
         s_last[i] = v; s_have[i] = 1; s_lastpub[i] = now;
-    }
 
-    /* system IP (string, retained, on-change + heartbeat) */
-    if (ipbuf[0]) {
+        if (++sent >= STREAM_MAX_PER_TICK) {
+            s_cursor = (i + 1) % ITEM_COUNT;
+            return;
+        }
+    }
+    s_cursor = 0;   /* completed a full pass with budget to spare */
+
+    /* system IP (string) — shares the same per-tick budget */
+    if (sent < STREAM_MAX_PER_TICK && ipbuf[0]) {
         int changed = !s_have_ip || strncmp(ipbuf, s_last_ip, sizeof(s_last_ip)) != 0;
         int hb = (int)((now - s_lastpub_ip) >= pdMS_TO_TICKS(STREAM_HB_MS));
-        if (changed || hb) {
-            MQTT_PublishMain_StringString("sys_ip", ipbuf, OBK_PUBLISH_FLAG_RETAIN);
+        if ((changed || hb) &&
+            MQTT_PublishMain_StringString("sys_ip", ipbuf,
+                OBK_PUBLISH_FLAG_QOS_ZERO | OBK_PUBLISH_FLAG_RETAIN) == OBK_PUBLISH_OK) {
             strncpy(s_last_ip, ipbuf, sizeof(s_last_ip) - 1);
             s_last_ip[sizeof(s_last_ip) - 1] = 0;
             s_have_ip = 1; s_lastpub_ip = now;
@@ -285,7 +324,8 @@ static void stream_task(void *arg)
                 int i;
                 for (i = 0; i < ITEM_COUNT; i++) { s_have[i] = 0; s_lastpub[i] = 0; }
                 s_have_ip = 0; s_lastpub_ip = 0;
-                ADDLOG_INFO(LOG_FEATURE_GENERAL, "MQTT stream: link up, republishing all");
+                s_cursor = 0;
+                ADDLOG_INFO(LOG_FEATURE_GENERAL, "MQTT stream: link up, republishing (paced)");
             }
             eval_and_publish();
         }
