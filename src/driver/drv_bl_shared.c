@@ -217,7 +217,7 @@ static meter_slot_t g_meter[6];
 // read is "fresh"; up to 30 s we keep showing/integrating the last-good value
 // but flag it as "stale" (comms hiccup); beyond 30 s it's treated as offline.
 #define METER_FRESH_TICKS ((TickType_t)( 9000 / portTICK_PERIOD_MS))
-#define METER_HOLD_TICKS  ((TickType_t)(30000 / portTICK_PERIOD_MS))
+#define METER_HOLD_TICKS  ((TickType_t)(60000 / portTICK_PERIOD_MS))
 
 // =====================================================================
 // PER-METER / PER-GROUP ENERGY STORE
@@ -378,6 +378,7 @@ void BL0942_InvalidateBaseline(int slot);
 #include "drv_public.h"
 #include "drv_uart.h"
 #include "../hal/hal_wifi.h"     // HAL_GetMyIPString (for the .22 diversion target)
+#include "../new_common.h"        // g_secondsElapsed (uptime for the SYSTEM panel)
 #include "../cmnds/cmd_public.h" //for enum EventCode
 #include <math.h>
 #include <time.h>
@@ -2186,8 +2187,8 @@ int http_fn_api_dash(http_request_t *request) {
     // chg_v/chg_c/pwr_cls/bal_cls/est_cls are all derived client-side from
     // the values themselves, saving further bytes.
     if (!req_param || strncmp(req_param, "req=core", 8) == 0) {
-        unsigned char raw[27];
-        char          b64[((27 + 2) / 3) * 4 + 1];
+        unsigned char raw[32];
+        char          b64[((32 + 2) / 3) * 4 + 1];
         int           b64_len;
         int           dmp = dump_load_relay[5];
         int           mode_v = charger_c_auto ? 0 : (charger_manual_temp ? 1 : 2);
@@ -2246,6 +2247,21 @@ int http_fn_api_dash(http_request_t *request) {
         raw[24] = (unsigned char)(divert_user < 0 ? 0 : divert_user > 2 ? 2 : divert_user);
         raw[25] = (unsigned char)(divert_threshold < 0 ? 0 : divert_threshold > 255 ? 255 : divert_threshold);
         raw[26] = (unsigned char)soc_v;
+        // ---- SYSTEM panel: WiFi RSSI (dBm) + uptime (seconds) ----
+        // RSSI is negative dBm (e.g. -64); stored as a signed byte. Uptime is
+        // g_secondsElapsed, little-endian uint32. Both refresh with req=core
+        // (~10 s). IP is served once, statically, in req=cfg (it doesn't change).
+        {
+            int rssi = HAL_GetWifiStrength();               // dBm (negative)
+            unsigned int up = (unsigned int)g_secondsElapsed;
+            if (rssi >  127) rssi =  127;
+            if (rssi < -128) rssi = -128;
+            raw[27] = (unsigned char)((signed char)rssi);
+            raw[28] = (unsigned char)( up        & 0xFF);
+            raw[29] = (unsigned char)((up >>  8)  & 0xFF);
+            raw[30] = (unsigned char)((up >> 16)  & 0xFF);
+            raw[31] = (unsigned char)((up >> 24)  & 0xFF);
+        }
 
         b64_len = base64_encode(raw, sizeof(raw), b64);
         b64[b64_len] = '\0';
@@ -2434,6 +2450,9 @@ int http_fn_api_dash(http_request_t *request) {
         if (g_inv2_ip)   B("\"inv2\":\"%d\",", g_inv2_ip);  else B("\"inv2\":\"\",");
         if (g_bypass_ip) B("\"byp\":\"%d\",", g_bypass_ip); else B("\"byp\":\"\",");
         B("\"boost\":%d,\"dthr\":%d", g_boost_power, divert_threshold);
+        // Device IP — static, for the SYSTEM panel (served once with the config
+        // the page fetches on load; it doesn't change at runtime).
+        { const char *ip = HAL_GetMyIPString(); B(",\"ip\":\"%s\"", ip ? ip : ""); }
     }
 
     // ---- METERS (req=meters) ----

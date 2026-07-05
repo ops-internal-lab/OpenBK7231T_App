@@ -704,6 +704,9 @@ int http_fn_custom_dash(http_request_t *request) {
         "function _b64toBytes(s){var bin=atob(s),len=bin.length,out=new Uint8Array(len),i;for(i=0;i<len;i++)out[i]=bin.charCodeAt(i);return out;}"
         "function _u16(b,o){return b[o]|(b[o+1]<<8);}"
         "function _u32(b,o){return (b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24))>>>0;}"
+        "function _s8(b,o){var v=b[o];return v>127?v-256:v;}"
+        "function _bars(dbm){var n=dbm>=-55?4:dbm>=-65?3:dbm>=-75?2:dbm>=-85?1:0;var s='';for(var i=0;i<4;i++)s+=(i<n?'\\u25b0':'\\u25b1');return s;}"
+        "function _uptime(s){if(!s||s<0)return '--';var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);return (d>0?d+'d ':'')+h+'h '+('0'+m).slice(-2)+'m';}"
         "function _s16(b,o){var v=_u16(b,o);return v&0x8000?v-0x10000:v;}"
         "function _k2(v){return (v/100).toFixed(2);}"
         "function _wh2(v){return (v/1000).toFixed(2);}"
@@ -828,6 +831,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "for(var i=0;i<fs.length;i++)if(d[ks[i]])setV(fs[i],d[ks[i]]);"
         "if(d.minv&&d.minv.length===6){for(var s=0;s<6;s++){var ic=document.getElementById('inv-m'+s);if(ic)ic.checked=!!d.minv[s];}}"
         "if(d.boost){boostWh=d.boost;setV('sld-boost',d.boost);setV('lbl-boost',d.boost);}"
+        "if(d.ip){setV('sd-ip',d.ip);}"
         "if(d.dthr){dthr=d.dthr;setV('cfg-sld-div',d.dthr);var el=document.getElementById('cfg-lbl-div');if(el)el.innerHTML='-'+d.dthr;}}"
         "if(rb){rb.disabled=false;rb.innerHTML='&#x21d3; Retrieve';}}); }"
         "function doCfgSave(){var get=function(id){var e=document.getElementById(id);return e?e.value:'';};"
@@ -891,10 +895,18 @@ int http_fn_custom_dash(http_request_t *request) {
         "dmp=rec('dmp',b[12],dmp);mode=rec('mode',b[13],mode);"
         "var dTpa=b[14],dTexp=b[15];"
         "var clk_h=b[16],clk_m=b[17];var ev=_u16(b,20);var flags=b[22];var dTpm=b[23];divUser=rec('divu',b[24],divUser);var dDthr=b[25];"
+        "var rssi=_s8(b,27);var up=_u32(b,28);"
+        // Estimate recomputed here from THIS snapshot (bal, pwr and clock are all
+        // from the same 10s reading, so no stale/fresh mixing): projected net Wh
+        // for the block = net-so-far + grid_power * (minutes_left / 60).
+        "var minLeft=15-(clk_m%15);if(minLeft<=0)minLeft=1;est=Math.round(bal+pwr*minLeft/60);"
         "clrIf('pwr',(mode===0)?dTpa:dTpm);clrIf('exp',dTexp);clrIf('div',dDthr);"
         "if(!held('pwr')){tpa=dTpa;tpm=dTpm;}if(!held('exp')){texp=dTexp;}if(!held('div')){dthr=dDthr;}"
         "var hntp=flags&1;divOn=(flags&2)?1:0;"
         "tbBal=bal;tbEst=est;tbDrawNet();"
+        // SYSTEM panel: RSSI (dBm + bars derived) + uptime (s -> d/h/m).
+        "setV('sd-rssi',(rssi<0?rssi:'--')+((rssi<0)?(' dBm '+_bars(rssi)):''));"
+        "setV('sd-uptime',_uptime(up));"
         "var ev2,ec2,efill;if(dmp===0){ev2='&ndash;';ec2='#5a6470';efill=0;}else if(dmp===5){ev2='INV';ec2='#00b3b3';efill=100;}else{ev2=dmp+'%';ec2=(dmp>=18)?'#f2b84b':'#4aa3ff';efill=dmp;}"
         "setV('tb-essv',ev2);setS('tb-essv',ec2);tbSetRing('tb-essf',efill,ec2);"
         "var cs=('0'+clk_h).slice(-2)+':'+('0'+clk_m).slice(-2);"
@@ -1047,7 +1059,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "function fit(){var c=document.getElementById('dash-container');if(!c)return;"
         "var w=c.offsetWidth||980,h=c.offsetHeight||700;var s=Math.min(window.innerWidth/w,window.innerHeight/h,1);var e=document.getElementById('scaler');var t='translate(-50%,-50%) scale('+s+')';e.style.webkitTransform=t;e.style.transform=t;}"
         "function fixBtns(){}"
-        "initGrid();loadAll();setInterval(runCycle,10000);fit();btnColor();loadCfg();tbLoadCfg();tbInitInputs();window.onresize=function(){fit();};setTimeout(function(){fit();},350);"
+        "initGrid();loadAll();xhr('/api_dash?req=cfg',function(d){if(d&&d.ip)setV('sd-ip',d.ip);});setInterval(runCycle,10000);fit();btnColor();loadCfg();tbLoadCfg();tbInitInputs();window.onresize=function(){fit();};setTimeout(function(){fit();},350);"
         "</script></body></html>"
     );
     rtos_delay_milliseconds(1);
