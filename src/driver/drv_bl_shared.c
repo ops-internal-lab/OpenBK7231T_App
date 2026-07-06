@@ -581,29 +581,14 @@ void BL09XX_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreSt
 
 void BL09XX_SaveEmeteringStatistics()
 {
-    ENERGY_METERING_DATA data;
-    memset(&data, 0, sizeof(ENERGY_METERING_DATA));
-
-    /* TotalGeneration no longer in the struct — stored as NVS key "eExpTotal" */
-    data.TotalConsumption = sensors[OBK_CONSUMPTION_TOTAL].lastReading;
-    data.TodayConsumpion = sensors[OBK_CONSUMPTION_TODAY].lastReading;
-    data.YesterdayConsumption = sensors[OBK_CONSUMPTION_YESTERDAY].lastReading;
-    data.actual_mday = actual_mday;
-    data.ConsumptionHistory[0] = sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading;
-    data.ConsumptionHistory[1] = sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading;
-    data.ConsumptionResetTime = ConsumptionResetTime;
+    /* The legacy float/emd layer (NVS keys emd, eImpTotal, eExpTotal,
+       eImpD0-3, eExpD0-3 -- ~33 NVS entries) is retired: it duplicated the
+       tick-based group store, which is now the single source of truth. The
+       sensors[] Wh values are derived from ticks at boot (BL_Shared_Init);
+       persistence is one blob write. ConsumptionResetTime and the save
+       counter travel inside that blob. */
     ConsumptionSaveCounter++;
-    data.save_counter = ConsumptionSaveCounter;
-
-    HAL_SetEnergyMeterStatus(&data);
-
-    /* Export total and daily history stored separately so the struct stays 32 bytes */
-    HAL_FlashVars_SaveEnergyExportTotal(sensors[OBK_GENERATION_TOTAL].lastReading);
-    HAL_FlashVars_SaveEnergyImportTotal(sensors[OBK_CONSUMPTION_TOTAL].lastReading);
-    HAL_FlashVars_SaveEnergyExportDaily(0, export_daily[0]);
-    HAL_FlashVars_SaveEnergyExportDaily(1, export_daily[1]);
-    HAL_FlashVars_SaveEnergyExportDaily(2, export_daily[2]);
-    HAL_FlashVars_SaveEnergyExportDaily(3, export_daily[3]);
+    COUNTERS_Save();
 }
 
 commandResult_t BL09XX_ResetEnergyCounter(const void *context, const char *cmd, const char *args, int cmdFlags)
@@ -1005,53 +990,67 @@ static void SETTINGS_Load(void)
     nvs_close(h);
 }
 
-// Solar / ESS energy counters, stored as integer Wh (sub-Wh rounding is
-// negligible; i32 Wh holds ~2.1 GWh of lifetime total). Saved on the 15-min
-// boundary and at the midnight reset; loaded at boot.
+// Solar / ESS energy counters. Everything committed at the same 15-minute
+// instant is now ONE versioned NVS blob (key "estate") instead of 15 separate
+// keys (grp0-2 blobs, 5 lifetime i64s, 6 meter_acc i64s, curslot):
+//   - live NVS footprint drops from ~24 entries to ~10;
+//   - churn per 15-min commit drops the same way (NVS is log-structured:
+//     every rewritten key leaves a dead entry behind until GC);
+//   - the commit becomes atomic: groups, lifetimes and meter accumulators
+//     can no longer be torn across a power cut mid-save.
+// ConsumptionResetTime / save counter / actual_mday ride along (they used to
+// live in the legacy float/emd layer, which is retired -- see BL_Shared_Init).
+#define ENERGY_STATE_MAGIC 0x31545345u   /* 'E','S','T','1' little-endian */
+
+typedef struct {
+    uint32_t     magic;                  /* ENERGY_STATE_MAGIC             */
+    int32_t      cur_slot;               /* g_cur_slot                     */
+    group_acct_t grp[N_GROUPS];          /* grid / solar / battery         */
+    int64_t      life_grid_imp, life_grid_exp;
+    int64_t      life_solar;
+    int64_t      life_ess_chg, life_ess_dis;
+    int64_t      macc[N_METERS];         /* per-meter lifetime ticks       */
+    int64_t      reset_time;             /* ConsumptionResetTime           */
+    int32_t      save_counter;           /* ConsumptionSaveCounter         */
+    int32_t      actual_mday;            /* last seen day-of-month         */
+} energy_state_t;
+
 static void COUNTERS_Save(void)
 {
+    energy_state_t st;
     nvs_handle_t h = 0;
+    memset(&st, 0, sizeof(st));
+    st.magic         = ENERGY_STATE_MAGIC;
+    st.cur_slot      = g_cur_slot;
+    memcpy(st.grp, g_grp, sizeof(st.grp));
+    st.life_grid_imp = life_grid_imp;
+    st.life_grid_exp = life_grid_exp;
+    st.life_solar    = life_solar;
+    st.life_ess_chg  = life_ess_chg;
+    st.life_ess_dis  = life_ess_dis;
+    { int i; for (i = 0; i < N_METERS; i++) st.macc[i] = meter_acc[i]; }
+    st.reset_time    = (int64_t)ConsumptionResetTime;
+    st.save_counter  = ConsumptionSaveCounter;
+    st.actual_mday   = actual_mday;
+
     if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
-    /* Per-GROUP store: compact accounting struct, one blob per group
-       (keys grp0..grp2, ~41 B each — reuses the old keys so the previous
-       ~768 B blobs are superseded and their NVS space reclaimed). */
-    { int g; char k[8];
-      for (g = 0; g < N_GROUPS; g++) {
-          snprintf(k, sizeof(k), "grp%d", g);
-          esp_err_t rc = nvs_set_blob(h, k, &g_grp[g], sizeof(group_acct_t));
-          if (rc != ESP_OK)
-              addLogAdv(LOG_ERROR, LOG_FEATURE_ENERGYMETER,
-                        "COUNTERS_Save: grp%d blob write failed rc=%d\n", g, rc);
-      } }
-    /* Lifetime buckets (totals forever, gross). */
-    nvs_set_i64(h, "glImp",  life_grid_imp);
-    nvs_set_i64(h, "glExp",  life_grid_exp);
-    nvs_set_i64(h, "slLife", life_solar);
-    nvs_set_i64(h, "blChg",  life_ess_chg);
-    nvs_set_i64(h, "blDis",  life_ess_dis);
-    /* Per-meter lifetime ticks (diagnostic reference). */
-    { int i; char k[8];
-      for (i = 0; i < N_METERS; i++) {
-          snprintf(k, sizeof(k), "macc%d", i);
-          nvs_set_i64(h, k, meter_acc[i]);
-      } }
-    nvs_set_i32(h, "curslot", g_cur_slot);
-    nvs_commit(h);
+    esp_err_t rc = nvs_set_blob(h, "estate", &st, sizeof(st));
+    if (rc == ESP_OK) rc = nvs_commit(h);
+    if (rc != ESP_OK)
+        addLogAdv(LOG_ERROR, LOG_FEATURE_ENERGYMETER,
+                  "COUNTERS_Save: estate blob write failed rc=0x%x\n", rc);
     nvs_close(h);
 }
 
-static void COUNTERS_Load(void)
+/* Read the pre-consolidation key set (grp0-2 + 11 scalars + curslot). Used
+   once, on the first boot after this firmware, to carry the counters over. */
+static void COUNTERS_LoadLegacy(nvs_handle_t h)
 {
-    nvs_handle_t h = 0;
     int32_t v; int64_t v64;
-    if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return;
     { int g; char k[8]; size_t sz;
       for (g = 0; g < N_GROUPS; g++) {
           snprintf(k, sizeof(k), "grp%d", g);
           sz = sizeof(group_acct_t);
-          /* Absent, OR an old-format (~768 B) blob whose size no longer
-             matches -> left zeroed. History resets once on upgrade; totals
-             and graph are unaffected. Re-saved in the new format next commit. */
           nvs_get_blob(h, k, &g_grp[g], &sz);
       } }
     if (nvs_get_i64(h, "glImp",  &v64) == ESP_OK) life_grid_imp = v64;
@@ -1065,7 +1064,66 @@ static void COUNTERS_Load(void)
           if (nvs_get_i64(h, k, &v64) == ESP_OK) meter_acc[i] = v64;
       } }
     if (nvs_get_i32(h, "curslot", &v) == ESP_OK) g_cur_slot = v;
+}
+
+/* Erase every key superseded by the "estate" blob AND the retired float/emd
+   accounting layer, freeing ~50 live NVS entries in the cramped 20 KB
+   partition (this is a big part of why the 3.5 KB main-config blob -- MQTT
+   credentials etc. -- was failing to find room). Safe on absent keys. */
+static void COUNTERS_EraseLegacyKeys(nvs_handle_t h)
+{
+    int i; char k[8];
+    static const char * const fixed[] = {
+        "glImp", "glExp", "slLife", "blChg", "blDis", "curslot",
+        /* retired float/emd layer (values now derived from ticks at boot) */
+        "emd", "eImpTotal", "eExpTotal",
+        "eImpD0", "eImpD1", "eImpD2", "eImpD3",
+        "eExpD0", "eExpD1", "eExpD2", "eExpD3",
+    };
+    for (i = 0; i < (int)(sizeof(fixed) / sizeof(fixed[0])); i++)
+        nvs_erase_key(h, fixed[i]);
+    for (i = 0; i < N_GROUPS; i++) {
+        snprintf(k, sizeof(k), "grp%d", i);  nvs_erase_key(h, k);
+    }
+    for (i = 0; i < N_METERS; i++) {
+        snprintf(k, sizeof(k), "macc%d", i); nvs_erase_key(h, k);
+    }
+}
+
+static void COUNTERS_Load(void)
+{
+    energy_state_t st;
+    size_t sz = sizeof(st);
+    nvs_handle_t h = 0;
+    if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+
+    if (nvs_get_blob(h, "estate", &st, &sz) == ESP_OK &&
+        sz == sizeof(st) && st.magic == ENERGY_STATE_MAGIC) {
+        /* Normal path: one read restores everything. */
+        g_cur_slot = st.cur_slot;
+        memcpy(g_grp, st.grp, sizeof(g_grp));
+        life_grid_imp = st.life_grid_imp;
+        life_grid_exp = st.life_grid_exp;
+        life_solar    = st.life_solar;
+        life_ess_chg  = st.life_ess_chg;
+        life_ess_dis  = st.life_ess_dis;
+        { int i; for (i = 0; i < N_METERS; i++) meter_acc[i] = st.macc[i]; }
+        ConsumptionResetTime   = (time_t)st.reset_time;
+        ConsumptionSaveCounter = st.save_counter;
+        actual_mday            = st.actual_mday;
+        nvs_close(h);
+        return;
+    }
+
+    /* First boot on this firmware (or blob damaged): migrate from the old
+       key set, persist in the new format, then erase every legacy key. */
+    COUNTERS_LoadLegacy(h);
+    COUNTERS_EraseLegacyKeys(h);
+    nvs_commit(h);
     nvs_close(h);
+    COUNTERS_Save();
+    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+              "Energy counters migrated to consolidated NVS blob\n");
 }
 #else
 static void SETTINGS_Save(void) {}
@@ -2025,7 +2083,6 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
 void BL_Shared_Init(void)
 {
     int i;
-    ENERGY_METERING_DATA data;
 
     // Restore the dashboard "System Configuration" (meter IPs, MACs,
     // inv2/bypass octets, boost power) and the persisted sliders/threshold
@@ -2047,27 +2104,33 @@ void BL_Shared_Init(void)
         net_graph_matrix[i] = (unsigned char)((0 + 150) / 2);
     }
 
-    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER, "Read ENERGYMETER status values. sizeof(ENERGY_METERING_DATA)=%d\n", sizeof(ENERGY_METERING_DATA));
-
-    HAL_GetEnergyMeterStatus(&data);
-    sensors[OBK_CONSUMPTION_TOTAL].lastReading    = data.TotalConsumption;
-    sensors[OBK_GENERATION_TOTAL].lastReading     = HAL_FlashVars_GetEnergyExportTotal();
-    sensors[OBK_CONSUMPTION_TODAY].lastReading    = data.TodayConsumpion;
-    sensors[OBK_CONSUMPTION_YESTERDAY].lastReading = data.YesterdayConsumption;
-    actual_mday = data.actual_mday;
-    lastSavedEnergyCounterValue = data.TotalConsumption;
+    // ---- Rehydrate the legacy Wh values from the tick store ----
+    // The old float/emd persistence layer is retired; the tick-based group
+    // store (loaded by COUNTERS_Load above, which also restored
+    // ConsumptionResetTime / save counter / actual_mday from the blob) is the
+    // single source of truth. Everything the old layer held is derived from
+    // it here, once, at boot:
+    //   grid import  -> consumption total + today/history
+    //   grid export  -> generation total  + export_daily[]
+    // Note: ticks_to_wh() uses the datasheet calibration constant, so on the
+    // FIRST boot after migrating from the float layer the displayed lifetime
+    // totals may step by the (old float total) - (ticks * default cal) delta.
+    // From then on everything is consistent by construction.
+    sensors[OBK_CONSUMPTION_TOTAL].lastReading    = (float)ticks_to_wh((long)life_grid_imp);
+    sensors[OBK_GENERATION_TOTAL].lastReading     = (float)ticks_to_wh((long)life_grid_exp);
+    sensors[OBK_CONSUMPTION_TODAY].lastReading    = (float)ticks_to_wh(g_grp[GRP_GRID].day_imp[0]);
+    sensors[OBK_CONSUMPTION_YESTERDAY].lastReading = (float)ticks_to_wh(g_grp[GRP_GRID].day_imp[1]);
+    sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading = (float)ticks_to_wh(g_grp[GRP_GRID].day_imp[2]);
+    sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading = (float)ticks_to_wh(g_grp[GRP_GRID].day_imp[3]);
+    lastSavedEnergyCounterValue = sensors[OBK_CONSUMPTION_TOTAL].lastReading;
     lastSavedGenerationCounterValue = sensors[OBK_GENERATION_TOTAL].lastReading;
-    sensors[OBK_CONSUMPTION_2_DAYS_AGO].lastReading = data.ConsumptionHistory[0];
-    sensors[OBK_CONSUMPTION_3_DAYS_AGO].lastReading = data.ConsumptionHistory[1];
-    ConsumptionResetTime = data.ConsumptionResetTime;
-    ConsumptionSaveCounter = data.save_counter;
     lastConsumptionSaveStamp = xTaskGetTickCount();
 
-    /* Load daily export history */
-    export_daily[0] = HAL_FlashVars_GetEnergyExportDaily(0);
-    export_daily[1] = HAL_FlashVars_GetEnergyExportDaily(1);
-    export_daily[2] = HAL_FlashVars_GetEnergyExportDaily(2);
-    export_daily[3] = HAL_FlashVars_GetEnergyExportDaily(3);
+    /* Daily export history: direct read of the grid group's export days. */
+    export_daily[0] = (float)ticks_to_wh(g_grp[GRP_GRID].day_exp[0]);
+    export_daily[1] = (float)ticks_to_wh(g_grp[GRP_GRID].day_exp[1]);
+    export_daily[2] = (float)ticks_to_wh(g_grp[GRP_GRID].day_exp[2]);
+    export_daily[3] = (float)ticks_to_wh(g_grp[GRP_GRID].day_exp[3]);
 
     /* Restore 12-hour graph from NVS so it survives power cuts */
     {
