@@ -83,14 +83,15 @@ float HAL_FlashVars_GetEnergyExportDaily(int daysAgo);
 
 /* ---- 12-hour graph matrix persistence ---- */
 /* net_graph = 48 unsigned chars (already encoded as (Wh+150)/2).  */
-/* chg/inv   = 48 ints (0..127).                                    */
+/* solar     = 48 unsigned chars (Wh per period, 0..150).           */
+/* ess_w     = 48 ints (avg battery W, +/-500; stored as int16).    */
 /* idx = last_matrix_index. ts = Unix timestamp of the save.        */
-void HAL_FlashVars_SaveGraphMatrices(unsigned char *net_graph,
-                                     int *chg, int *inv,
+void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
+                                     const unsigned char *solar, const int *ess_w,
                                      int size, int idx, unsigned int ts);
 /* Returns 1 on success, 0 if NVS had no valid data. */
 int  HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
-                                     int *chg, int *inv,
+                                     unsigned char *solar, int *ess_w,
                                      int size, int *idx, unsigned int *ts);
 
 #ifdef ENABLE_DRIVER_HLW8112SPI
