@@ -477,7 +477,7 @@ static void divert_send(int on) {
 // force-on (divert_user 1/2) ignores the charger gate.
 static TickType_t charger_on_tick = 0;   // tick the charger last went off->on
 static void evaluate_diversion(void) {
-    int charger_running = (dump_load_relay[5] >= 12);
+    int charger_running = (dump_load_relay[5] >= 18);
     TickType_t now = xTaskGetTickCount();
     int want_on;
 
@@ -716,28 +716,21 @@ static void ApplyDumpLoadGPIO(int state)
             else if (bd.cell_min >= inverter_cutoff_v + INVERTER_HYST_V) inverter_gated = 0;
         }
         // ALWAYS apply the (possibly held) latch state.
-        if (charger_gated  && state >= 12)              state = 0;
+        if (charger_gated  && state >= 18)              state = 0;
         if (inverter_gated && state >= 3 && state <= 5) state = 0;
     }
 #endif
 
     int inverter_active = (state >= 3 && state <= 5);
-    int charger_active  = (state >= 12);
+    int charger_active  = (state >= 18);
     TickType_t now    = xTaskGetTickCount();
 
     if (charger_active) {
         // ----- CHARGER MODE -----
-        // Linear map of the 12..100 duty range onto 0..255: 12->0, 100->255.
-		int duty = 0;
-		if (state < 12) {
-        duty = 0;
-	    } else {
-	        // (state * 5) / 2 is the exact same as state * 2.5  but uses fast integer math
-	        duty = (state * 5) / 2;
-	    }
-		// Optional: Keep this if your hardware still requires 
-    	// the output to cap at a maximum of 255.
-    	if (duty > 255) duty = 255;
+        // Linear map of the 18..100 duty range onto 0..255: 18->0, 100->255.
+        int duty = ((state - 18) * 255) / 82;
+        if (duty < 0)   duty = 0;
+        if (duty > 255) duty = 255;
 
         gpio_set_level(GPIO_CHARGER_ENABLE, 1);
 
@@ -831,12 +824,12 @@ commandResult_t BL09XX_SetTargetPower(const void *context, const char *cmd, cons
 
         if (charger_c_auto == 1) {
             // AUTO: this is the ceiling the loop may regulate up to.
-            if (val < 12)  val = 12;
+            if (val < 18)  val = 18;
             if (val > 100) val = 100;
             target_power_auto = val;
         } else {
             // MANUAL: this is the actual charger output, applied instantly.
-            if (val > 5 && val < 12) val = 12;
+            if (val > 5 && val < 18) val = 18;
             if (val > 100) val = 100;
             if (val < 0)   val = 0;
             target_power_manual = val;
@@ -1940,13 +1933,13 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                     }
                     
                     // Enforce absolute constraints
-                    if (solar_excess > 88) solar_excess = 88;
+                    if (solar_excess > 82) solar_excess = 82;
                     if (solar_excess < 0) solar_excess = 0;
                     
-                    persistent_state = 12 + solar_excess;
+                    persistent_state = 18 + solar_excess;
                     
                     int active_max = target_power_auto;
-                    if (active_max < 12) active_max = 100;
+                    if (active_max < 18) active_max = 100;
                     
                     if (persistent_state > active_max) persistent_state = active_max;
                 }
