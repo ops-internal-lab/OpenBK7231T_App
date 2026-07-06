@@ -217,48 +217,91 @@ float HAL_FlashVars_GetEnergyExportDaily(int daysAgo)
 	return nvs_get_float(s_exp_day_keys[daysAgo]);
 }
 
-/* ---- 12-hour graph matrix persistence ---- */
-void HAL_FlashVars_SaveGraphMatrices(unsigned char *net_graph,
-                                     int *chg, int *inv,
+/* ---- 12-hour graph matrix persistence ----
+   Single consolidated blob under one key ("grph"), replacing the old five
+   keys (grph_net/chg/inv/idx/ts). Two reasons:
+     1. NVS cost: one ~210 B blob is ~8 entries; the old five keys were ~22
+        entries live and ~22 dead entries of churn per 15-min save.
+     2. Correctness: the old API declared the solar matrix as int* while the
+        caller's array is unsigned char[48]; save read 192 B from a 48 B
+        array and LOAD WROTE 192 B BACK INTO IT, overwriting ~144 bytes of
+        adjacent globals (control-loop state) at every boot. The struct
+        below fixes the types, and the battery matrix is stored as int16
+        (values are clamped to +/-500 W) instead of a wasteful int32. */
+
+#define GRAPH_BLOB_MAGIC   0x31485247u  /* 'G','R','H','1' little-endian */
+#define GRAPH_BLOB_SLOTS   48
+
+typedef struct {
+	uint32_t      magic;                     /* GRAPH_BLOB_MAGIC            */
+	int32_t       idx;                       /* last_matrix_index           */
+	uint32_t      ts;                        /* save timestamp (epoch)      */
+	unsigned char net  [GRAPH_BLOB_SLOTS];   /* packed net Wh bytes         */
+	unsigned char solar[GRAPH_BLOB_SLOTS];   /* solar Wh/period, 0..150     */
+	int16_t       ess  [GRAPH_BLOB_SLOTS];   /* avg battery W, +/-500       */
+} graph_blob_t;                              /* 12 + 48 + 48 + 96 = 204 B   */
+
+/* One-time cleanup of the legacy five-key layout (safe if keys are absent). */
+static void graph_erase_legacy_keys(nvs_handle_t h)
+{
+	nvs_erase_key(h, "grph_net");
+	nvs_erase_key(h, "grph_chg");
+	nvs_erase_key(h, "grph_inv");
+	nvs_erase_key(h, "grph_idx");
+	nvs_erase_key(h, "grph_ts");
+}
+
+void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
+                                     const unsigned char *solar, const int *ess_w,
                                      int size, int idx, unsigned int ts)
 {
-	size_t net_sz = (size_t)size;
-	size_t int_sz = (size_t)(size * (int)sizeof(int));
+	graph_blob_t b;
+	int i, n = (size < GRAPH_BLOB_SLOTS) ? size : GRAPH_BLOB_SLOTS;
+	memset(&b, 0, sizeof(b));
+	b.magic = GRAPH_BLOB_MAGIC;
+	b.idx   = (int32_t)idx;
+	b.ts    = (uint32_t)ts;
+	memcpy(b.net,   net_graph, (size_t)n);
+	memcpy(b.solar, solar,     (size_t)n);
+	for (i = 0; i < n; i++) {
+		int v = ess_w[i];
+		if (v >  32767) v =  32767;
+		if (v < -32768) v = -32768;
+		b.ess[i] = (int16_t)v;
+	}
 	InitFlashIfNeeded();
 	nvs_handle_t h = 0;
-	nvs_open("config", NVS_READWRITE, &h);
-	nvs_set_blob(h, "grph_net", net_graph, net_sz);
-	nvs_set_blob(h, "grph_chg", chg, int_sz);
-	nvs_set_blob(h, "grph_inv", inv, int_sz);
-	nvs_set_i32(h,  "grph_idx", (int32_t)idx);
-	nvs_set_u32(h,  "grph_ts",  (uint32_t)ts);
-	nvs_commit(h);
+	if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+	graph_erase_legacy_keys(h);
+	esp_err_t rc = nvs_set_blob(h, "grph", &b, sizeof(b));
+	if (rc == ESP_OK) rc = nvs_commit(h);
+	if (rc != ESP_OK)
+		ADDLOG_ERROR(LOG_FEATURE_ENERGYMETER, "graph save failed rc=0x%x", rc);
 	nvs_close(h);
 }
 
 int HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
-                                    int *chg, int *inv,
+                                    unsigned char *solar, int *ess_w,
                                     int size, int *idx, unsigned int *ts)
 {
-	size_t net_sz = (size_t)size;
-	size_t int_sz = (size_t)(size * (int)sizeof(int));
-	int32_t  saved_idx = 0;
-	uint32_t saved_ts  = 0;
-	esp_err_t err;
+	graph_blob_t b;
+	size_t sz = sizeof(b);
+	int i, n = (size < GRAPH_BLOB_SLOTS) ? size : GRAPH_BLOB_SLOTS;
 	InitFlashIfNeeded();
 	nvs_handle_t h = 0;
-	nvs_open("config", NVS_READONLY, &h);
-	err  = nvs_get_blob(h, "grph_net", net_graph, &net_sz);
-	int_sz = (size_t)(size * (int)sizeof(int));
-	err |= nvs_get_blob(h, "grph_chg", chg, &int_sz);
-	int_sz = (size_t)(size * (int)sizeof(int));
-	err |= nvs_get_blob(h, "grph_inv", inv, &int_sz);
-	err |= nvs_get_i32(h,  "grph_idx", &saved_idx);
-	err |= nvs_get_u32(h,  "grph_ts",  &saved_ts);
+	if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return 0;
+	esp_err_t rc = nvs_get_blob(h, "grph", &b, &sz);
 	nvs_close(h);
-	if (err != ESP_OK) return 0;
-	*idx = (int)saved_idx;
-	*ts  = (unsigned int)saved_ts;
+	/* Absent, wrong size, or wrong magic -> fresh start (zeroed matrices).
+	   The legacy five-key layout is deliberately NOT migrated: its "chg"
+	   blob contained out-of-bounds garbage (see comment above), so the old
+	   data was never trustworthy. Keys are erased on the next save. */
+	if (rc != ESP_OK || sz != sizeof(b) || b.magic != GRAPH_BLOB_MAGIC) return 0;
+	memcpy(net_graph, b.net,   (size_t)n);
+	memcpy(solar,     b.solar, (size_t)n);
+	for (i = 0; i < n; i++) ess_w[i] = (int)b.ess[i];
+	*idx = (int)b.idx;
+	*ts  = (unsigned int)b.ts;
 	return 1;
 }
 
