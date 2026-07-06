@@ -408,7 +408,10 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
     power   = (float)d.watt  / BL_GetMeterPowerCal(slot);
     if (!isfinite(power)) power = 0.0f;
     frequency   = (d.freq != 0) ? (2 * 500000.0f / d.freq) : 0.0f;
-    signedPower = CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC) ? (-1.0f * power) : power;
+    // Remote slots deliberately IGNORE the global OBK_FLAG_POWER_INVERT_AC —
+    // that flag belongs to the onboard sensor's wiring only. Direction for a
+    // remote meter is owned exclusively by its per-meter invert (below).
+    signedPower = power;
 
     // Per-meter direction flip for a reverse-wired slave (settings page). Applies
     // to BOTH the signed watt and the signed CF-CNT energy (below) so a slot's
@@ -449,8 +452,9 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
             // reverse-wired meter's totals and its displayed direction agree.
             // (This is a fixed config convention, NOT per-cycle power-sign logic.)
             // Applied to both the calibrated Wh AND the raw ticks so every
-            // downstream consumer of either sees a consistent sign.
-            if (CFG_HasFlag(OBK_FLAG_POWER_INVERT_AC)) { cf_wh = -cf_wh; cf_ticks = -cf_ticks; }
+            // downstream consumer of either sees a consistent sign. The global
+            // OBK_FLAG_POWER_INVERT_AC is intentionally NOT applied here (it
+            // would cancel the per-meter invert); it remains onboard-only.
             if (meterInv) { cf_wh = -cf_wh; cf_ticks = -cf_ticks; }   // per-meter reverse-wire flip
             cf_valid = 1;
         }
