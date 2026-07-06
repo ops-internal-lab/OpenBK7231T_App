@@ -52,7 +52,15 @@ static volatile uint32_t s_last_connect_attempt_ticks = 0; // Boot/reconnect wat
 static volatile uint32_t s_disconnect_ticks = 0; // when the last disconnect happened
 static volatile uint32_t s_connect_ticks = 0; // when the GATT link came up (handshake watchdog)
 static volatile int      s_stream_rekicks = 0; // consecutive 0x96 re-kicks with no data
-static volatile int      s_connect_fails  = 0; // consecutive failed connect ATTEMPTS (reset on success)
+static volatile int      s_connect_fails  = 0; // consecutive fruitless connects (reset on first VALID frame)
+static volatile bool     s_got_frame      = false; // this session produced >=1 checksum-valid frame
+static volatile int      s_dead_sessions  = 0; // consecutive connected-but-no-valid-frame sessions
+
+// After this many consecutive sessions that connected but never produced a
+// single checksum-valid frame, assume the controller/host is wedged in a way
+// reconnects can't fix and restart the whole NimBLE stack (the in-driver
+// equivalent of the reboot that "fixes" it by hand).
+#define JKBMS_DEAD_SESSION_RESTART_LIMIT 6
 
 // Reconnect backoff schedule, indexed by consecutive failed connect attempts.
 // A single drop of a previously-working link retries after 1 s as before; but
@@ -155,9 +163,11 @@ static int     s_len = 0;
 
 static void feed(const uint8_t *data, int len)
 {
-    // Feed resets the watchdog timer
-    s_last_rx_ticks = xTaskGetTickCount();
-    s_stream_rekicks = 0; // healthy data clears the escalation counter
+    // NOTE: the stream watchdog is deliberately NOT reset here. A degraded
+    // link can trickle partial frames forever (bytes arrive, checksums never
+    // pass); resetting on raw bytes let that state hang the driver
+    // indefinitely with the link held and the UI stuck on "Not paired".
+    // Only a checksum-VALID frame (below) counts as a healthy stream.
 
     if (len >= 4 && data[0]==0x55 && data[1]==0xAA && data[2]==0xEB && data[3]==0x90)
         s_len = 0;                                   
@@ -169,6 +179,13 @@ static void feed(const uint8_t *data, int len)
         uint8_t sum = 0;
         for (int i = 0; i < 299; i++) sum += s_buf[i];
         if (sum == s_buf[299]) {
+            // A valid frame is the ONLY signal that the session is healthy:
+            // feed the watchdog, clear every escalation counter.
+            s_last_rx_ticks  = xTaskGetTickCount();
+            s_stream_rekicks = 0;
+            s_connect_fails  = 0;
+            s_dead_sessions  = 0;
+            s_got_frame      = true;
             if      (s_buf[4] == 0x02) decode_cell_info(s_buf);
             else if (s_buf[4] == 0x01) s_balance_start = u32(s_buf, 30) * 0.001f;
         }
@@ -203,7 +220,11 @@ static int on_disc_dsc(uint16_t conn, const struct ble_gatt_error *err,
     if (err->status == 0) {
         if (ble_uuid_cmp(&dsc->uuid.u, &CCCD_UUID.u) == 0) s_cccd_handle = dsc->handle;
     } else if (err->status == BLE_HS_EDONE) {
-        if (s_cccd_handle == 0) { ESP_LOGW(TAG, "no CCCD found"); return 0; }
+        if (s_cccd_handle == 0) {
+            ESP_LOGW(TAG, "no CCCD found; terminating");
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
         uint8_t val[2] = { 0x01, 0x00 };             
         ble_gattc_write_flat(conn, s_cccd_handle, val, sizeof(val), on_subscribe, NULL);
     }
@@ -217,7 +238,11 @@ static int on_disc_chr(uint16_t conn, const struct ble_gatt_error *err,
     if (err->status == 0) {
         s_val_handle = chr->val_handle;              
     } else if (err->status == BLE_HS_EDONE) {
-        if (s_val_handle == 0) { ESP_LOGW(TAG, "0xFFE1 not found"); return 0; }
+        if (s_val_handle == 0) {
+            ESP_LOGW(TAG, "0xFFE1 not found; terminating");
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
         s_cccd_handle = 0;
         ble_gattc_disc_all_dscs(conn, s_val_handle, s_svc_end, on_disc_dsc, NULL);
     }
@@ -232,7 +257,11 @@ static int on_disc_svc(uint16_t conn, const struct ble_gatt_error *err,
         s_svc_start = svc->start_handle;
         s_svc_end   = svc->end_handle;
     } else if (err->status == BLE_HS_EDONE) {
-        if (s_svc_start == 0) { ESP_LOGW(TAG, "service 0xFFE0 not found"); return 0; }
+        if (s_svc_start == 0) {
+            ESP_LOGW(TAG, "service 0xFFE0 not found; terminating");
+            ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
         s_val_handle = 0;
         ble_gattc_disc_chrs_by_uuid(conn, s_svc_start, s_svc_end, &CHR_UUID.u,
                                     on_disc_chr, NULL);
@@ -243,6 +272,13 @@ static int on_disc_svc(uint16_t conn, const struct ble_gatt_error *err,
 static int on_mtu(uint16_t conn, const struct ble_gatt_error *err,
                   uint16_t mtu, void *arg)
 {
+    if (err->status != 0) {
+        // Failing fast here turns a silent 15 s handshake-watchdog wait into
+        // an immediate retry with escalation (dead-session accounting).
+        ESP_LOGW(TAG, "MTU exchange failed (status=%d); terminating", err->status);
+        ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
     ESP_LOGI(TAG, "MTU exchanged: %d", mtu);
     s_svc_start = 0;
     ble_gattc_disc_svc_by_uuid(conn, &SVC_UUID.u, on_disc_svc, NULL);
@@ -258,7 +294,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_connect_ticks = xTaskGetTickCount(); // arm handshake watchdog
-            s_connect_fails = 0;                   // peer reachable: reset backoff
+            s_got_frame = false; // session proves itself with a valid frame
+            // NOTE: s_connect_fails is NOT reset here. A GAP connect that
+            // never yields a valid frame must still escalate the backoff,
+            // otherwise a connect->stall->terminate loop retries hot (1 s,
+            // full scan duty) forever. feed() resets it on real data.
             ESP_LOGI(TAG, "Connected; exchanging MTU...");
             ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
         } else {
@@ -281,6 +321,16 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGW(TAG, "Disconnected (reason=%d); will reconnect shortly", event->disconnect.reason);
+        if (!s_got_frame) {
+            // Session came up but never produced a single valid frame:
+            // escalate both the reconnect backoff (throttled scan duty,
+            // growing idle gaps) and the dead-session counter that
+            // eventually triggers a full NimBLE stack restart.
+            s_connect_fails++;
+            s_dead_sessions++;
+            ESP_LOGW(TAG, "Session ended with no valid frame (%d consecutive)",
+                     s_dead_sessions);
+        }
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_subscribed  = false;
         s_kick_pending = false;
@@ -337,30 +387,47 @@ static void start_connect(void)
     // synchronously and never generates a GAP event of its own.
     s_last_connect_attempt_ticks = xTaskGetTickCount();
 
-    // Explicit connection parameters. The key pair is scan_itvl/scan_window:
-    // a "direct connect by MAC" still puts the controller in the INITIATING
-    // state, where it listens for the peer's advertising packets exactly like
-    // a scan (just address-filtered) -- these two fields set that listening
-    // duty cycle. NimBLE's defaults (NULL params) are itvl == window == 10 ms,
-    // i.e. the receiver is on 100% of the attempt window, which starves WiFi
-    // on a shared-radio chip. 10 ms every 60 ms (~17%) still catches a JK
-    // advertising at ~1 Hz within a few seconds, but leaves the antenna free.
+    // Connection parameters, in two halves:
     //
-    // The link parameters are deliberately relaxed too: a 45-90 ms connection
-    // interval is far more than fast enough for a 300-byte frame every 2 s,
-    // and a 5 s supervision timeout rides out WiFi-induced jitter that would
-    // drop the link at NimBLE's default 640 ms -- fewer drops means fewer
-    // reconnect cycles in the first place.
+    // 1) scan_itvl/scan_window -- the INITIATING duty cycle. A direct connect
+    //    by MAC still listens for the peer's advertising exactly like a scan
+    //    (just address-filtered); these fields set how much of the time the
+    //    receiver is on, i.e. how hard BLE competes with WiFi for the single
+    //    C3 radio. ADAPTIVE: the first attempt (and any attempt while the
+    //    link has been recently healthy) uses 100% duty -- connects as fast
+    //    as stock NimBLE, which matters most at boot when WiFi bring-up is
+    //    also stomping the coex arbiter. Only after real consecutive
+    //    failures (BMS off / out of range) do we throttle, because that's
+    //    the only case where sustained initiating would strangle WiFi.
+    //
+    // 2) itvl_min/max -- the LIVE link interval. Deliberately kept in
+    //    NimBLE's default 30-50 ms range: the JK module bursts its ~300 B
+    //    frame as ~15 back-to-back notifications sized for fast intervals,
+    //    and stretching the interval makes its tiny TX queue overflow and
+    //    drop frame tails (bytes arrive, checksums never pass, the UI shows
+    //    "Not paired" on a live link). A connected link at this interval
+    //    carrying 15 tiny packets every 2 s is negligible airtime anyway --
+    //    the WiFi win must come from the initiating duty + backoff, not from
+    //    slowing the working link. supervision_timeout stays long (5 s) to
+    //    ride out WiFi-induced jitter that would drop the link at the ~2.5 s
+    //    default.
     struct ble_gap_conn_params cp = {
-        .scan_itvl           = 0x0060,   /* 96  * 0.625 ms = 60 ms            */
-        .scan_window         = 0x0010,   /* 16  * 0.625 ms = 10 ms (~17% duty)*/
-        .itvl_min            = 36,       /* 36  * 1.25 ms  = 45 ms            */
-        .itvl_max            = 72,       /* 72  * 1.25 ms  = 90 ms            */
+        .scan_itvl           = 0x0010,   /* overwritten below per tier        */
+        .scan_window         = 0x0010,
+        .itvl_min            = 24,       /* 24 * 1.25 ms = 30 ms              */
+        .itvl_max            = 40,       /* 40 * 1.25 ms = 50 ms              */
         .latency             = 0,
-        .supervision_timeout = 500,      /* 500 * 10 ms    = 5 s              */
+        .supervision_timeout = 500,      /* 500 * 10 ms  = 5 s                */
         .min_ce_len          = 0,
         .max_ce_len          = 0,
     };
+    if (s_connect_fails <= 0) {
+        cp.scan_itvl = 0x0010;  cp.scan_window = 0x0010;  /* 100% duty        */
+    } else if (s_connect_fails <= 2) {
+        cp.scan_itvl = 0x0060;  cp.scan_window = 0x0030;  /* 50% duty         */
+    } else {
+        cp.scan_itvl = 0x0060;  cp.scan_window = 0x0010;  /* ~17% duty        */
+    }
 
     int rc = ble_gap_connect(s_own_addr_type, &s_peer,
                              JKBMS_CONNECT_ATTEMPT_MS, &cp, gap_event, NULL);
@@ -394,6 +461,53 @@ static void host_task(void *param)
     (void)param;
     nimble_port_run();                 
     nimble_port_freertos_deinit();
+}
+
+static void nimble_host_setup(void)
+{
+    ble_hs_cfg.reset_cb        = on_reset;
+    ble_hs_cfg.sync_cb         = on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_store_config_init();
+}
+
+// Last-resort recovery: tear the whole NimBLE stack down and bring it back
+// up. Used when JKBMS_DEAD_SESSION_RESTART_LIMIT consecutive sessions
+// connected but never delivered one valid frame -- at that point the
+// controller/host is assumed wedged in a state that mere reconnects can't
+// clear (empirically, only a device reboot used to fix this; this is that
+// hammer, scoped to BLE). Runs on poll_task, never on the NimBLE host task.
+static void ble_stack_restart(void)
+{
+    ESP_LOGW(TAG, "Restarting NimBLE stack after %d dead sessions...", s_dead_sessions);
+    s_conn_handle       = BLE_HS_CONN_HANDLE_NONE;
+    s_subscribed        = false;
+    s_kick_pending      = false;
+    s_reconnect_pending = false;
+    s_len               = 0;
+
+    int rc = nimble_port_stop();            /* stops host; host_task exits */
+    if (rc != 0) {
+        ESP_LOGE(TAG, "nimble_port_stop rc=%d; will retry after backoff", rc);
+        s_dead_sessions = 0;                /* don't re-fire every tick     */
+        s_disconnect_ticks  = xTaskGetTickCount();
+        s_reconnect_pending = true;
+        return;
+    }
+    nimble_port_deinit();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (nimble_port_init() != ESP_OK) {
+        ESP_LOGE(TAG, "nimble_port_init failed after restart");
+        return;                             /* 60 s watchdog keeps retrying */
+    }
+    nimble_host_setup();
+    nimble_port_freertos_init(host_task);   /* on_sync -> start_connect     */
+
+    s_dead_sessions = 0;
+    s_connect_fails = 0;                    /* fresh stack: full-duty shot  */
+    s_last_connect_attempt_ticks = xTaskGetTickCount();
+    ESP_LOGI(TAG, "NimBLE stack restarted");
 }
 
 /* ---- polling watchdog task ----------------------------------------------- */
@@ -465,7 +579,10 @@ static void poll_task(void *param)
                 }
             }
         } else /* s_conn_handle == BLE_HS_CONN_HANDLE_NONE */ {
-            if (s_reconnect_pending) {
+            if (s_dead_sessions >= JKBMS_DEAD_SESSION_RESTART_LIMIT) {
+                // Reconnects aren't fixing it; escalate to a stack restart.
+                ble_stack_restart();
+            } else if (s_reconnect_pending) {
                 // A disconnect or a failed connect attempt scheduled a retry
                 // (see gap_event). Wait out the backoff, then reconnect --
                 // from this task, not the NimBLE host task. The delay grows
@@ -522,10 +639,7 @@ esp_err_t jk_bms_start(const jk_bms_config_t *cfg)
     esp_err_t err = nimble_port_init();        
     if (err != ESP_OK) { ESP_LOGE(TAG, "nimble_port_init: %d", err); return err; }
 
-    ble_hs_cfg.reset_cb        = on_reset;
-    ble_hs_cfg.sync_cb         = on_sync;
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
-    ble_store_config_init();
+    nimble_host_setup();
 
     nimble_port_freertos_init(host_task);
     xTaskCreate(poll_task, "jk_poll", 3072, NULL, 5, NULL);
