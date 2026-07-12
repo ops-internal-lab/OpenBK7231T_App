@@ -229,7 +229,12 @@ float HAL_FlashVars_GetEnergyExportDaily(int daysAgo)
         below fixes the types, and the battery matrix is stored as int16
         (values are clamped to +/-500 W) instead of a wasteful int32. */
 
-#define GRAPH_BLOB_MAGIC   0x31485247u  /* 'G','R','H','1' little-endian */
+#define GRAPH_BLOB_MAGIC   0x32485247u  /* 'G','R','H','2' little-endian.
+   v2: ess[] switched from plain int16 W to a packed uint16 per slot:
+       bits 0-8 = |W| (clamped 500), bit 9 = sign (1 = discharge),
+       bits 10-15 = battery SOC as (soc%/2)+1 (1..51, 0 = no sample).
+   Same 204-byte blob size. A v1 ('GRH1') blob fails the magic check ->
+   one-time fresh start of the 12-h graph history after upgrading. */
 #define GRAPH_BLOB_SLOTS   48
 
 typedef struct {
@@ -238,7 +243,7 @@ typedef struct {
 	uint32_t      ts;                        /* save timestamp (epoch)      */
 	unsigned char net  [GRAPH_BLOB_SLOTS];   /* packed net Wh bytes         */
 	unsigned char solar[GRAPH_BLOB_SLOTS];   /* solar Wh/period, 0..150     */
-	int16_t       ess  [GRAPH_BLOB_SLOTS];   /* avg battery W, +/-500       */
+	uint16_t      ess  [GRAPH_BLOB_SLOTS];   /* packed: |W|,sign,soc6       */
 } graph_blob_t;                              /* 12 + 48 + 48 + 96 = 204 B   */
 
 /* One-time cleanup of the legacy five-key layout (safe if keys are absent). */
@@ -253,6 +258,7 @@ static void graph_erase_legacy_keys(nvs_handle_t h)
 
 void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
                                      const unsigned char *solar, const int *ess_w,
+                                     const unsigned char *socm,
                                      int size, int idx, unsigned int ts)
 {
 	graph_blob_t b;
@@ -264,10 +270,12 @@ void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
 	memcpy(b.net,   net_graph, (size_t)n);
 	memcpy(b.solar, solar,     (size_t)n);
 	for (i = 0; i < n; i++) {
-		int v = ess_w[i];
-		if (v >  32767) v =  32767;
-		if (v < -32768) v = -32768;
-		b.ess[i] = (int16_t)v;
+		int w   = ess_w[i];
+		int mag = (w < 0) ? -w : w;
+		int s6  = socm ? (socm[i] & 0x3F) : 0;
+		if (mag > 500) mag = 500;
+		b.ess[i] = (uint16_t)((mag & 0x1FF) | ((w < 0) ? 0x200 : 0)
+		                      | (s6 << 10));
 	}
 	InitFlashIfNeeded();
 	nvs_handle_t h = 0;
@@ -282,6 +290,7 @@ void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
 
 int HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
                                     unsigned char *solar, int *ess_w,
+                                    unsigned char *socm,
                                     int size, int *idx, unsigned int *ts)
 {
 	graph_blob_t b;
@@ -299,7 +308,12 @@ int HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
 	if (rc != ESP_OK || sz != sizeof(b) || b.magic != GRAPH_BLOB_MAGIC) return 0;
 	memcpy(net_graph, b.net,   (size_t)n);
 	memcpy(solar,     b.solar, (size_t)n);
-	for (i = 0; i < n; i++) ess_w[i] = (int)b.ess[i];
+	for (i = 0; i < n; i++) {
+		unsigned int enc = b.ess[i];
+		int mag = (int)(enc & 0x1FF);
+		ess_w[i] = (enc & 0x200) ? -mag : mag;
+		if (socm) socm[i] = (unsigned char)((enc >> 10) & 0x3F);
+	}
 	*idx = (int)b.idx;
 	*ts  = (unsigned int)b.ts;
 	return 1;
