@@ -46,6 +46,7 @@ static unsigned char net_graph_matrix[MATRIX_SIZE] = {0};
 //   clamped 0..150. Always drawn as a negative (downward) yellow overlay.
 static int           ess_pwr_matrix[MATRIX_SIZE]    = {0};   // avg battery W, signed
 static unsigned char solar_graph_matrix[MATRIX_SIZE] = {0};  // solar Wh/period, 0..150
+static unsigned char soc_matrix[MATRIX_SIZE]         = {0};  // BMS1 SOC, (soc/2)+1 -> 1..51, 0 = no sample
 
 // Per-period sample accumulators (sampled by the 30 s sampler below). Battery
 // power is signed; solar power is the (>=0) instantaneous generation in W.
@@ -394,6 +395,19 @@ void BL0942_InvalidateBaseline(int slot);
 #include "jk_bms.h"      // jk_bms_data_t
 #endif
 
+/* Battery SOC (BMS 1, same source req=core uses) packed to 6 bits:
+   (soc%/2)+1 = 1..51 at 2% steps; 0 = BMS offline / no sample.
+   2% is exactly 1 px on the dashboard's 50-px graph band. */
+static int bms_soc6(void)
+{
+#ifdef ENABLE_JK_BMS
+    jk_bms_data_t bd;
+    if (JKBMS_GetData(&bd) && bd.soc >= 0 && bd.soc <= 100)
+        return (bd.soc >> 1) + 1;
+#endif
+    return 0;
+}
+
 int stat_updatesSkipped = 0;
 int stat_updatesSent = 0;
 
@@ -654,6 +668,7 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
         net_graph_matrix[i]   = (unsigned char)((0 + 150) / 2);
         ess_pwr_matrix[i]     = 0;
         solar_graph_matrix[i] = 0;
+        soc_matrix[i]         = 0;
     }
 
     ConsumptionResetTime = (time_t)TIME_GetCurrentTime();
@@ -663,6 +678,7 @@ commandResult_t BL09XX_ClearMeteringData(const void *context, const char *cmd, c
 #if PLATFORM_ESPIDF
     HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
                                     solar_graph_matrix, ess_pwr_matrix,
+                                    soc_matrix,
                                     MATRIX_SIZE,
                                     (last_matrix_index < 0) ? 0 : last_matrix_index,
                                     (unsigned int)TIME_GetCurrentTime());
@@ -1128,6 +1144,8 @@ static void COUNTERS_Load(void) {}
 // ---- Settings setters (store to RAM, then flash-persist on change) ----
 
 // SetMeterIP <slot 1..6> <octet 0..255> — assign a meter slave's last octet.
+// Special values: 0 = meter unset (poller skips it); 255 = LoRa link
+// (E22-400M22S), modem channel = slot — see mc_service() in the TCP poller.
 commandResult_t BL09XX_SetMeterIP(const void *context, const char *cmd, const char *args, int cmdFlags)
 {
     int slot, oct;
@@ -1642,6 +1660,7 @@ void BL_ProcessSweep(void) {
 #if PLATFORM_ESPIDF
             HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
                                             solar_graph_matrix, ess_pwr_matrix,
+                                            soc_matrix,
                                             MATRIX_SIZE, last_matrix_index,
                                             (unsigned int)TIME_GetCurrentTime());
 #endif
@@ -1767,6 +1786,10 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 if (ess_avg_w < -500) ess_avg_w = -500;
                 ess_pwr_matrix[last_matrix_index] = ess_avg_w;
 
+                // Battery SOC for the same slot (0 = no sample -> gap on the
+                // graph, consistent with how a missing BMS is shown elsewhere).
+                soc_matrix[last_matrix_index] = (unsigned char)bms_soc6();
+
                 // BOTTOM panel: solar ENERGY generated this period (Wh) =
                 // average solar power (W) * 0.25 h. Clamped 0..150 to match the
                 // chart's -150..+150 band; drawn as a negative yellow overlay.
@@ -1798,6 +1821,7 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
 #if PLATFORM_ESPIDF
                     HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
                                                    solar_graph_matrix, ess_pwr_matrix,
+                                                   soc_matrix,
                                                    MATRIX_SIZE, last_matrix_index,
                                                    (unsigned int)TIME_GetCurrentTime());
 #endif
@@ -2131,6 +2155,7 @@ void BL_Shared_Init(void)
         unsigned int saved_ts = 0;
         if (HAL_FlashVars_LoadGraphMatrices(net_graph_matrix,
                                             solar_graph_matrix, ess_pwr_matrix,
+                                            soc_matrix,
                                             MATRIX_SIZE, &saved_idx, &saved_ts)) {
             last_matrix_index = saved_idx;
             addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
@@ -2344,7 +2369,9 @@ int http_fn_api_dash(http_request_t *request) {
         raw[19] = (unsigned char)((lms_v  >> 8) & 0xFF);
         raw[20] = (unsigned char)(ev_v   & 0xFF);
         raw[21] = (unsigned char)((ev_v   >> 8) & 0xFF);
-        raw[22] = (unsigned char)((has_ntp ? 1 : 0) | (divert_is_on ? 2 : 0));
+        raw[22] = (unsigned char)((has_ntp ? 1 : 0) | (divert_is_on ? 2 : 0)
+                                  | (charger_gated  ? 4 : 0)   /* BMS high-V latch */
+                                  | (inverter_gated ? 8 : 0)); /* BMS low-V  latch */
         raw[23] = (unsigned char)(target_power_manual < 0 ? 0 : target_power_manual > 255 ? 255 : target_power_manual);
         raw[24] = (unsigned char)(divert_user < 0 ? 0 : divert_user > 2 ? 2 : divert_user);
         raw[25] = (unsigned char)(divert_threshold < 0 ? 0 : divert_threshold > 255 ? 255 : divert_threshold);
@@ -2618,10 +2645,14 @@ int http_fn_api_dash(http_request_t *request) {
     //        positive=total energy import (red up), negative=export (green down).
     //   sol: 1 byte/slot = solar Wh this period, 0..150. JS draws it negated
     //        (yellow, downward) as a semi-transparent overlay.
-    // req=batt: {"batt":"b64_96"} — top panel, battery power.
-    //   2 bytes/slot, little-endian 10-bit sign+magnitude:
-    //   enc = (|W| & 0x1FF) | (W<0 ? 0x200 : 0), |W| clamped to 500.
-    //   JS: mag = enc & 0x1FF; if (enc & 0x200) mag = -mag.  + = charge, - = discharge.
+    // req=batt: {"batt":"b64_96"} — top panel, battery power + SOC.
+    //   2 bytes/slot, little-endian:
+    //   enc = (|W| & 0x1FF) | (W<0 ? 0x200 : 0) | (soc6 << 10),
+    //   |W| clamped to 500; soc6 = (SOC%/2)+1 -> 1..51, 0 = no sample.
+    //   JS: mag = enc & 0x1FF; if (enc & 0x200) mag = -mag (+ = charge);
+    //       soc6 = (enc >> 10) & 0x3F; SOC% = soc6 ? (soc6-1)*2 : missing.
+    //   Bits 10-15 were always transmitted as 0 before, and old clients mask
+    //   them off — the format change is fully backward compatible on the wire.
     else if (has_ntp && req_param) {
         unsigned int msm = TIME_GetHour() * 60 + TIME_GetMinute();
 
@@ -2660,18 +2691,20 @@ int http_fn_api_dash(http_request_t *request) {
             int           raw_len = 0, b64_len;
             int           has_live = (sample_count_30s > 0);
             int           batt_live = has_live ? (current_ess_pwr_accum / sample_count_30s) : 0;
+            int           live_soc6 = bms_soc6();
 
             for (int i = 47; i >= 0; i--) {
                 int idx  = (msm / net_metering_period - i + 96) % 96;
                 int slot = idx % MATRIX_SIZE;
                 int w    = (i == 0 && has_live) ? batt_live : ess_pwr_matrix[slot];
+                int soc6 = (i == 0) ? live_soc6 : (int)soc_matrix[slot];
                 int mag, enc;
                 if (w >  500) w =  500;
                 if (w < -500) w = -500;
                 mag = (w < 0) ? -w : w;
-                enc = (mag & 0x1FF) | ((w < 0) ? 0x200 : 0);
+                enc = (mag & 0x1FF) | ((w < 0) ? 0x200 : 0) | ((soc6 & 0x3F) << 10);
                 raw[raw_len++] = (unsigned char)(enc & 0xFF);
-                raw[raw_len++] = (unsigned char)((enc >> 8) & 0x03);
+                raw[raw_len++] = (unsigned char)((enc >> 8) & 0xFF);
             }
             b64_len = base64_encode(raw, raw_len, b64);
             b64[b64_len] = '\0';

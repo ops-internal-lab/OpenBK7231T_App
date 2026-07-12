@@ -323,6 +323,15 @@ static int mc_service(int slot)
         BL_SetMeterReading(slot, 0, 0, 0, 0, 0);
         return -1;
     }
+    if (oct == 255) {
+        /* Reserved sentinel: this meter is linked over the LoRa radio
+           (EBYTE E22-400M22S), modem channel = slot + 1. 255 is the /24
+           broadcast octet so it can never be a real TCP host. No TCP
+           attempts; the future radio driver hooks in here. Until then
+           the slot reads as offline. */
+        BL_SetMeterReading(slot, 0, 0, 0, 0, 0);
+        return -1;
+    }
 
     UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
     fd = mc_open(ip);
