@@ -170,8 +170,17 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 #define MP_PORT            UART_TCP_PORT   /* 8888 */
 #define MP_CONNECT_MS      80              /* bounded "get the link live" wait    */
 #define MP_FRAME_SETTLE_MS 70              /* skip the guaranteed-empty period    */
-#define MP_ATTEMPT_MS      100             /* total wait per attempt (settle+poll) */
-#define MP_MAX_ATTEMPTS    3               /* re-send + retry up to this many      */
+#define MP_ATTEMPT_MS      200             /* total wait per attempt (settle+poll).
+   Measured: replies land ~110-170 ms after the request, so the old 100 ms
+   (= 70 settle + only 30 listening) expired on EVERY first attempt and the
+   frame was collected by attempt 2 -- stats showed rt~1.00, t=170 (=100+70)
+   on every meter. 200 matches MP_REG_READ_MS, whose 150 ms window never had
+   this problem on the same link. Deadlines only bind on failure, so this
+   costs nothing when the read succeeds.                                    */
+#define MP_MAX_ATTEMPTS    2               /* re-send + retry up to this many.
+   Safe at 2 only because the window above now covers the real reply time:
+   attempt 1 should succeed, attempt 2 is a genuine backup. Worst case:
+   80 connect + 200 reg + 2*200 = 680 ms, inside the 1 s tick.              */
 #define MP_REG_READ_MS     200             /* single-register reply wait          */
 #define MP_REG_SETTLE_MS   50              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */

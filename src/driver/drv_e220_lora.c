@@ -43,8 +43,14 @@
 
 /* ---- timeouts: TCP-stack values + air allowance (tuned for 62.5k air) ---- */
 #define LM_FRAME_SETTLE_MS 120   /* TCP 70  + ~50 ms for two air hops        */
-#define LM_ATTEMPT_MS      180   /* TCP 100 + ~80 ms air allowance           */
-#define LM_MAX_ATTEMPTS    3     /* same as TCP                              */
+#define LM_ATTEMPT_MS      350   /* TCP 200 + ~150 ms air allowance.
+   Same lesson as TCP: the window must cover the WHOLE reply, not just the
+   part after the settle. Air round trip is ~200-350 ms (serial 4800 both
+   ends + two air hops + module packetisation + LBT), so 350 leaves ~230 ms
+   of listening after the 120 ms settle.                                    */
+#define LM_MAX_ATTEMPTS    2     /* same as TCP. Worst case: 280 reg +
+   2*350 = 980 ms, inside the 1 s tick -- and that worst case needs the MODE
+   read to succeed while BOTH frame reads fail, which is rare.              */
 #define LM_REG_READ_MS     280   /* TCP 200 + ~80 ms air allowance           */
 #define LM_REG_SETTLE_MS   80    /* TCP 50  + ~30 ms                         */
 #define LM_RXCAP           64    /* frame resync buffer (same as TCP)        */
