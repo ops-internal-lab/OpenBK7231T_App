@@ -18,6 +18,7 @@
 #include "drv_uart_tcp_client.h"
 #include "drv_bl0942.h"      /* BL0942_TCP_ScanStore */
 #include "drv_bl_shared.h"   /* BL_GetMeterOctet / BL_SetMeterReading / ... */
+#include "drv_e220_lora.h"   /* LoRa transport for octet-255 slots */
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -175,7 +176,7 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 #define MP_REG_SETTLE_MS   50              /* reg reply is only 4 bytes (~8 ms)    */
 #define MP_RXCAP           64              /* frame resync buffer                 */
 #define MP_SLOTS           6
-#define MP_TICKS_PER_CYCLE 6             /* 6 meters + 4 dummy skips = 10 s cycle */
+#define MP_TICKS_PER_CYCLE 10            /* 6 meters + 4 idle ticks = 10 s cycle */
 
 static bool     g_pollRun  = false;        /* poller enabled between Start/Stop   */
 static int      g_pollTick = 0;            /* 0..MP_TICKS_PER_CYCLE-1 round-robin  */
@@ -324,23 +325,25 @@ static int mc_service(int slot)
         return -1;
     }
     if (oct == 255) {
-        /* Reserved sentinel: this meter is linked over the LoRa radio
-           (EBYTE E22-400M22S), modem channel = slot + 1. 255 is the /24
-           broadcast octet so it can never be a real TCP host. No TCP
-           attempts; the future radio driver hooks in here. Until then
-           the slot reads as offline. */
-        BL_SetMeterReading(slot, 0, 0, 0, 0, 0);
-        return -1;
+        /* Reserved sentinel: this meter is linked over LoRa (E220-400T22S,
+           slave address = slot + 1). 255 is the /24 broadcast octet so it
+           can never be a real TCP host. LoRaMeter_Service() mirrors this
+           function's contract (MODE verified every cycle, same store/fail
+           paths) and degrades to offline while the radio is unconfigured. */
+        return LoRaMeter_Service(slot);
     }
 
     UART_TCP_BuildIP(ip, sizeof(ip), (unsigned char)oct);
     fd = mc_open(ip);
     if (fd < 0) { BL_MeterReadFailed(slot); return -1; }
 
+    uint32_t t0;   /* stats: first frame request -> valid frame */
+
     /* 1) Always verify the MODE register first using the stable deadline logic */
     if (mc_read_reg(fd, BL0942_REG_MODE_ADDR, &mode) != 0) {
         mc_close(fd);
         BL_MeterReadFailed(slot);
+        BL_MeterStatsReport(slot, 0, 0, 0);
         return 0; /* Read failed, skip this cycle */
     }
 
@@ -359,10 +362,12 @@ static int mc_service(int slot)
         /* Terminate connection immediately to let the chip settle until the next cycle */
         mc_close(fd);
         BL_MeterReadFailed(slot);
+        BL_MeterStatsReport(slot, 0, 0, 0);
         return 0;
     }
 
     /* 3) Register is verified. Proceed to read the data frame. */
+    t0 = now_ms();
     for (attempt = 0; attempt < MP_MAX_ATTEMPTS; attempt++) {
         int r = mc_read_frame(fd, slot, cf_reset, now_ms() + MP_ATTEMPT_MS);
         if (r == 1) { got = 1; break; }                   /* valid frame stored */
@@ -372,8 +377,12 @@ static int mc_service(int slot)
     /* 4) Clean up */
     mc_close(fd);                                         /* always RST-close */
 
-    if (got) return 1;
+    if (got) {
+        BL_MeterStatsReport(slot, 1, attempt + 1, (int)(now_ms() - t0));
+        return 1;
+    }
     BL_MeterReadFailed(slot);
+    BL_MeterStatsReport(slot, 0, MP_MAX_ATTEMPTS, 0);
     return 0;
 }
 
@@ -509,5 +518,6 @@ void UART_TCP_ClientInit(void)
     CMD_RegisterCommand("setChargerIP2",   cmd_c2, "Active charger IP (last octet)");
     CMD_RegisterCommand("listChargerIPs",  cmd_list_charger, "List charger IPs");
     CMD_RegisterCommand("sendChargerCmd",  cmd_send_charger, "HTTP GET to active charger: sendChargerCmd /path");
+    LoRaMeter_Init();
     ADDLOG_INFO(LOG_FEATURE_DRV, "UART TCP client ready");
 }

@@ -13,6 +13,13 @@ void BL_ProcessUpdate(float voltage, float current, float power,
 
 /* Remote multi-meter interface (BL0942 TCP poller <-> shared accounting). */
 int  BL_GetMeterOctet(int slot);                                  /* 0 = unset */
+
+/* Per-meter link diagnostics (RAM only). frame_rssi: plug-embedded WiFi RSSI
+   from BL0942 frame byte 18 (captured post-checksum; 0 = not reported).
+   Stats are fed by BOTH pollers (TCP + LoRa) with identical semantics. */
+void BL_SetMeterFrameRssi(int slot, int rssi);
+void BL_MeterStatsReport(int slot, int ok, int frame_txs, int elapsed_ms);
+void BL_MeterStatsReset(void);
 int  BL_GetMeterInvert(int slot);        /* 1 = reverse-wired: flip W and energy */
 float BL_GetMeterVoltCal(int slot);
 float BL_GetMeterCurrentCal(int slot);

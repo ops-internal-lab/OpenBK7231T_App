@@ -48,6 +48,39 @@ static int           ess_pwr_matrix[MATRIX_SIZE]    = {0};   // avg battery W, s
 static unsigned char solar_graph_matrix[MATRIX_SIZE] = {0};  // solar Wh/period, 0..150
 static unsigned char soc_matrix[MATRIX_SIZE]         = {0};  // BMS1 SOC, (soc/2)+1 -> 1..51, 0 = no sample
 
+/* ---- per-meter link diagnostics (RAM only, since boot) ----
+   frame_rssi: WiFi plugs running the byte-18 firmware embed their own
+   RSSI (signed dBm) in the otherwise-unused byte 18 of the BL0942 frame;
+   captured after checksum validation, 0 = not reported / old firmware.
+   stats: fed by BOTH pollers (TCP + LoRa) with identical definitions:
+     cycles   = service cycles attempted (MODE failures included)
+     success  = cycles that stored a checksum-valid frame
+     retx     = frame re-requests beyond the first, summed
+     last_ms  = first frame request -> valid frame, retries included   */
+static signed char   g_meter_frame_rssi[6] = {0,0,0,0,0,0};
+static unsigned int  g_mst_cycles [6] = {0,0,0,0,0,0};
+static unsigned int  g_mst_success[6] = {0,0,0,0,0,0};
+static unsigned int  g_mst_retx   [6] = {0,0,0,0,0,0};
+static unsigned int  g_mst_lastms [6] = {0,0,0,0,0,0};
+
+void BL_SetMeterFrameRssi(int slot, int rssi) {
+    if (slot < 0 || slot >= 6) return;
+    if (rssi >= -127 && rssi < 0) g_meter_frame_rssi[slot] = (signed char)rssi;
+}
+
+void BL_MeterStatsReport(int slot, int ok, int frame_txs, int elapsed_ms) {
+    if (slot < 0 || slot >= 6) return;
+    g_mst_cycles[slot]++;
+    if (ok) { g_mst_success[slot]++; g_mst_lastms[slot] = (unsigned)elapsed_ms; }
+    if (frame_txs > 1) g_mst_retx[slot] += (unsigned)(frame_txs - 1);
+}
+
+void BL_MeterStatsReset(void) {
+    int i;
+    for (i = 0; i < 6; i++)
+        g_mst_cycles[i] = g_mst_success[i] = g_mst_retx[i] = g_mst_lastms[i] = 0;
+}
+
 // Per-period sample accumulators (sampled by the 30 s sampler below). Battery
 // power is signed; solar power is the (>=0) instantaneous generation in W.
 static int current_ess_pwr_accum   = 0;   // sum of signed battery W samples
@@ -393,6 +426,9 @@ void BL0942_InvalidateBaseline(int slot);
 #ifdef ENABLE_JK_BMS
 #include "drv_jkbms.h"   // JKBMS_GetData / JKBMS_GetMac
 #include "jk_bms.h"      // jk_bms_data_t
+#endif
+#if PLATFORM_ESPIDF
+#include "drv_e220_lora.h"   /* LoRaMeter_GetRSSI */
 #endif
 
 /* Battery SOC (BMS 1, same source req=core uses) packed to 6 bits:
@@ -2097,6 +2133,30 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     }       
 }
 
+
+static int cmd_meterStats(const void *c, const char *cmd, const char *a) {
+    int i; (void)c; (void)cmd; (void)a;
+    for (i = 0; i < 6; i++) {
+        unsigned cy = g_mst_cycles[i];
+        ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
+            "meter %d: cycles=%u ok=%u (%u.%u%%) retx=%u (avg %u.%02u) last=%ums rssi=%d",
+            i + 1, cy, g_mst_success[i],
+            cy ? (unsigned)(g_mst_success[i] * 100u / cy) : 0,
+            cy ? (unsigned)((g_mst_success[i] * 1000u / cy) % 10) : 0,
+            g_mst_retx[i],
+            cy ? (unsigned)(g_mst_retx[i] / cy) : 0,
+            cy ? (unsigned)((g_mst_retx[i] * 100u / cy) % 100) : 0,
+            g_mst_lastms[i], (int)g_meter_frame_rssi[i]);
+    }
+    return 1;
+}
+static int cmd_meterStatsReset(const void *c, const char *cmd, const char *a) {
+    (void)c; (void)cmd; (void)a;
+    BL_MeterStatsReset();
+    ADDLOG_INFO(LOG_FEATURE_ENERGYMETER, "meter stats zeroed");
+    return 1;
+}
+
 void BL_Shared_Init(void)
 {
     int i;
@@ -2244,6 +2304,10 @@ void BL_Shared_Init(void)
     CMD_RegisterCommand("SetDivertThreshold", BL09XX_SetDivertThreshold, NULL);
     CMD_RegisterCommand("SetMeterIP", BL09XX_SetMeterIP, NULL);
     CMD_RegisterCommand("SetMeterInvert", BL09XX_SetMeterInvert, NULL);
+    CMD_RegisterCommand("MeterStats", cmd_meterStats,
+        "Dump per-meter link stats (cycles/success/retx/last ms)");
+    CMD_RegisterCommand("MeterStatsReset", cmd_meterStatsReset,
+        "Zero the per-meter link statistics");
     CMD_RegisterCommand("SetMeterVoltCal", BL09XX_SetMeterVoltCal, NULL);
     CMD_RegisterCommand("SetMeterCurrentCal", BL09XX_SetMeterCurrentCal, NULL);
     CMD_RegisterCommand("SetMeterPowerCal", BL09XX_SetMeterPowerCal, NULL);
@@ -2604,11 +2668,29 @@ int http_fn_api_dash(http_request_t *request) {
         float v, a, w; int on;
         B("\"mt\":[");
         for (i = 0; i < 6; i++) {
+            int rssi = 0;
             v = a = w = 0; on = 0;
             BL_GetMeter(i, &v, &a, &w, &on);
-            B("%s{\"v\":%d,\"w\":%d,\"o\":%d,\"e\":%d}",
+            /* link RSSI by transport: LoRa slot -> radio-measured RSSI of its
+               last frame; TCP slot -> plug-reported RSSI embedded in frame
+               byte 18 (0 = plug not running the byte-18 firmware). */
+#if PLATFORM_ESPIDF
+            if (g_meter_ip[i] == 255) rssi = LoRaMeter_GetRSSI(i);
+            else
+#endif
+                rssi = g_meter_frame_rssi[i];
+            B("%s{\"v\":%d,\"w\":%d,\"o\":%d,\"e\":%d",
               i ? "," : "", (int)(v * 10.0f + 0.5f), (int)w, on,
               ticks_to_wh((long)meter_acc[i]));
+            if (rssi) B(",\"r\":%d", rssi);
+            if (g_mst_cycles[i]) {
+                /* s = success permille, q = avg retransmits x100, t = last ms */
+                B(",\"s\":%u,\"q\":%u,\"t\":%u",
+                  (unsigned)((unsigned long long)g_mst_success[i] * 1000ULL / g_mst_cycles[i]),
+                  (unsigned)((unsigned long long)g_mst_retx[i]    * 100ULL  / g_mst_cycles[i]),
+                  g_mst_lastms[i]);
+            }
+            B("}");
         }
         // Solar (one-way).
         B("],\"gen\":{\"d\":%d,\"t\":%d,\"lh\":%d,\"h\":[%d,%d,%d]}",

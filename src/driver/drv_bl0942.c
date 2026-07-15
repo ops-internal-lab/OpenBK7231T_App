@@ -394,6 +394,12 @@ static int BL0942_ParseScaleStore(const byte *b, int len, int slot, int cf_reset
     d.cf_cnt = (b[15] << 16) | (b[14] << 8) | b[13];
     d.freq   = (b[17] << 8) | b[16];
 
+    /* Byte 18 is unused by the BL0942 quantities we read; plugs running the
+       byte-18 firmware embed their WiFi RSSI there (signed dBm) and fix up
+       the checksum. Captured only after the checksum passed, same trust rule
+       as every other field. 0 / non-negative = not reported. */
+    BL_SetMeterFrameRssi(slot, (int)(signed char)b[18]);
+
     // Latch the raw (pre-calibration) codes so a calibration command issued
     // right after this read has "what the chip just said" to work from.
     BL_SetMeterRaw(slot, d.v_rms, d.i_rms, d.watt);

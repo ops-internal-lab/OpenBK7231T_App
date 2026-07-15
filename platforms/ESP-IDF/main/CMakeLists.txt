@@ -29,6 +29,7 @@ set(PROJ_ALL_SRC
 	${OBK_SRCS}driver/drv_mqtt_stream.c
 	# TCP UART client (remote UART-over-TCP, targets via setUartTarget1..4)
 	${OBK_SRCS}driver/drv_uart_tcp_client.c
+	${OBK_SRCS}driver/drv_e220_lora.c
 )
 set(ENABLE_MDNS_ESPIDF 0)
 if("$ENV{IDF_TARGET}" STREQUAL "esp32" OR "$ENV{IDF_TARGET}" STREQUAL "esp32c6" OR "$ENV{IDF_TARGET}" STREQUAL "esp32s3")
