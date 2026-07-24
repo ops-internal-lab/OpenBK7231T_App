@@ -1924,9 +1924,16 @@ void MQTT_InitCallbacks() {
 		MQTT_RegisterCallback(cbtopicbase, cbtopicsub, 7, tasCmnd);
 	}
 	// test hack iobroker
+	/* homeassistant/+ subscription DISABLED for this build: HA discovery is
+	   compiled out and entities are static YAML, so reacting to HA's birth
+	   message by broadcasting the whole legacy device state (channels etc.)
+	   is exactly the burst-on-restart behavior we removed. The streamer's
+	   retained topics + heartbeat already restore HA state after a restart. */
+	/*
 	snprintf(cbtopicbase, sizeof(cbtopicbase), "homeassistant/");
 	snprintf(cbtopicsub, sizeof(cbtopicsub), "homeassistant/+");
 	MQTT_RegisterCallback(cbtopicbase, cbtopicsub, 8, onHassStatus);
+	*/
 }
  // initialise things MQTT
  // called from user_main
