@@ -392,7 +392,13 @@ static long ess_chg_lh(void)   { return grp_lasthour(GRP_BATT,  +1); }
 static long ess_dis_lh(void)   { return grp_lasthour(GRP_BATT,  -1); }
 
 #include "drv_bl_shared.h"
-#if ENABLE_BLE_THERM
+#if defined(PLATFORM_ESPIDF)
+/* Guarded on PLATFORM_ESPIDF (a compiler -D flag, always defined) rather than
+   ENABLE_BLE_THERM: this include sits above the headers that pull in
+   obk_config.h, so ENABLE_BLE_THERM is not defined yet here and a feature-flag
+   guard would silently skip the include, leaving BLETherm_Get/GetMacStr
+   undeclared where they're used below. The header's prototypes are harmless
+   when the feature is off; the call sites stay guarded on ENABLE_BLE_THERM. */
 #include "drv_ble_therm.h"
 #endif
 
