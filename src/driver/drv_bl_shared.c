@@ -392,6 +392,9 @@ static long ess_chg_lh(void)   { return grp_lasthour(GRP_BATT,  +1); }
 static long ess_dis_lh(void)   { return grp_lasthour(GRP_BATT,  -1); }
 
 #include "drv_bl_shared.h"
+#if ENABLE_BLE_THERM
+#include "drv_ble_therm.h"
+#endif
 
 #include "../new_cfg.h"
 #include "../new_pins.h"
@@ -1709,7 +1712,6 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
     int i;
     time_t ntpTime;
     struct tm *ltm;
-    char datetime[64];
     float diff;
 
     // Capture tick at the very top of the function. This timestamp is used
@@ -2102,30 +2104,15 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 break;
             }
 
-            if (MQTT_IsReady() == true)
-            {
-                sensors[i].lastSentValue = sensors[i].lastReading;
-                if (i == OBK_CONSUMPTION_CLEAR_DATE) {
-                    sensors[i].lastReading = ConsumptionResetTime; 
-                    ltm = gmtime(&ConsumptionResetTime);
-                    if (NTP_GetTimesZoneOfsSeconds()>0)
-                    {
-                        snprintf(datetime, sizeof(datetime), "%04i-%02i-%02iT%02i:%02i+%02i:%02i",
-                                 ltm->tm_year+1900, ltm->tm_mon+1, ltm->tm_mday, ltm->tm_hour, ltm->tm_min,
-                                 NTP_GetTimesZoneOfsSeconds()/3600, (NTP_GetTimesZoneOfsSeconds()/60) % 60);
-                    } else {
-                        snprintf(datetime, sizeof(datetime), "%04i-%02i-%02iT%02i:%02i-%02i:%02i",
-                                 ltm->tm_year+1900, ltm->tm_mon+1, ltm->tm_mday, ltm->tm_hour, ltm->tm_min,
-                                 abs(NTP_GetTimesZoneOfsSeconds()/3600), (abs(NTP_GetTimesZoneOfsSeconds())/60) % 60);
-                    }
-                    MQTT_PublishMain_StringString(sensors[i].names.name_mqtt, datetime, 0);
-                } else { 
-                    float val = sensors[i].lastReading;
-                    if (sensors[i].names.units == UNIT_WH) val = BL_ChangeEnergyUnitIfNeeded(val);
-                    MQTT_PublishMain_StringFloat(sensors[i].names.name_mqtt, val, sensors[i].rounding_decimals, 0);
-                }
-                stat_updatesSent++;
+            /* MQTT publishing REMOVED from this driver entirely — the paced
+               streamer in drv_mqtt_stream.c is the ONLY publisher. This loop
+               now exists solely to fire the script events above; keep the
+               bookkeeping so change detection still advances. */
+            sensors[i].lastSentValue = sensors[i].lastReading;
+            if (i == OBK_CONSUMPTION_CLEAR_DATE) {
+                sensors[i].lastReading = ConsumptionResetTime;
             }
+            stat_updatesSent++;
         } else {
             sensors[i].noChangeFrame++;
             stat_updatesSkipped++;
@@ -2633,6 +2620,11 @@ int http_fn_api_dash(http_request_t *request) {
     else if (req_param && strncmp(req_param, "req=cfg", 7) == 0) {
         int i;
         B("\"bms1\":\"%s\",\"bms2\":\"%s\",", g_bms_mac, g_bms2_mac);
+#if ENABLE_BLE_THERM
+        { char tm[24];
+          BLETherm_GetMacStr(0, tm, sizeof(tm)); B("\"th1\":\"%s\",", tm);
+          BLETherm_GetMacStr(1, tm, sizeof(tm)); B("\"th2\":\"%s\",", tm); }
+#endif
         for (i = 0; i < 6; i++) {
             if (g_meter_ip[i]) B("\"m%d\":\"%d\",", i + 1, g_meter_ip[i]);
             else               B("\"m%d\":\"\",", i + 1);
@@ -2692,8 +2684,22 @@ int http_fn_api_dash(http_request_t *request) {
             }
             B("}");
         }
+#if ENABLE_BLE_THERM
+        /* Two BLE thermometers for the top bar: t = 0.1 C, h = %RH, o = fresh.
+           Slot 0 = inside, slot 1 = outside (long-range PHY, transparently). */
+        B("],\"th\":[");
+        { int ti; for (ti = 0; ti < 2; ti++) {
+            float tc = 0, rh = 0; int bp = 0;
+            int ok = BLETherm_Get(ti, &tc, &rh, &bp);
+            B("%s{\"o\":%d,\"t\":%d,\"h\":%d,\"b\":%d}", ti ? "," : "",
+              ok, (int)(tc * 10.0f + (tc >= 0 ? 0.5f : -0.5f)), (int)(rh + 0.5f), bp);
+        } }
+        B("]");
+#else
+        B("]");
+#endif
         // Solar (one-way).
-        B("],\"gen\":{\"d\":%d,\"t\":%d,\"lh\":%d,\"h\":[%d,%d,%d]}",
+        B(",\"gen\":{\"d\":%d,\"t\":%d,\"lh\":%d,\"h\":[%d,%d,%d]}",
           ticks_to_wh(solar_gen(0)),
           ticks_to_wh(solar_total()),
           ticks_to_wh(solar_lh()),
@@ -2844,10 +2850,10 @@ void BL_GetPublishSnapshot(bl_pub_snapshot_t *s)
 
     if (!s) return;
 
-    /* --- grid phase voltages (NAN when offline so the streamer skips them) --- */
-    BL_GetMeter(0, &v, &a, &w, &on); s->grid_l1_v = on ? v : NAN;
-    BL_GetMeter(1, &v, &a, &w, &on); s->grid_l2_v = on ? v : NAN;
-    BL_GetMeter(2, &v, &a, &w, &on); s->grid_l3_v = on ? v : NAN;
+    /* --- grid phase voltages + currents (NAN offline so the streamer skips) --- */
+    BL_GetMeter(0, &v, &a, &w, &on); s->grid_l1_v = on ? v : NAN; s->grid_l1_a = on ? a : NAN;
+    BL_GetMeter(1, &v, &a, &w, &on); s->grid_l2_v = on ? v : NAN; s->grid_l2_a = on ? a : NAN;
+    BL_GetMeter(2, &v, &a, &w, &on); s->grid_l3_v = on ? v : NAN; s->grid_l3_a = on ? a : NAN;
 
     /* --- instant group power: signed sum of ONLINE meter watts --- */
     s->grid_power = 0.0f;
@@ -2869,6 +2875,20 @@ void BL_GetPublishSnapshot(bl_pub_snapshot_t *s)
     s->solar_lasthour_wh       = ticks_to_wh(solar_lh());
     s->solar_today_wh          = ticks_to_wh(solar_gen(0));
     s->solar_total_wh          = ticks_to_wh(solar_total());
+
+    /* --- BMS AC side (battery group = meter slot 5; import = charging) --- */
+    if (BL_MeterOnlineState(5)) {
+        float bw = g_meter[5].w;             /* signed: + charging, - discharging */
+        s->bms_ac_import_now_w = (bw > 0.0f) ?  bw : 0.0f;
+        s->bms_ac_export_now_w = (bw < 0.0f) ? -bw : 0.0f;
+    } else {
+        s->bms_ac_import_now_w = NAN;        /* offline -> streamer skips these  */
+        s->bms_ac_export_now_w = NAN;
+    }
+    s->bms_ac_import_lasthour_wh = ticks_to_wh(ess_chg_lh());
+    s->bms_ac_import_today_wh    = ticks_to_wh(ess_charge(0));
+    s->bms_ac_export_lasthour_wh = ticks_to_wh(ess_dis_lh());
+    s->bms_ac_export_today_wh    = ticks_to_wh(ess_discharge(0));
 
     /* --- ESS / controller state --- */
     s->ess_charger_mode   = charger_c_auto ? 0 : (charger_manual_temp ? 1 : 2);

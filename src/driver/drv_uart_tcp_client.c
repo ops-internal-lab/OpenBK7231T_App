@@ -19,6 +19,7 @@
 #include "drv_bl0942.h"      /* BL0942_TCP_ScanStore */
 #include "drv_bl_shared.h"   /* BL_GetMeterOctet / BL_SetMeterReading / ... */
 #include "drv_e220_lora.h"   /* LoRa transport for octet-255 slots */
+#include "drv_mqtt_stream.h" /* MQTTStream_RunQuietTick on quiet ticks */
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -187,7 +188,7 @@ int UART_TCP_PollMeter(const char *ip, int port, uint8_t *out, int outlen)
 #define MP_SLOTS           6
 #define MP_TICKS_PER_CYCLE 10            /* 6 meters + 4 idle ticks = 10 s cycle */
 
-static bool     g_pollRun  = false;        /* poller enabled between Start/Stop   */
+static volatile bool g_pollRun  = false;   /* toggled from console, read by task  */
 static int      g_pollTick = 0;            /* 0..MP_TICKS_PER_CYCLE-1 round-robin  */
 
 static uint32_t now_ms(void)
@@ -395,20 +396,61 @@ static int mc_service(int slot)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+   BACKGROUND POLLER TASK
+   The blocking TCP work (connect + settle + read, 150-680 ms per meter) used
+   to run inside the main loop and stalled everything once per second. It now
+   lives in its own FreeRTOS task on a fixed 1 Hz grid. The task only does
+   network I/O and word-sized stores (BL_SetMeterReading / stats / RSSI, all
+   plain assignments, safe to read from other threads). Anything with side
+   effects beyond that — BL_ProcessSweep (energy integration, script events,
+   NVS graph saves) — is still executed by the MAIN LOOP: the task just posts
+   s_sweep_pending and the main loop's UART_TCP_MeterTick() consumes it.
+   Same for MQTT: the task only MARKS quiet seconds; publishing stays in the
+   main loop (MQTTStream_RunPendingTick).
+   --------------------------------------------------------------------------- */
+static volatile unsigned char s_sweep_pending = 0;
+
+static void mp_task(void *arg)
+{
+    TickType_t lastWake = xTaskGetTickCount();
+    (void)arg;
+    for (;;) {
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1000));
+
+        if (!g_pollRun) {
+            MQTTStream_MarkQuietTick();     /* poller off: every second free */
+            continue;
+        }
+
+        if (g_pollTick < MP_SLOTS) {
+            /* Unset slot (octet 0) = dummy placement: mc_service stores
+               zeros and returns instantly, so the second is still quiet. */
+            if (BL_GetMeterOctet(g_pollTick) == 0)
+                MQTTStream_MarkQuietTick();
+            mc_service(g_pollTick);         /* one real meter this tick */
+        } else {
+            MQTTStream_MarkQuietTick();     /* idle tick (6..9)          */
+        }
+
+        if (g_pollTick == MP_TICKS_PER_CYCLE - 1)
+            s_sweep_pending = 1;            /* main loop runs the sweep  */
+
+        g_pollTick++;
+        if (g_pollTick >= MP_TICKS_PER_CYCLE) g_pollTick = 0;
+    }
+}
+
+/* Called once per second from the MAIN LOOP (via drv_bl0942.c). No longer
+   does any network I/O — it only runs the end-of-cycle sweep (energy
+   integration + events + graph persistence) in main-loop context, where
+   the script engine and NVS writes belong. */
 void UART_TCP_MeterTick(void)
 {
-    if (!g_pollRun) return;
-
-    if (g_pollTick < MP_SLOTS) {
-        mc_service(g_pollTick);                 /* one real meter this tick */
+    if (s_sweep_pending) {
+        s_sweep_pending = 0;
+        BL_ProcessSweep();
     }
-
-    if (g_pollTick == MP_TICKS_PER_CYCLE - 1) {
-        BL_ProcessSweep();                      /* integrate deltas + sync web */
-    }
-
-    g_pollTick++;
-    if (g_pollTick >= MP_TICKS_PER_CYCLE) g_pollTick = 0;
 }
 
 void UART_TCP_StartMeterPoll(void)
@@ -528,5 +570,9 @@ void UART_TCP_ClientInit(void)
     CMD_RegisterCommand("listChargerIPs",  cmd_list_charger, "List charger IPs");
     CMD_RegisterCommand("sendChargerCmd",  cmd_send_charger, "HTTP GET to active charger: sendChargerCmd /path");
     LoRaMeter_Init();
-    ADDLOG_INFO(LOG_FEATURE_DRV, "UART TCP client ready");
+    /* Blocking meter I/O runs in its own task from now on; the main loop
+       only consumes results (see mp_task above). Priority 5: above idle,
+       below networking, so a slow TCP peer can never starve anything. */
+    xTaskCreate(mp_task, "meterpoll", 4096, NULL, 5, NULL);
+    ADDLOG_INFO(LOG_FEATURE_DRV, "UART TCP client ready (poller task started)");
 }

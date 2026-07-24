@@ -3,6 +3,12 @@
 #include "drv_bl0937.h"
 #include "drv_bl0942.h"
 #include "drv_bl_shared.h"
+#if defined(PLATFORM_ESPIDF) && ENABLE_MQTT
+#include "drv_mqtt_stream.h"
+#endif
+#if defined(PLATFORM_ESPIDF) && ENABLE_BLE_THERM
+#include "drv_ble_therm.h"
+#endif
 #include "drv_neo6m.h"
 #include "drv_cse7766.h"
 #include "drv_ir.h"
@@ -1534,6 +1540,38 @@ static driver_t g_drivers[] = {
 	DRV_MQTTServer_AppendInformationToHTTPIndexPage, // appendInformationToHTTPIndexPage
 	DRV_MQTTServer_RunQuickTick,             // runQuickTick
 	DRV_MQTTServer_Stop,                     // stopFunction
+	NULL,                                    // onChannelChanged
+	NULL,                                    // onHassDiscovery
+	false,                                   // loaded
+	}
+#endif
+#if defined(PLATFORM_ESPIDF) && ENABLE_MQTT
+	//drvdetail:{"name":"MQTTStream",
+	//drvdetail:"title":"TODO",
+	//drvdetail:"descr":"Grouped BMS + energy + system MQTT streamer; the sole MQTT publisher on this build. Stoppable at runtime so buggy publishing can be halted without reflashing.",
+	//drvdetail:"requires":""}
+	{ "MQTTStream",                          // Driver Name
+	MQTTStream_Start,                        // Init (re-armable, resets state)
+	NULL,                                    // onEverySecond (driven by main loop directly)
+	NULL,                                    // appendInformationToHTTPIndexPage
+	NULL,                                    // runQuickTick
+	MQTTStream_Stop,                         // stopFunction
+	NULL,                                    // onChannelChanged
+	NULL,                                    // onHassDiscovery
+	false,                                   // loaded
+	}
+#endif
+#if defined(PLATFORM_ESPIDF) && ENABLE_BLE_THERM
+	//drvdetail:{"name":"BLETherm",
+	//drvdetail:"title":"TODO",
+	//drvdetail:"descr":"Passive BLE listener for two Xiaomi LYWSD03MMC thermometers (ATC1441/PVVX firmware), selected by MAC. Never connects; coexists with the JK-BMS link.",
+	//drvdetail:"requires":""}
+	{ "BLETherm",                            // Driver Name
+	BLETherm_Start,                          // Init (re-armable)
+	BLETherm_OnEverySecond,                  // onEverySecond ((re)starts scan)
+	NULL,                                    // appendInformationToHTTPIndexPage
+	NULL,                                    // runQuickTick
+	BLETherm_Stop,                           // stopFunction
 	NULL,                                    // onChannelChanged
 	NULL,                                    // onHassDiscovery
 	false,                                   // loaded

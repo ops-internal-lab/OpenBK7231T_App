@@ -61,6 +61,7 @@ void BL09XX_SaveEmeteringStatistics();
 typedef struct {
     /* grid */
     float grid_l1_v, grid_l2_v, grid_l3_v;   /* NAN when that phase is offline  */
+    float grid_l1_a, grid_l2_a, grid_l3_a;   /* NAN when that phase is offline  */
     float grid_power;                        /* signed sum of ONLINE phase W     */
     float net_energy;                        /* Wh (repurposed reactive slot)    */
     int   grid_import_total_wh, grid_export_total_wh;
@@ -69,6 +70,11 @@ typedef struct {
     /* solar */
     float solar_power;                       /* signed sum of ONLINE solar W      */
     int   solar_lasthour_wh, solar_today_wh, solar_total_wh;
+    /* BMS AC side (meter slot 5 / battery group; import = charging) */
+    float bms_ac_import_now_w;               /* W into battery, NAN if offline    */
+    float bms_ac_export_now_w;               /* W out of battery, NAN if offline  */
+    int   bms_ac_import_lasthour_wh, bms_ac_import_today_wh;
+    int   bms_ac_export_lasthour_wh, bms_ac_export_today_wh;
     /* ess / controller */
     float ess_ac_power;                      /* slot 5 W, signed (0 if offline)   */
     int   ess_charger_mode;                  /* 0 auto / 1 man-temp / 2 man-lock  */

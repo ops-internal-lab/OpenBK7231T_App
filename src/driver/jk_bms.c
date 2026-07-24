@@ -16,6 +16,7 @@
 #include "host/util/util.h"
 
 #include "jk_bms.h"
+#include "drv_ble_therm.h"   /* scan suspend/resume around connect attempts */
 
 static const char *TAG = "jk_bms";
 
@@ -291,6 +292,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
 
     case BLE_GAP_EVENT_CONNECT:
+        // Attempt resolved (either way): the link layer is free again, let
+        // the BLE thermometer scan restart from its next driver tick.
+        BLETherm_ResumeScan();
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_connect_ticks = xTaskGetTickCount(); // arm handshake watchdog
@@ -381,6 +385,12 @@ static void start_connect(void)
     // Any disconnect-triggered reconnect that was scheduled is moot now,
     // regardless of which path (poll_task or a GAP event) got us here.
     s_reconnect_pending = false;
+
+    // NimBLE cannot initiate a connection while a discovery is active, so
+    // stop the thermometer listener's passive scan first (no-op if idle).
+    // It resumes automatically once this attempt resolves (see the
+    // BLE_GAP_EVENT_CONNECT handler).
+    BLETherm_SuspendScan();
 
     // Record the attempt regardless of outcome so the poll_task watchdog
     // knows when we last tried, even if ble_gap_connect() below fails
