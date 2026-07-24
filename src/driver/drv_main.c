@@ -3,10 +3,15 @@
 #include "drv_bl0937.h"
 #include "drv_bl0942.h"
 #include "drv_bl_shared.h"
-#if defined(PLATFORM_ESPIDF) && ENABLE_MQTT
+#if defined(PLATFORM_ESPIDF)
+/* These headers declare prototypes unconditionally; include them whenever
+   building for ESP-IDF. Guarding on ENABLE_MQTT/ENABLE_BLE_THERM here would
+   fail silently, because those macros come from obk_config.h which is not
+   yet included at this point in the file (the guard would evaluate false and
+   the declarations would be missing when the driver table below references
+   them). The driver-table entries themselves stay guarded on the feature
+   flags, which ARE defined by the time the table is compiled. */
 #include "drv_mqtt_stream.h"
-#endif
-#if defined(PLATFORM_ESPIDF) && ENABLE_BLE_THERM
 #include "drv_ble_therm.h"
 #endif
 #include "drv_neo6m.h"
