@@ -1543,7 +1543,7 @@ static driver_t g_drivers[] = {
 	NULL,                                    // onChannelChanged
 	NULL,                                    // onHassDiscovery
 	false,                                   // loaded
-	}
+	},
 #endif
 #if defined(PLATFORM_ESPIDF) && ENABLE_MQTT
 	//drvdetail:{"name":"MQTTStream",
@@ -1559,7 +1559,7 @@ static driver_t g_drivers[] = {
 	NULL,                                    // onChannelChanged
 	NULL,                                    // onHassDiscovery
 	false,                                   // loaded
-	}
+	},
 #endif
 #if defined(PLATFORM_ESPIDF) && ENABLE_BLE_THERM
 	//drvdetail:{"name":"BLETherm",
