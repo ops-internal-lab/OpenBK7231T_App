@@ -1,3 +1,5 @@
 CONFIG_PM_ENABLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
+# Extended scanning (dual 1M + Coded PHY) for BLE long-range thermometers
+CONFIG_BT_NIMBLE_EXT_ADV=y
