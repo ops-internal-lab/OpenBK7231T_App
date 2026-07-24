@@ -27,6 +27,7 @@ set(PROJ_ALL_SRC
 	${OBK_SRCS}driver/bms_frontend.c
 	# Grouped BMS + energy + system MQTT streamer
 	${OBK_SRCS}driver/drv_mqtt_stream.c
+	${OBK_SRCS}driver/drv_ble_therm.c
 	# TCP UART client (remote UART-over-TCP, targets via setUartTarget1..4)
 	${OBK_SRCS}driver/drv_uart_tcp_client.c
 	${OBK_SRCS}driver/drv_e220_lora.c
