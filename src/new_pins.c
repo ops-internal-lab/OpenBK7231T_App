@@ -1382,11 +1382,21 @@ static void Channel_OnChanged(int ch, int prevValue, int iFlags) {
 		}
 	}
 #if ENABLE_MQTT
+	/* Automatic channel->MQTT publishing DISABLED for this build: no channels
+	   are bound to physical relays here, and every meaningful state (inverter
+	   on/off, charger PWM, manual/auto modes) is already carried by the paced
+	   streamer in drv_mqtt_stream.c under its own topics. Keeping this path
+	   would create a second, unpaced publisher. Incoming <topic>/<ch>/set
+	   commands are unaffected (that is the subscribe side), and the manual
+	   `publishChannel` console command still works if ever needed. */
+	/*
 	if ((iFlags & CHANNEL_SET_FLAG_SKIP_MQTT) == 0) {
 		if (CHANNEL_ShouldBePublished(ch)) {
 			MQTT_ChannelPublish(ch, 0);
 		}
 	}
+	*/
+	(void)iFlags;
 #endif
 	// Simple event - it just says that there was a change
 	EventHandlers_FireEvent(CMD_EVENT_CHANNEL_ONCHANGE, ch);

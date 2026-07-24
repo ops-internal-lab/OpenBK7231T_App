@@ -470,13 +470,17 @@
 #elif PLATFORM_ESPIDF
 
 #define ENABLE_SEND_POSTANDGET					1
-#define	ENABLE_HA_DISCOVERY						1
+/* HA discovery removed - all entities are declared manually in HA YAML
+   (see mqtt_stream topics in drv_mqtt_stream.c). This compiles out hass.c,
+   the /ha discovery HTTP page, the scheduleHADiscovery command and the
+   automatic discovery-on-boot/IP-change publishes. */
+//#define	ENABLE_HA_DISCOVERY					1
 #define ENABLE_MQTT								1
 #define ENABLE_I2C								1
 #define ENABLE_NTP								1
 //#define ENABLE_TIME_DST						1
 #define ENABLE_DRIVER_LED						1
-#define ENABLE_DRIVER_TUYAMCU					1
+//#define ENABLE_DRIVER_TUYAMCU					1
 #define ENABLE_LITTLEFS							1
 #define ENABLE_DRIVER_BMPI2C					1
 #define ENABLE_DRIVER_DS1820					1
@@ -485,23 +489,26 @@
 #define ENABLE_DRIVER_BATTERY					1
 #define ENABLE_DRIVER_CHARTS					1
 #define ENABLE_EXPAND_CONSTANT					1
-#define ENABLE_DRIVER_HUE						1
-#define ENABLE_DRIVER_WEMO						1
-#define ENABLE_DRIVER_BL0937					1
+//#define ENABLE_DRIVER_HUE						1
+//#define ENABLE_DRIVER_WEMO						1
+/* Trimmed for this ESS build: no local BL0937 chip, no LED strips, no
+   Alexa (Wemo/Hue) emulation, no TuyaMCU, no device-group UDP, no SSDP
+   announcements. Less flash, fewer open network listeners. */
+//#define ENABLE_DRIVER_BL0937					1
 #define ENABLE_DRIVER_BL0942				1
 #define ENABLE_DRIVER_UART_TCP    1
-#define ENABLE_TASMOTADEVICEGROUPS				1
+//#define ENABLE_TASMOTADEVICEGROUPS				1
 #define ENABLE_TASMOTA_JSON						1
 #define ENABLE_CALENDAR_EVENTS					1
 #define ENABLE_DRIVER_DDP						1
 //#define ENABLE_DRIVER_ARISTON					1
-#define ENABLE_DRIVER_SSDP						1
+//#define ENABLE_DRIVER_SSDP						1
 #define ENABLE_DRIVER_CHT83XX					1
 //#define ENABLE_DRIVER_CSE7761					1
 #define ENABLE_OBK_SCRIPTING					1
 #define ENABLE_ADVANCED_CHANNELTYPES_DISCOVERY	1
-#define ENABLE_DRIVER_SM16703P					1
-#define ENABLE_DRIVER_PIXELANIM					1
+//#define ENABLE_DRIVER_SM16703P					1
+//#define ENABLE_DRIVER_PIXELANIM					1
 #define ENABLE_DRIVER_TINYIR_NEC				1
 
 #if (OBK_VARIANT == OBK_VARIANT_ESP4M || OBK_VARIANT == OBK_VARIANT_ESP2M_BERRY)
@@ -518,6 +525,7 @@
 // Enable JK-BMS BLE monitor (NimBLE central, MAC C8:47:80:1A:18:B5)
 // Pages: /bms (live monitor) and /api_bms (JSON data endpoint)
 #define ENABLE_JK_BMS							1
+#define ENABLE_BLE_THERM					1	// Xiaomi LYWSD03MMC (ATC/PVVX) passive BLE listener
 
 #elif PLATFORM_TR6260
 
