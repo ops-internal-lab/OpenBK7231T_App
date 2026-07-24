@@ -4,6 +4,8 @@
 #include "../../logging/logging.h"
 #include "../../quicktick.h"
 #include <arch/sys_arch.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_wifi.h"
 #include "esp_sleep.h"
 #if PLATFORM_ESP8266
@@ -75,14 +77,28 @@ void app_main(void)
     JKBMS_AutoStart();
 #endif
 
-    /* Start grouped BMS + energy + system MQTT streamer (no-op if MQTT off).
-       Safe to start now: it waits for MQTT_IsReady() before publishing. */
-    MQTTStream_Start();
+    /* MQTT streamer is an OpenBeken DRIVER now — it is NOT force-started
+       here. Add `startDriver MQTTStream` to autoexec.bat (or start/stop it
+       from the web UI / console). Because autoexec is skipped in safe mode,
+       a buggy publisher can always be recovered without a serial reflash. */
 
-    while(1)
+    /* Fixed-rate 1 Hz scheduling. The old sys_delay_ms(1000) + work pattern
+       made the real period 1 s PLUS the work time — with meter polls taking
+       150-680 ms on 6 of every 10 ticks, the "10 second" meter cycle
+       stretched to ~12 s and every timer (heartbeats, uptime, ring rollover)
+       drifted. vTaskDelayUntil anchors each tick to an absolute deadline so
+       the work time is absorbed, not accumulated. If one tick overruns 1 s,
+       FreeRTOS just runs the next one immediately and stays on grid. */
     {
-        sys_delay_ms(1000);
-        Main_OnEverySecond();
+        TickType_t lastWake = xTaskGetTickCount();
+        while(1)
+        {
+            vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1000));
+            Main_OnEverySecond();
+            /* MAIN-LOOP MQTT publish: sends at most one message, and only if
+               this second's meter tick flagged itself quiet (no meter I/O). */
+            MQTTStream_RunPendingTick();
+        }
     }
 }
 
