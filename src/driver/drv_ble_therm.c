@@ -44,6 +44,9 @@
 #include "../cmnds/cmd_local.h"
 #include "../cmnds/cmd_public.h"   /* commandResult_t, CMD_RES_* */
 
+#include "sdkconfig.h"           /* CONFIG_BT_NIMBLE_EXT_ADV must be visible
+                                     HERE: the ext-vs-legacy scan choice below
+                                     is a preprocessor decision in this file.  */
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -234,6 +237,7 @@ static void therm_try_start_scan(void)
         }
     }
 #else
+#warning "BLETherm: CONFIG_BT_NIMBLE_EXT_ADV not set - LEGACY 1M-only scan, long-range (Coded PHY) sensors will NOT be received"
     /* Legacy 1M-only scan (build without CONFIG_BT_NIMBLE_EXT_ADV; no
        long-range reception in this mode). */
     {
@@ -338,8 +342,14 @@ static commandResult_t cmd_list_therm(const void *c, const char *cmd, const char
                 ADDLOG_INFO(LOG_FEATURE_DRV, "therm%d: %s  (no frame yet)", i + 1, m);
         }
     }
-    ADDLOG_INFO(LOG_FEATURE_DRV, "scan: enabled=%d suspended=%d active=%d",
-                s_enabled, s_suspended, s_scanning);
+    ADDLOG_INFO(LOG_FEATURE_DRV, "scan: enabled=%d suspended=%d active=%d mode=%s",
+                s_enabled, s_suspended, s_scanning,
+#if defined(CONFIG_BT_NIMBLE_EXT_ADV)
+                "EXT dual-PHY (long range OK)"
+#else
+                "LEGACY 1M ONLY (no long range!)"
+#endif
+                );
     return CMD_RES_OK;
 }
 
@@ -361,8 +371,13 @@ void BLETherm_Start(void)
     therm_nvs_load();
     for (int i = 0; i < THERM_COUNT; i++) s_seen[i] = 0;
     s_enabled = 1;
-    ADDLOG_INFO(LOG_FEATURE_DRV, "BLETherm: armed (%s%s)",
+#if defined(CONFIG_BT_NIMBLE_EXT_ADV)
+    ADDLOG_INFO(LOG_FEATURE_DRV, "BLETherm: armed (%s%s) scan=EXTENDED dual-PHY (1M+LongRange)",
                 s_mac_set[0] ? "mac1 " : "", s_mac_set[1] ? "mac2" : "");
+#else
+    ADDLOG_ERROR(LOG_FEATURE_DRV, "BLETherm: armed (%s%s) scan=LEGACY 1M ONLY - long-range sensors will NOT be received!",
+                s_mac_set[0] ? "mac1 " : "", s_mac_set[1] ? "mac2" : "");
+#endif
 }
 
 void BLETherm_Stop(void)
