@@ -31,3 +31,7 @@ int  BLETherm_Get(int idx, float *temp_c, float *hum_pct, int *batt_pct);
 /* Configured MAC as "aa:bb:cc:dd:ee:ff" into out; returns 1 if set, else
    writes "" and returns 0. For the dashboard config Retrieve. */
 int  BLETherm_GetMacStr(int idx, char *out, int outlen);
+
+/* Diagnostics for the config UI. */
+int  BLETherm_GetStats(int idx, int *secs_since_seen, int *avg_interval_s, int *rssi_dbm);
+void BLETherm_ResetIntervalStats(void);

@@ -13,6 +13,14 @@
 #endif
 #include "dash_frontend.h"
 
+/* Forward declaration: BLETherm_ResetIntervalStats is used in BL_MeterStatsReset
+   below, which sits far above the drv_ble_therm.h include (and above where
+   obk_config.h defines ENABLE_BLE_THERM). Declaring it here keeps the call
+   valid regardless of include order; the real prototype/stub is in the header. */
+#if defined(PLATFORM_ESPIDF)
+void BLETherm_ResetIntervalStats(void);
+#endif
+
 // Charger C mapping constants
 #define CHARGER_MIN_PWM   10       // lowest useful duty for the supply
 #define CHARGER_MAX_PWM  100
@@ -62,6 +70,10 @@ static unsigned int  g_mst_cycles [6] = {0,0,0,0,0,0};
 static unsigned int  g_mst_success[6] = {0,0,0,0,0,0};
 static unsigned int  g_mst_retx   [6] = {0,0,0,0,0,0};
 static unsigned int  g_mst_lastms [6] = {0,0,0,0,0,0};
+/* EWMA of successful read time, alpha = 1/50, stored x256 fixed-point so the
+   fractional part survives integer math. g_mst_msavg_q8>>8 = whole ms. */
+#define STAT_EWMA_SHIFT 6          /* alpha = 1/64 ~= 1/50; power-of-two = cheap */
+static unsigned int  g_mst_msavg_q8[6] = {0,0,0,0,0,0};
 
 void BL_SetMeterFrameRssi(int slot, int rssi) {
     if (slot < 0 || slot >= 6) return;
@@ -71,14 +83,33 @@ void BL_SetMeterFrameRssi(int slot, int rssi) {
 void BL_MeterStatsReport(int slot, int ok, int frame_txs, int elapsed_ms) {
     if (slot < 0 || slot >= 6) return;
     g_mst_cycles[slot]++;
-    if (ok) { g_mst_success[slot]++; g_mst_lastms[slot] = (unsigned)elapsed_ms; }
+    if (ok) {
+        g_mst_success[slot]++;
+        g_mst_lastms[slot] = (unsigned)elapsed_ms;
+        /* EWMA update: avg += (sample - avg) / 2^SHIFT, in x256 fixed-point.
+           First sample seeds the average so it converges immediately. */
+        {
+            unsigned sample_q8 = (unsigned)elapsed_ms << 8;
+            if (g_mst_msavg_q8[slot] == 0) g_mst_msavg_q8[slot] = sample_q8;
+            else g_mst_msavg_q8[slot] += ((int)sample_q8 - (int)g_mst_msavg_q8[slot]) >> STAT_EWMA_SHIFT;
+        }
+    }
     if (frame_txs > 1) g_mst_retx[slot] += (unsigned)(frame_txs - 1);
+}
+
+/* EWMA average read time in whole ms (for display). */
+unsigned BL_MeterAvgMs(int slot) {
+    if (slot < 0 || slot >= 6) return 0;
+    return g_mst_msavg_q8[slot] >> 8;
 }
 
 void BL_MeterStatsReset(void) {
     int i;
     for (i = 0; i < 6; i++)
-        g_mst_cycles[i] = g_mst_success[i] = g_mst_retx[i] = g_mst_lastms[i] = 0;
+        g_mst_cycles[i] = g_mst_success[i] = g_mst_retx[i] = g_mst_lastms[i] = g_mst_msavg_q8[i] = 0;
+#if defined(PLATFORM_ESPIDF)
+    BLETherm_ResetIntervalStats();   /* also zero thermometer interval EWMAs */
+#endif
 }
 
 // Per-period sample accumulators (sampled by the 30 s sampler below). Battery
@@ -1335,8 +1366,8 @@ commandResult_t BL09XX_SetChargerCutoff(const void *context, const char *cmd, co
 {
     if (args && *args) {
         int cv = atoi(args);
-        if (cv < 250) cv = 250;
-        if (cv > 420) cv = 420;
+        if (cv < 330) cv = 330;   /* 3.30 V floor */
+        if (cv > 405) cv = 405;   /* 4.05 V ceiling */
         charger_cutoff_v = cv / 100.0f;
         SETTINGS_Save();
     }
@@ -1349,8 +1380,8 @@ commandResult_t BL09XX_SetInverterCutoff(const void *context, const char *cmd, c
 {
     if (args && *args) {
         int cv = atoi(args);
-        if (cv < 250) cv = 250;
-        if (cv > 420) cv = 420;
+        if (cv < 330) cv = 330;   /* 3.30 V floor */
+        if (cv > 405) cv = 405;   /* 4.05 V ceiling */
         inverter_cutoff_v = cv / 100.0f;
         SETTINGS_Save();
     }
@@ -2132,13 +2163,14 @@ static int cmd_meterStats(const void *c, const char *cmd, const char *a) {
     for (i = 0; i < 6; i++) {
         unsigned cy = g_mst_cycles[i];
         ADDLOG_INFO(LOG_FEATURE_ENERGYMETER,
-            "meter %d: cycles=%u ok=%u (%u.%u%%) retx=%u (avg %u.%02u) last=%ums rssi=%d",
+            "meter %d: cycles=%u ok=%u (%u.%u%%) retx=%u (avg %u.%02u) avg=%umsD last=%ums rssi=%d",
             i + 1, cy, g_mst_success[i],
             cy ? (unsigned)(g_mst_success[i] * 100u / cy) : 0,
             cy ? (unsigned)((g_mst_success[i] * 1000u / cy) % 10) : 0,
             g_mst_retx[i],
             cy ? (unsigned)(g_mst_retx[i] / cy) : 0,
             cy ? (unsigned)((g_mst_retx[i] * 100u / cy) % 100) : 0,
+            BL_MeterAvgMs(i),
             g_mst_lastms[i], (int)g_meter_frame_rssi[i]);
     }
     return 1;
@@ -2641,6 +2673,10 @@ int http_fn_api_dash(http_request_t *request) {
         if (g_inv2_ip)   B("\"inv2\":\"%d\",", g_inv2_ip);  else B("\"inv2\":\"\",");
         if (g_bypass_ip) B("\"byp\":\"%d\",", g_bypass_ip); else B("\"byp\":\"\",");
         B("\"boost\":%d,\"dthr\":%d", g_boost_power, divert_threshold);
+        /* battery-protection cut-offs, centivolts, for the config text boxes */
+        B(",\"ccut\":%d,\"icut\":%d",
+          (int)(charger_cutoff_v  * 100.0f + 0.5f),
+          (int)(inverter_cutoff_v * 100.0f + 0.5f));
         B(",\"solrng\":%d,\"battrng\":%d", g_solar_power_range_w, g_batt_power_range_w);
         // Device IP — static, for the SYSTEM panel (served once with the config
         // the page fetches on load; it doesn't change at runtime).
@@ -2682,11 +2718,11 @@ int http_fn_api_dash(http_request_t *request) {
               ticks_to_wh((long)meter_acc[i]));
             if (rssi) B(",\"r\":%d", rssi);
             if (g_mst_cycles[i]) {
-                /* s = success permille, q = avg retransmits x100, t = last ms */
+                /* s = success permille, q = avg retransmits x100, t = EWMA avg ms */
                 B(",\"s\":%u,\"q\":%u,\"t\":%u",
                   (unsigned)((unsigned long long)g_mst_success[i] * 1000ULL / g_mst_cycles[i]),
                   (unsigned)((unsigned long long)g_mst_retx[i]    * 100ULL  / g_mst_cycles[i]),
-                  g_mst_lastms[i]);
+                  BL_MeterAvgMs(i));
             }
             B("}");
         }
@@ -2696,9 +2732,13 @@ int http_fn_api_dash(http_request_t *request) {
         B("],\"th\":[");
         { int ti; for (ti = 0; ti < 2; ti++) {
             float tc = 0, rh = 0; int bp = 0;
+            int ls = -1, iv = 0, rs = 0;
             int ok = BLETherm_Get(ti, &tc, &rh, &bp);
-            B("%s{\"o\":%d,\"t\":%d,\"h\":%d,\"b\":%d}", ti ? "," : "",
-              ok, (int)(tc * 10.0f + (tc >= 0 ? 0.5f : -0.5f)), (int)(rh + 0.5f), bp);
+            BLETherm_GetStats(ti, &ls, &iv, &rs);
+            B("%s{\"o\":%d,\"t\":%d,\"h\":%d,\"b\":%d,\"ls\":%d,\"iv\":%d,\"rs\":%d}",
+              ti ? "," : "",
+              ok, (int)(tc * 10.0f + (tc >= 0 ? 0.5f : -0.5f)), (int)(rh + 0.5f), bp,
+              ls, iv, rs);
         } }
         B("]");
 #else

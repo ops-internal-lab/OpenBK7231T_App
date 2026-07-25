@@ -54,7 +54,8 @@
 #include "host/ble_gap.h"
 
 #define THERM_COUNT       2
-#define THERM_FRESH_SECS  180     /* reading older than this = "no data"      */
+#define THERM_FRESH_SECS  1800    /* reading older than this = "no data" (30 min;
+                                     generous for outdoor sensors that drop out) */
 
 extern int g_secondsElapsed;
 
@@ -66,6 +67,8 @@ static volatile float    s_temp[THERM_COUNT];
 static volatile float    s_hum[THERM_COUNT];
 static volatile int      s_batt[THERM_COUNT];
 static volatile uint32_t s_seen[THERM_COUNT];        /* g_secondsElapsed stamp */
+static volatile uint32_t s_ivl_q8[THERM_COUNT];      /* interval EWMA, x256 fixed */
+static volatile int8_t   s_rssi[THERM_COUNT];        /* last frame RSSI, dBm      */
 
 static volatile unsigned char s_enabled   = 0;       /* driver started         */
 static volatile unsigned char s_suspended = 0;       /* jk_bms is connecting   */
@@ -154,6 +157,18 @@ static void parse_svcdata_181a(int idx, const uint8_t *p, int len)
     s_temp[idx] = t;
     s_hum[idx]  = rh;
     s_batt[idx] = batt;
+    /* Interval EWMA: seconds since the previous frame, averaged alpha=1/64
+       (~1/50) in x256 fixed-point. Seeded on the second frame (needs a prior
+       timestamp). Diagnostic for placement / packet loss: settles near the
+       sensor's true advertising period and rises if frames are being missed. */
+    {
+        uint32_t now = (uint32_t)g_secondsElapsed;
+        if (s_seen[idx] != 0 && now >= s_seen[idx]) {
+            uint32_t gap_q8 = (now - s_seen[idx]) << 8;
+            if (s_ivl_q8[idx] == 0) s_ivl_q8[idx] = gap_q8;
+            else s_ivl_q8[idx] += ((int)gap_q8 - (int)s_ivl_q8[idx]) >> 6;
+        }
+    }
     s_seen[idx] = (uint32_t)g_secondsElapsed;
 }
 
@@ -182,6 +197,7 @@ static int therm_gap_event(struct ble_gap_event *event, void *arg)
         for (int i = 0; i < THERM_COUNT; i++) {
             if (s_mac_set[i] &&
                 memcmp(event->disc.addr.val, s_mac[i], 6) == 0) {
+                s_rssi[i] = (int8_t)event->disc.rssi;
                 parse_adv(i, event->disc.data, event->disc.length_data);
                 break;
             }
@@ -194,6 +210,7 @@ static int therm_gap_event(struct ble_gap_event *event, void *arg)
         for (int i = 0; i < THERM_COUNT; i++) {
             if (s_mac_set[i] &&
                 memcmp(event->ext_disc.addr.val, s_mac[i], 6) == 0) {
+                s_rssi[i] = (int8_t)event->ext_disc.rssi;
                 parse_adv(i, event->ext_disc.data, event->ext_disc.length_data);
                 break;
             }
@@ -290,6 +307,32 @@ int BLETherm_GetMacStr(int idx, char *out, int outlen)
     if (idx < 0 || idx >= THERM_COUNT || !s_mac_set[idx]) return 0;
     fmt_mac(s_mac[idx], out, outlen);
     return 1;
+}
+
+/* Diagnostics for the config UI. secs_since_seen = age of last frame (or -1 if
+   never / not configured); avg_interval_s = EWMA of inter-arrival gap (0 until
+   two frames seen). rssi via BLETherm_Get already. Returns 1 if configured. */
+int BLETherm_GetStats(int idx, int *secs_since_seen, int *avg_interval_s, int *rssi_dbm)
+{
+    if (idx < 0 || idx >= THERM_COUNT || !s_mac_set[idx]) {
+        if (secs_since_seen) *secs_since_seen = -1;
+        if (avg_interval_s)  *avg_interval_s  = 0;
+        if (rssi_dbm)        *rssi_dbm        = 0;
+        return 0;
+    }
+    if (secs_since_seen)
+        *secs_since_seen = s_seen[idx] ? (int)((uint32_t)g_secondsElapsed - s_seen[idx]) : -1;
+    if (avg_interval_s)
+        *avg_interval_s = (int)(s_ivl_q8[idx] >> 8);
+    if (rssi_dbm)
+        *rssi_dbm = (int)s_rssi[idx];
+    return 1;
+}
+
+void BLETherm_ResetIntervalStats(void)
+{
+    int i;
+    for (i = 0; i < THERM_COUNT; i++) s_ivl_q8[i] = 0;
 }
 
 /* ---- console commands -----------------------------------------------------
@@ -395,5 +438,7 @@ void BLETherm_OnEverySecond(void) { }
 void BLETherm_SuspendScan(void) { }
 void BLETherm_ResumeScan(void) { }
 int  BLETherm_Get(int idx, float *t, float *h, int *b) { (void)idx; (void)t; (void)h; (void)b; return 0; }
+int  BLETherm_GetStats(int idx, int *s, int *a, int *r) { (void)idx; if(s)*s=-1; if(a)*a=0; if(r)*r=0; return 0; }
+void BLETherm_ResetIntervalStats(void) { }
 
 #endif /* ENABLE_BLE_THERM */
