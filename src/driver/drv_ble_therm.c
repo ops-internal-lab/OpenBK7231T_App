@@ -42,6 +42,7 @@
 
 #include "../logging/logging.h"
 #include "../cmnds/cmd_local.h"
+#include "../cmnds/cmd_public.h"   /* commandResult_t, CMD_RES_* */
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -109,14 +110,22 @@ static void therm_nvs_save(int idx)
 {
     char buf[24];
     nvs_handle_t h = 0;
-    nvs_open("config", NVS_READWRITE, &h);
+    esp_err_t e = nvs_open("config", NVS_READWRITE, &h);
+    if (e != ESP_OK) {
+        ADDLOG_ERROR(LOG_FEATURE_DRV, "BLETherm: nvs_open failed (%d), MAC NOT persisted", (int)e);
+        return;
+    }
     if (s_mac_set[idx]) {
         fmt_mac(s_mac[idx], buf, sizeof(buf));
-        nvs_set_str(h, s_nvs_keys[idx], buf);
+        e = nvs_set_str(h, s_nvs_keys[idx], buf);
     } else {
-        nvs_erase_key(h, s_nvs_keys[idx]);
+        e = nvs_erase_key(h, s_nvs_keys[idx]);
+        if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;   /* clearing an unset key is fine */
     }
-    nvs_commit(h); nvs_close(h);
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK)
+        ADDLOG_ERROR(LOG_FEATURE_DRV, "BLETherm: nvs write failed (%d), MAC NOT persisted", (int)e);
 }
 
 /* ---- advertisement parsing ------------------------------------------------ */
@@ -279,36 +288,42 @@ int BLETherm_GetMacStr(int idx, char *out, int outlen)
     return 1;
 }
 
-/* ---- console commands ----------------------------------------------------- */
-static int cmd_set_therm_mac(const void *c, const char *cmd, const char *args)
+/* ---- console commands -----------------------------------------------------
+   NOTE: this fork's commandHandler_t is
+     commandResult_t fn(const void*, const char*, const char*, int flags)
+   and the dispatcher treats the return as a result code (0 = CMD_RES_OK).
+   Returning anything else makes the console report the command as failed
+   even when it ran. */
+static commandResult_t cmd_set_therm_mac(const void *c, const char *cmd, const char *args, int flags)
 {
     int idx; const char *p = args;
-    (void)c; (void)cmd;
+    (void)c; (void)cmd; (void)flags;
     while (p && *p == ' ') p++;
-    if (!p || !*p) { ADDLOG_INFO(LOG_FEATURE_DRV, "usage: setThermMac 1|2 aa:bb:cc:dd:ee:ff (or 0 to clear)"); return 1; }
+    if (!p || !*p) { ADDLOG_INFO(LOG_FEATURE_DRV, "usage: setThermMac 1|2 aa:bb:cc:dd:ee:ff (or 0 to clear)"); return CMD_RES_NOT_ENOUGH_ARGUMENTS; }
     idx = atoi(p) - 1;
-    if (idx < 0 || idx >= THERM_COUNT) { ADDLOG_INFO(LOG_FEATURE_DRV, "setThermMac: index must be 1 or 2"); return 1; }
+    if (idx < 0 || idx >= THERM_COUNT) { ADDLOG_INFO(LOG_FEATURE_DRV, "setThermMac: index must be 1 or 2"); return CMD_RES_BAD_ARGUMENT; }
     while (*p && *p != ' ') p++;
     while (*p == ' ') p++;
-    if (*p == 0 || *p == '0') {
+    /* clear ONLY on a bare "0" argument -- a real MAC may begin with 0x0.. */
+    if (*p == 0 || (p[0] == '0' && (p[1] == 0 || p[1] == ' '))) {
         s_mac_set[idx] = 0; s_seen[idx] = 0;
         therm_nvs_save(idx);
         ADDLOG_INFO(LOG_FEATURE_DRV, "Thermometer %d cleared", idx + 1);
-        return 1;
+        return CMD_RES_OK;
     }
     if (!parse_mac(p, s_mac[idx])) {
         ADDLOG_INFO(LOG_FEATURE_DRV, "setThermMac: bad MAC '%s'", p);
-        return 1;
+        return CMD_RES_BAD_ARGUMENT;
     }
     s_mac_set[idx] = 1; s_seen[idx] = 0;
     therm_nvs_save(idx);
     ADDLOG_INFO(LOG_FEATURE_DRV, "Thermometer %d MAC set to %s", idx + 1, p);
-    return 1;
+    return CMD_RES_OK;
 }
 
-static int cmd_list_therm(const void *c, const char *cmd, const char *args)
+static commandResult_t cmd_list_therm(const void *c, const char *cmd, const char *args, int flags)
 {
-    (void)c; (void)cmd; (void)args;
+    (void)c; (void)cmd; (void)args; (void)flags;
     for (int i = 0; i < THERM_COUNT; i++) {
         if (!s_mac_set[i]) {
             ADDLOG_INFO(LOG_FEATURE_DRV, "therm%d: unset", i + 1);
@@ -325,7 +340,7 @@ static int cmd_list_therm(const void *c, const char *cmd, const char *args)
     }
     ADDLOG_INFO(LOG_FEATURE_DRV, "scan: enabled=%d suspended=%d active=%d",
                 s_enabled, s_suspended, s_scanning);
-    return 1;
+    return CMD_RES_OK;
 }
 
 /* ---- driver entry points -------------------------------------------------- */
