@@ -26,7 +26,7 @@ void BLETherm_ResetIntervalStats(void);
 #define CHARGER_MAX_PWM  100
 
 // Set to 48 slots (12-hour circular buffer to match the new 12-hour graph)
-#define MATRIX_SIZE 48
+#define MATRIX_SIZE 96   /* 24 h of 15-min slots; flash still keeps 12 h */
 
 static int consumption_matrix[MATRIX_SIZE] = {0}; 
 static int export_matrix[MATRIX_SIZE] = {0};
@@ -54,7 +54,22 @@ static unsigned char net_graph_matrix[MATRIX_SIZE] = {0};
 //   clamped 0..150. Always drawn as a negative (downward) yellow overlay.
 static int           ess_pwr_matrix[MATRIX_SIZE]    = {0};   // avg battery W, signed
 static unsigned char solar_graph_matrix[MATRIX_SIZE] = {0};  // solar Wh/period, 0..150
-static unsigned char soc_matrix[MATRIX_SIZE]         = {0};  // BMS1 SOC, (soc/2)+1 -> 1..51, 0 = no sample
+static unsigned char soc_matrix[MATRIX_SIZE]         = {0};
+/* Temperature history. One 6-bit code per sensor per slot: 0..60 = -20..+40 C,
+   T_NODATA = sensor delivered nothing, T_OFF = device was not running. Every
+   slot starts as T_OFF so an unfilled window reads as absent, not as 0 C. */
+#define NET_NODATA 255   /* byte sentinel: slot never measured */
+#define T_NODATA 61
+#define T_OFF    62
+static unsigned char tin_matrix [MATRIX_SIZE];
+static unsigned char tout_matrix[MATRIX_SIZE];
+static long          t_acc[2];        /* sum of readings this interval, x10  */
+static int           t_cnt[2];        /* sample count this interval          */
+static int           t_hist_init;
+/* Set when a blob is restored at boot. The downtime gap can only be worked out
+   once NTP is up, so the clearing is deferred to the first synced sweep. */
+static unsigned int  g_graph_restored_ts;
+static int           g_graph_restored_idx = -1;  // BMS1 SOC, (soc/2)+1 -> 1..51, 0 = no sample
 
 /* ---- per-meter link diagnostics (RAM only, since boot) ----
    frame_rssi: WiFi plugs running the byte-18 firmware embed their own
@@ -1686,12 +1701,85 @@ void BL_ProcessSweep(void) {
         int msm  = TIME_GetHour() * 60 + TIME_GetMinute();
         int qhr  = msm / 15;                        // 0..95, current interval
 
+        /* Deferred downtime gap: with the clock finally valid, work out how
+           many slots elapsed since the blob was written and blank them, so a
+           power cut shows as absent instead of replaying yesterday's values. */
+        if (g_graph_restored_idx >= 0) {
+            unsigned int now_ts = (unsigned int)TIME_GetCurrentTime();
+            int missed = (now_ts > g_graph_restored_ts)
+                       ? (int)((now_ts - g_graph_restored_ts) / (15u * 60u)) : 0;
+            int k;
+            if (missed > MATRIX_SIZE) missed = MATRIX_SIZE;
+            for (k = 1; k <= missed; k++) {
+                int sl = ((g_graph_restored_idx + k) % MATRIX_SIZE + MATRIX_SIZE) % MATRIX_SIZE;
+                net_graph_matrix[sl]   = NET_NODATA;
+                solar_graph_matrix[sl] = 0;
+                ess_pwr_matrix[sl]     = 0;
+                soc_matrix[sl]         = 0;
+                tin_matrix[sl]         = T_OFF;
+                tout_matrix[sl]        = T_OFF;
+            }
+            if (missed > 0)
+                addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                          "Graph: blanked %d slot(s) of downtime\n", missed);
+            g_graph_restored_idx = -1;
+        }
+        /* One-time init: every slot absent until proven otherwise. */
+        if (!t_hist_init) {
+            int z; for (z = 0; z < MATRIX_SIZE; z++) { tin_matrix[z] = T_OFF; tout_matrix[z] = T_OFF; }
+            t_hist_init = 1;
+        }
+        /* Accumulate every reading in the interval; averaged at the boundary. */
+        {
+            int ti; float tc; float rh; int bp;
+            for (ti = 0; ti < 2; ti++) {
+                tc = 0; rh = 0; bp = 0;
+                if (BLETherm_Get(ti, &tc, &rh, &bp)) {
+                    t_acc[ti] += (long)(tc * 10.0f + (tc >= 0 ? 0.5f : -0.5f));
+                    t_cnt[ti]++;
+                }
+            }
+        }
+
         if (last_qhr < 0) {
             // First synced sweep after boot: adopt the current interval as the
             // fill target without committing a bogus partial slot.
             g_cur_slot = qhr;
         } else if (qhr != last_qhr) {
             int g;
+            /* Slots between last_qhr and qhr were never measured (task stall,
+               clock jump). Mark them absent so nothing stale is replayed. */
+            {
+                int miss = ((qhr - last_qhr) % MATRIX_SIZE + MATRIX_SIZE) % MATRIX_SIZE;
+                int k;
+                if (miss > MATRIX_SIZE) miss = MATRIX_SIZE;
+                for (k = 1; k < miss; k++) {
+                    int sl = ((last_qhr + k) % MATRIX_SIZE + MATRIX_SIZE) % MATRIX_SIZE;
+                    net_graph_matrix[sl]   = NET_NODATA;
+                    solar_graph_matrix[sl] = 0;
+                    ess_pwr_matrix[sl]     = 0;
+                    soc_matrix[sl]         = 0;
+                    tin_matrix[sl]         = T_OFF;
+                    tout_matrix[sl]        = T_OFF;
+                }
+            }
+            /* Commit this interval's mean temperature, then start fresh. */
+            {
+                int ti;
+                for (ti = 0; ti < 2; ti++) {
+                    unsigned char code = T_NODATA;
+                    if (t_cnt[ti] > 0) {
+                        long avg10 = t_acc[ti] / t_cnt[ti];          /* deg C x10 */
+                        long c = (avg10 + (avg10 >= 0 ? 5 : -5)) / 10;
+                        if (c < -20) c = -20;
+                        if (c >  40) c =  40;
+                        code = (unsigned char)(c + 20);
+                    }
+                    if (ti == 0) tin_matrix[last_qhr % MATRIX_SIZE]  = code;
+                    else         tout_matrix[last_qhr % MATRIX_SIZE] = code;
+                    t_acc[ti] = 0; t_cnt[ti] = 0;
+                }
+            }
 
             // Commit each GROUP's completed interval net: gross into today,
             // into the last-hour ring, and into the sign-appropriate LIFETIME
@@ -1739,6 +1827,9 @@ void BL_ProcessSweep(void) {
                                             soc_matrix,
                                             MATRIX_SIZE, last_matrix_index,
                                             (unsigned int)TIME_GetCurrentTime());
+            HAL_FlashVars_SaveTempMatrices(tin_matrix, tout_matrix,
+                                           MATRIX_SIZE, last_matrix_index,
+                                           (unsigned int)TIME_GetCurrentTime());
 #endif
         }
         last_qhr = qhr;
@@ -2243,8 +2334,25 @@ void BL_Shared_Init(void)
                                             soc_matrix,
                                             MATRIX_SIZE, &saved_idx, &saved_ts)) {
             last_matrix_index = saved_idx;
+            g_graph_restored_ts  = saved_ts;
+            g_graph_restored_idx = saved_idx;
             addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
                       "Graph matrix restored from NVS (idx=%d)\n", saved_idx);
+        }
+        {
+            int z;
+            for (z = 0; z < MATRIX_SIZE; z++) { tin_matrix[z] = T_OFF; tout_matrix[z] = T_OFF; }
+#if PLATFORM_ESPIDF
+            {
+                int t_idx = 0; unsigned int t_ts = 0;
+                if (HAL_FlashVars_LoadTempMatrices(tin_matrix, tout_matrix,
+                                                   MATRIX_SIZE, &t_idx, &t_ts)) {
+                    addLogAdv(LOG_INFO, LOG_FEATURE_ENERGYMETER,
+                              "Temp matrix restored from NVS (idx=%d)\n", t_idx);
+                }
+            }
+#endif
+            t_hist_init = 1;
         }
         /* If load failed: matrices stay zero-init — correct for a fresh start */
     }
@@ -2797,9 +2905,9 @@ int http_fn_api_dash(http_request_t *request) {
             int           rn_len = 0, rs_len = 0, l;
             int           net_live   = safe_int(real_consumption - real_export);
             int           solar_live = sample_count_30s
-                                       ? ((current_solar_pwr_accum / sample_count_30s) / 4) : 0;
+                                       ? ((current_solar_pwr_accum / sample_count_30s) / 14) : 0;  /* 150 cap = 2100 W */
 
-            for (int i = 47; i >= 0; i--) {
+            for (int i = MATRIX_SIZE - 1; i >= 0; i--) {
                 int idx  = (msm / net_metering_period - i + 96) % 96;
                 int slot = idx % MATRIX_SIZE;
                 if (i == 0) {
@@ -2807,7 +2915,7 @@ int http_fn_api_dash(http_request_t *request) {
                     if (val > 300)  val = 300;
                     if (val < -150) val = -150;
                     rn[rn_len++] = (unsigned char)((val + 150) / 2);
-                    if (solar_live > 150) solar_live = 150;
+                    if (solar_live > 150) solar_live = 150;   /* 150 = 2100 W with the /14 scale */
                     if (solar_live < 0)   solar_live = 0;
                     rs[rs_len++] = (unsigned char)solar_live;
                 } else {
@@ -2827,7 +2935,7 @@ int http_fn_api_dash(http_request_t *request) {
             int           batt_live = has_live ? (current_ess_pwr_accum / sample_count_30s) : 0;
             int           live_soc6 = bms_soc6();
 
-            for (int i = 47; i >= 0; i--) {
+            for (int i = MATRIX_SIZE - 1; i >= 0; i--) {
                 int idx  = (msm / net_metering_period - i + 96) % 96;
                 int slot = idx % MATRIX_SIZE;
                 int w    = (i == 0 && has_live) ? batt_live : ess_pwr_matrix[slot];
@@ -2843,6 +2951,26 @@ int http_fn_api_dash(http_request_t *request) {
             b64_len = base64_encode(raw, raw_len, b64);
             b64[b64_len] = '\0';
             B("\"batt\":\"%s\"", b64);
+
+        } else if (strncmp(req_param, "req=temp", 8) == 0) {
+            /* Temperature history, one byte per slot per sensor: 6-bit code,
+               0..60 = -20..+40 C, 61 = no reading, 62 = device off. Served on
+               its own turn of the graph rotation so it never shares a poll
+               with the net/batt blobs. */
+            unsigned char rti[MATRIX_SIZE], rto[MATRIX_SIZE];
+            char          bti[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            char          bto[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
+            int           lt = 0, lo = 0, e1, e2;
+
+            for (int i = MATRIX_SIZE - 1; i >= 0; i--) {
+                int idx  = (msm / net_metering_period - i + 96) % 96;
+                int slot = idx % MATRIX_SIZE;
+                rti[lt++] = tin_matrix[slot];
+                rto[lo++] = tout_matrix[slot];
+            }
+            e1 = base64_encode(rti, lt, bti); bti[e1] = '\0';
+            e2 = base64_encode(rto, lo, bto); bto[e2] = '\0';
+            B("\"ti\":\"%s\",\"to\":\"%s\"", bti, bto);
         }
     }
 
