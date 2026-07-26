@@ -100,6 +100,14 @@ int  HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
                                      unsigned char *socm,
                                      int size, int *idx, unsigned int *ts);
 
+/* Temperature history, its own NVS key. 6-bit codes per sensor per slot:  */
+/* 0..60 = -20..+40 C, 61 = no reading, 62 = device off.                   */
+void HAL_FlashVars_SaveTempMatrices(const unsigned char *tin,
+                                    const unsigned char *tout,
+                                    int size, int idx, unsigned int ts);
+int  HAL_FlashVars_LoadTempMatrices(unsigned char *tin, unsigned char *tout,
+                                    int size, int *idx, unsigned int *ts);
+
 #ifdef ENABLE_DRIVER_HLW8112SPI
 void HAL_FlashVars_SaveEnergy(ENERGY_DATA** data, int channel_count);
 void HAL_FlashVars_GetEnergy(ENERGY_DATA* data, ENERGY_CHANNEL channel);
