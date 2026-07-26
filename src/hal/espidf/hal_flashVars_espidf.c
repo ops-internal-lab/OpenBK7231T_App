@@ -229,7 +229,7 @@ float HAL_FlashVars_GetEnergyExportDaily(int daysAgo)
         below fixes the types, and the battery matrix is stored as int16
         (values are clamped to +/-500 W) instead of a wasteful int32. */
 
-#define GRAPH_BLOB_MAGIC   0x32485247u  /* 'G','R','H','2' little-endian.
+#define GRAPH_BLOB_MAGIC   0x33485247u  /* 'G','R','H','3' little-endian.
    v2: ess[] switched from plain int16 W to a packed uint16 per slot:
        bits 0-8 = |W| (clamped 500), bit 9 = sign (1 = discharge),
        bits 10-15 = battery SOC as (soc%/2)+1 (1..51, 0 = no sample).
@@ -256,6 +256,86 @@ static void graph_erase_legacy_keys(nvs_handle_t h)
 	nvs_erase_key(h, "grph_ts");
 }
 
+/* ---- temperature history -------------------------------------------------
+   Its own NVS key so the energy blob above is never restructured. 48 slots
+   (12 h) x 2 sensors, each a 6-bit code: 0..60 = -20..+40 C, 61 = sensor gave
+   no reading, 62 = device was off. 6-bit packed -> 72 B (+1 pad byte so the
+   two-byte window in t6_get/t6_put never reads past the end). */
+#define TEMP_BLOB_SLOTS 48
+#define TEMP_BLOB_MAGIC 0x31504D54u          /* 'T','M','P','1'              */
+#define TEMP_PK_BYTES   ((TEMP_BLOB_SLOTS * 2 * 6) / 8 + 1)   /* 72 + 1      */
+
+typedef struct {
+	uint32_t      magic;
+	int32_t       idx;                       /* day-slot of the newest entry */
+	uint32_t      ts;
+	unsigned char pk[TEMP_PK_BYTES];
+} temp_blob_t;                               /* 12 + 73 = 85 B               */
+
+static unsigned t6_get(const unsigned char *p, int i)
+{
+	int bit = i * 6, by = bit >> 3, sh = bit & 7;
+	unsigned w = (unsigned)p[by] | ((unsigned)p[by + 1] << 8);
+	return (w >> sh) & 0x3Fu;
+}
+
+static void t6_put(unsigned char *p, int i, unsigned v)
+{
+	int bit = i * 6, by = bit >> 3, sh = bit & 7;
+	unsigned w = (unsigned)p[by] | ((unsigned)p[by + 1] << 8);
+	unsigned m = 0x3Fu << sh;
+	w = (w & ~m) | (((v & 0x3Fu) << sh) & m);
+	p[by]     = (unsigned char)(w & 0xFF);
+	p[by + 1] = (unsigned char)((w >> 8) & 0xFF);
+}
+
+void HAL_FlashVars_SaveTempMatrices(const unsigned char *tin,
+                                    const unsigned char *tout,
+                                    int size, int idx, unsigned int ts)
+{
+	temp_blob_t b;
+	int i, n = (size < TEMP_BLOB_SLOTS) ? size : TEMP_BLOB_SLOTS;
+	memset(&b, 0, sizeof(b));
+	b.magic = TEMP_BLOB_MAGIC;
+	b.idx   = (int32_t)idx;
+	b.ts    = (uint32_t)ts;
+	for (i = 0; i < n; i++) {
+		int src = ((idx - (n - 1) + i) % size + size) % size;
+		t6_put(b.pk, i * 2,     tin[src]);
+		t6_put(b.pk, i * 2 + 1, tout[src]);
+	}
+	InitFlashIfNeeded();
+	nvs_handle_t h = 0;
+	if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+	esp_err_t rc = nvs_set_blob(h, "tmpg", &b, sizeof(b));
+	if (rc == ESP_OK) rc = nvs_commit(h);
+	if (rc != ESP_OK)
+		ADDLOG_ERROR(LOG_FEATURE_ENERGYMETER, "temp save failed rc=0x%x", rc);
+	nvs_close(h);
+}
+
+int HAL_FlashVars_LoadTempMatrices(unsigned char *tin, unsigned char *tout,
+                                   int size, int *idx, unsigned int *ts)
+{
+	temp_blob_t b;
+	size_t sz = sizeof(b);
+	int i, n = (size < TEMP_BLOB_SLOTS) ? size : TEMP_BLOB_SLOTS;
+	InitFlashIfNeeded();
+	nvs_handle_t h = 0;
+	if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return 0;
+	esp_err_t rc = nvs_get_blob(h, "tmpg", &b, &sz);
+	nvs_close(h);
+	if (rc != ESP_OK || sz != sizeof(b) || b.magic != TEMP_BLOB_MAGIC) return 0;
+	for (i = 0; i < n; i++) {
+		int dst = (((int)b.idx - (n - 1) + i) % size + size) % size;
+		tin [dst] = (unsigned char)t6_get(b.pk, i * 2);
+		tout[dst] = (unsigned char)t6_get(b.pk, i * 2 + 1);
+	}
+	*idx = (int)b.idx;
+	*ts  = (unsigned int)b.ts;
+	return 1;
+}
+
 void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
                                      const unsigned char *solar, const int *ess_w,
                                      const unsigned char *socm,
@@ -267,12 +347,17 @@ void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
 	b.magic = GRAPH_BLOB_MAGIC;
 	b.idx   = (int32_t)idx;
 	b.ts    = (uint32_t)ts;
-	memcpy(b.net,   net_graph, (size_t)n);
-	memcpy(b.solar, solar,     (size_t)n);
+	/* The RAM matrix is now 24 h (96 slots) but the blob still holds 12 h.
+	   Store the n most recent slots in CHRONOLOGICAL order, oldest first, so
+	   b.*[n-1] is the sample at day-slot b.idx. v2 blobs stored the raw ring
+	   instead, which is why the magic had to move to 'GRH3'. */
 	for (i = 0; i < n; i++) {
-		int w   = ess_w[i];
+		int src = ((idx - (n - 1) + i) % size + size) % size;
+		int w   = ess_w[src];
 		int mag = (w < 0) ? -w : w;
-		int s6  = socm ? (socm[i] & 0x3F) : 0;
+		int s6  = socm ? (socm[src] & 0x3F) : 0;
+		b.net[i]   = net_graph[src];
+		b.solar[i] = solar[src];
 		if (mag > 500) mag = 500;
 		b.ess[i] = (uint16_t)((mag & 0x1FF) | ((w < 0) ? 0x200 : 0)
 		                      | (s6 << 10));
@@ -306,13 +391,15 @@ int HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
 	   blob contained out-of-bounds garbage (see comment above), so the old
 	   data was never trustworthy. Keys are erased on the next save. */
 	if (rc != ESP_OK || sz != sizeof(b) || b.magic != GRAPH_BLOB_MAGIC) return 0;
-	memcpy(net_graph, b.net,   (size_t)n);
-	memcpy(solar,     b.solar, (size_t)n);
+	/* Chronological run ending at day-slot b.idx -> scatter back into the ring. */
 	for (i = 0; i < n; i++) {
+		int dst = (((int)b.idx - (n - 1) + i) % size + size) % size;
 		unsigned int enc = b.ess[i];
 		int mag = (int)(enc & 0x1FF);
-		ess_w[i] = (enc & 0x200) ? -mag : mag;
-		if (socm) socm[i] = (unsigned char)((enc >> 10) & 0x3F);
+		net_graph[dst] = b.net[i];
+		solar[dst]     = b.solar[i];
+		ess_w[dst] = (enc & 0x200) ? -mag : mag;
+		if (socm) socm[dst] = (unsigned char)((enc >> 10) & 0x3F);
 	}
 	*idx = (int)b.idx;
 	*ts  = (unsigned int)b.ts;
