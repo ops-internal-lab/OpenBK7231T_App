@@ -100,6 +100,14 @@ int  HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
                                      unsigned char *socm,
                                      int size, int *idx, unsigned int *ts);
 
+/* Today's BLE-thermometer high/low, 2 sensors, tenths of a degree C, carried
+   inside the graph blob above (it had spare bytes NVS was already paying for).
+   Values move through a shadow copy so the graph save/load call sites stay
+   unchanged: push new values with Set, read the staged ones back with Get.
+   -32768 means "no reading yet". date is packed y7|m4|d5, 0 = none. */
+void HAL_FlashVars_SetThermShadow(const short *hi, const short *lo, unsigned short date);
+void HAL_FlashVars_GetThermShadow(short *hi, short *lo, unsigned short *date);
+
 #ifdef ENABLE_DRIVER_HLW8112SPI
 void HAL_FlashVars_SaveEnergy(ENERGY_DATA** data, int channel_count);
 void HAL_FlashVars_GetEnergy(ENERGY_DATA* data, ENERGY_CHANNEL channel);
