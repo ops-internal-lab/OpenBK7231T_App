@@ -229,13 +229,23 @@ float HAL_FlashVars_GetEnergyExportDaily(int daysAgo)
         below fixes the types, and the battery matrix is stored as int16
         (values are clamped to +/-500 W) instead of a wasteful int32. */
 
-#define GRAPH_BLOB_MAGIC   0x32485247u  /* 'G','R','H','2' little-endian.
+#define GRAPH_BLOB_MAGIC   0x33485247u  /* 'G','R','H','3' little-endian.
    v2: ess[] switched from plain int16 W to a packed uint16 per slot:
        bits 0-8 = |W| (clamped 500), bit 9 = sign (1 = discharge),
        bits 10-15 = battery SOC as (soc%/2)+1 (1..51, 0 = no sample).
-   Same 204-byte blob size. A v1 ('GRH1') blob fails the magic check ->
-   one-time fresh start of the 12-h graph history after upgrading. */
+   v3: the BLE-thermometer daily range moved in here (th_hi/th_lo/th_date),
+       replacing the separate "thmn" key. It fits in space this blob already
+       pays for: NVS allocates blob data in 32-byte entries, so 204 B occupied
+       7 entries = 224 B of capacity with 20 B unused. The range costs 10 of
+       those 20, so the entry count, the page footprint and the write cost are
+       all unchanged -- the temperatures ride along on a write that happens
+       anyway. A v1/v2 blob fails the magic check -> one-time fresh start of
+       the 12-h graph history (and an empty range) after upgrading. */
 #define GRAPH_BLOB_SLOTS   48
+
+/* Sentinel for "no reading yet today" -- -3276.8 C is not a value a sensor
+   can report, so it doubles as the seeded flag at zero storage cost. */
+#define THERM_TENTHS_NONE  ((int16_t)-32768)
 
 typedef struct {
 	uint32_t      magic;                     /* GRAPH_BLOB_MAGIC            */
@@ -244,9 +254,35 @@ typedef struct {
 	unsigned char net  [GRAPH_BLOB_SLOTS];   /* packed net Wh bytes         */
 	unsigned char solar[GRAPH_BLOB_SLOTS];   /* solar Wh/period, 0..150     */
 	uint16_t      ess  [GRAPH_BLOB_SLOTS];   /* packed: |W|,sign,soc6       */
-} graph_blob_t;                              /* 12 + 48 + 48 + 96 = 204 B   */
+	int16_t       th_hi[2];                  /* today's max, tenths degC    */
+	int16_t       th_lo[2];                  /* today's min, tenths degC    */
+	uint16_t      th_date;                   /* packed y7|m4|d5, 0 = none   */
+} graph_blob_t;                              /* 204 + 10 = 214 -> 216 padded */
 
-/* One-time cleanup of the legacy five-key layout (safe if keys are absent). */
+/* The range is carried in a shadow copy rather than through the Save/Load
+   parameter lists. That keeps every existing graph call site untouched: the
+   thermometer driver pushes new values here whenever they change, and the
+   next graph save picks them up automatically. */
+static int16_t  s_th_hi[2]  = { THERM_TENTHS_NONE, THERM_TENTHS_NONE };
+static int16_t  s_th_lo[2]  = { THERM_TENTHS_NONE, THERM_TENTHS_NONE };
+static uint16_t s_th_date   = 0;
+
+void HAL_FlashVars_SetThermShadow(const short *hi, const short *lo, unsigned short date)
+{
+	s_th_hi[0] = (int16_t)hi[0]; s_th_hi[1] = (int16_t)hi[1];
+	s_th_lo[0] = (int16_t)lo[0]; s_th_lo[1] = (int16_t)lo[1];
+	s_th_date  = (uint16_t)date;
+}
+
+void HAL_FlashVars_GetThermShadow(short *hi, short *lo, unsigned short *date)
+{
+	hi[0] = (short)s_th_hi[0]; hi[1] = (short)s_th_hi[1];
+	lo[0] = (short)s_th_lo[0]; lo[1] = (short)s_th_lo[1];
+	if (date) *date = (unsigned short)s_th_date;
+}
+
+/* One-time cleanup of superseded keys (safe if any are absent).
+   "thmn" was the short-lived standalone min/max blob, now folded into grph. */
 static void graph_erase_legacy_keys(nvs_handle_t h)
 {
 	nvs_erase_key(h, "grph_net");
@@ -254,6 +290,7 @@ static void graph_erase_legacy_keys(nvs_handle_t h)
 	nvs_erase_key(h, "grph_inv");
 	nvs_erase_key(h, "grph_idx");
 	nvs_erase_key(h, "grph_ts");
+	nvs_erase_key(h, "thmn");
 }
 
 void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
@@ -277,6 +314,10 @@ void HAL_FlashVars_SaveGraphMatrices(const unsigned char *net_graph,
 		b.ess[i] = (uint16_t)((mag & 0x1FF) | ((w < 0) ? 0x200 : 0)
 		                      | (s6 << 10));
 	}
+	/* Thermometer daily range rides along from the shadow copy. */
+	b.th_hi[0] = s_th_hi[0]; b.th_hi[1] = s_th_hi[1];
+	b.th_lo[0] = s_th_lo[0]; b.th_lo[1] = s_th_lo[1];
+	b.th_date  = s_th_date;
 	InitFlashIfNeeded();
 	nvs_handle_t h = 0;
 	if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
@@ -306,6 +347,12 @@ int HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
 	   blob contained out-of-bounds garbage (see comment above), so the old
 	   data was never trustworthy. Keys are erased on the next save. */
 	if (rc != ESP_OK || sz != sizeof(b) || b.magic != GRAPH_BLOB_MAGIC) return 0;
+	/* Stage the thermometer range. This runs at boot, before NTP, so it is
+	   only parked in the shadow -- the driver adopts it later, on the first
+	   synced sweep, once th_date can be compared against a real date. */
+	s_th_hi[0] = b.th_hi[0]; s_th_hi[1] = b.th_hi[1];
+	s_th_lo[0] = b.th_lo[0]; s_th_lo[1] = b.th_lo[1];
+	s_th_date  = b.th_date;
 	memcpy(net_graph, b.net,   (size_t)n);
 	memcpy(solar,     b.solar, (size_t)n);
 	for (i = 0; i < n; i++) {
@@ -318,5 +365,6 @@ int HAL_FlashVars_LoadGraphMatrices(unsigned char *net_graph,
 	*ts  = (unsigned int)b.ts;
 	return 1;
 }
+
 
 #endif // PLATFORM_ESPIDF
