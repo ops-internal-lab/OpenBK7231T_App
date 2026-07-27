@@ -35,3 +35,12 @@ int  BLETherm_GetMacStr(int idx, char *out, int outlen);
 /* Diagnostics for the config UI. */
 int  BLETherm_GetStats(int idx, int *secs_since_seen, int *avg_interval_s, int *rssi_dbm);
 void BLETherm_ResetIntervalStats(void);
+
+/* Today's high/low, degC. Persisted as tenths inside the graph blob, which is
+   already written every 15 min -- no separate key, no extra write. The stored
+   range carries its own packed date, so it is only ever adopted if it belongs
+   to today; that makes save ordering irrelevant. Date is y7|m4|d5, 0 = none. */
+int  BLETherm_GetMinMax(int idx, float *hi, float *lo);
+unsigned short BLETherm_PackDate(int year, int month, int mday);
+void BLETherm_MidnightReset(unsigned short today_date); /* new day: clear + re-stamp */
+void BLETherm_SyncRestore(unsigned short today_date);   /* first synced sweep: adopt if today */

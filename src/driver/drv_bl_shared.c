@@ -19,6 +19,9 @@
    valid regardless of include order; the real prototype/stub is in the header. */
 #if defined(PLATFORM_ESPIDF)
 void BLETherm_ResetIntervalStats(void);
+unsigned short BLETherm_PackDate(int year, int month, int mday);
+void BLETherm_MidnightReset(unsigned short today_date);
+void BLETherm_SyncRestore(unsigned short today_date);
 #endif
 
 // Charger C mapping constants
@@ -1690,6 +1693,15 @@ void BL_ProcessSweep(void) {
             // First synced sweep after boot: adopt the current interval as the
             // fill target without committing a bogus partial slot.
             g_cur_slot = qhr;
+#if defined(PLATFORM_ESPIDF)
+            /* Thermometer daily range: restore here (not at boot) so the
+               persisted date can be compared against a real, NTP-synced date.
+               A same-day match recovers the day so far; anything else leaves
+               the range empty to re-seed from the next reading. */
+            BLETherm_SyncRestore(BLETherm_PackDate(TIME_GetYear(),
+                                                   TIME_GetMonth(),
+                                                   TIME_GetMDay()));
+#endif
         } else if (qhr != last_qhr) {
             int g;
 
@@ -1715,6 +1727,16 @@ void BL_ProcessSweep(void) {
             // daily totals down one day and clear today (the last-hour ring is
             // left intact so last-hour can span midnight).
             if (qhr < last_qhr) {
+#if defined(PLATFORM_ESPIDF)
+                /* New day: clear the range and re-stamp the shadow with today's
+                   date. The stored range carries its own date, so it does not
+                   matter whether the graph blob is written before or after this
+                   point -- a range stamped yesterday can never be adopted as
+                   today's. */
+                BLETherm_MidnightReset(BLETherm_PackDate(TIME_GetYear(),
+                                                         TIME_GetMonth(),
+                                                         TIME_GetMDay()));
+#endif
                 for (g = 0; g < N_GROUPS; g++) {
                     g_grp[g].day_imp[3] = g_grp[g].day_imp[2];
                     g_grp[g].day_imp[2] = g_grp[g].day_imp[1];
@@ -1732,14 +1754,12 @@ void BL_ProcessSweep(void) {
             mark_energy_dirty();
             COUNTERS_Save();                        // persist store + lifetime + meter_acc
 
-            // Persist the 12-hour visual graph matrices too (unchanged role).
-#if PLATFORM_ESPIDF
-            HAL_FlashVars_SaveGraphMatrices(net_graph_matrix,
-                                            solar_graph_matrix, ess_pwr_matrix,
-                                            soc_matrix,
-                                            MATRIX_SIZE, last_matrix_index,
-                                            (unsigned int)TIME_GetCurrentTime());
-#endif
+            /* The graph blob is NOT written here. It is produced and saved in
+               BL_ProcessUpdate, which fills the slot matrices at the same
+               quarter-hour boundary; saving it here as well wrote the same
+               204-byte blob twice per boundary (192 writes/day instead of 96).
+               The thermometer range rides inside that same blob, so it is
+               covered by that save too. */
         }
         last_qhr = qhr;
     }
@@ -1868,9 +1888,20 @@ void BL_ProcessUpdate(float voltage, float current, float power, float frequency
                 // BOTTOM panel: solar ENERGY generated this period (Wh) =
                 // average solar power (W) * 0.25 h. Clamped 0..150 to match the
                 // chart's -150..+150 band; drawn as a negative yellow overlay.
-                solar_period_wh = sample_count_30s
-                    ? ((current_solar_pwr_accum / sample_count_30s) / 4)
-                    : 0;
+                // Solar graph byte: full-scale (150) maps to the configured
+                // solar power range (g_solar_power_range_w), so the chart auto-
+                // scales to the user's array peak instead of a fixed ceiling.
+                //   byte = avg_W * 150 / range   (clamped 0..150)
+                // range is clamped >=500 by its setter, but floor it here too so
+                // a corrupt NVS read can't divide by zero. Display only -- energy
+                // accounting is the separate tick-slot store, untouched.
+                {
+                    int solar_avg_w = sample_count_30s
+                        ? (current_solar_pwr_accum / sample_count_30s) : 0;
+                    int solar_range = g_solar_power_range_w > 0
+                        ? g_solar_power_range_w : 5000;
+                    solar_period_wh = (solar_avg_w * 150) / solar_range;
+                }
                 if (solar_period_wh > 150) solar_period_wh = 150;
                 if (solar_period_wh < 0)   solar_period_wh = 0;
                 solar_graph_matrix[last_matrix_index] = (unsigned char)solar_period_wh;
@@ -2191,6 +2222,9 @@ void BL_Shared_Init(void)
     // from flash before anything reads them.
     SETTINGS_Load();
     COUNTERS_Load();
+    /* Thermometer min/max is NOT restored here: it needs a real date to
+       validate against, which isn't available until NTP sync. The restore
+       runs from the first synced 15-min sweep instead (BLETherm_SyncRestore). */
 
     for(i = OBK__FIRST; i <= OBK__LAST; i++)
     {
@@ -2372,11 +2406,20 @@ int http_fn_api_dash(http_request_t *request) {
 
     http_setup(request, "application/json");
 
-    char buf[1024];  /* headroom for the expanded req=meters payload (per-meter mt[] + grid/gen/imp/exp with d/t/lh + 3-day h[] arrays) */
+    char buf[1280];  /* headroom for the expanded req=meters payload (per-meter mt[] + grid/gen/imp/exp with d/t/lh + 3-day h[] arrays, plus the two thermometers' hi/lo). Measured worst case ~1017 B. */
     int  pos     = 0;
     int  has_ntp = TIME_IsTimeSynced();   // endpoints gate on clock sync only
 
-#define B(...) pos += snprintf(buf + pos, sizeof(buf) - pos, __VA_ARGS__)
+/* snprintf returns the length it WOULD have written, so an unclamped
+   `pos += ...` can run past sizeof(buf); the next call then computes
+   `sizeof(buf) - pos` as a huge size_t and writes off the end of the stack
+   buffer. Clamp pos to the buffer size after every append: once full, the
+   remaining size is 0 and snprintf writes nothing further. */
+#define B(...) do { \
+        int _n = snprintf(buf + pos, sizeof(buf) - pos, __VA_ARGS__); \
+        if (_n > 0) pos += _n; \
+        if (pos > (int)sizeof(buf)) pos = (int)sizeof(buf); \
+    } while (0)
 
     B("{");
 
@@ -2733,12 +2776,20 @@ int http_fn_api_dash(http_request_t *request) {
         { int ti; for (ti = 0; ti < 2; ti++) {
             float tc = 0, rh = 0; int bp = 0;
             int ls = -1, iv = 0, rs = 0;
-            int ok = BLETherm_Get(ti, &tc, &rh, &bp);
+            float dhi = 0, dlo = 0;
+            int ok  = BLETherm_Get(ti, &tc, &rh, &bp);
+            int mmk = BLETherm_GetMinMax(ti, &dhi, &dlo);   /* today's high/low */
             BLETherm_GetStats(ti, &ls, &iv, &rs);
-            B("%s{\"o\":%d,\"t\":%d,\"h\":%d,\"b\":%d,\"ls\":%d,\"iv\":%d,\"rs\":%d}",
+            B("%s{\"o\":%d,\"t\":%d,\"h\":%d,\"b\":%d,\"ls\":%d,\"iv\":%d,\"rs\":%d",
               ti ? "," : "",
               ok, (int)(tc * 10.0f + (tc >= 0 ? 0.5f : -0.5f)), (int)(rh + 0.5f), bp,
               ls, iv, rs);
+            if (mmk) {
+                B(",\"hi\":%d,\"lo\":%d",
+                  (int)(dhi * 10.0f + (dhi >= 0 ? 0.5f : -0.5f)),
+                  (int)(dlo * 10.0f + (dlo >= 0 ? 0.5f : -0.5f)));
+            }
+            B("}");
         } }
         B("]");
 #else
@@ -2796,8 +2847,14 @@ int http_fn_api_dash(http_request_t *request) {
             char          bs[((MATRIX_SIZE) + 2) / 3 * 4 + 1];
             int           rn_len = 0, rs_len = 0, l;
             int           net_live   = safe_int(real_consumption - real_export);
+            /* Live slot: identical scaling to the committed slot above --
+               150 maps to g_solar_power_range_w. Both must match or the
+               right-most (in-progress) bar renders at a different scale than
+               the 47 stored bars. */
+            int           solar_range = g_solar_power_range_w > 0
+                                        ? g_solar_power_range_w : 5000;
             int           solar_live = sample_count_30s
-                                       ? ((current_solar_pwr_accum / sample_count_30s) / 4) : 0;
+                                       ? (((current_solar_pwr_accum / sample_count_30s) * 150) / solar_range) : 0;
 
             for (int i = 47; i >= 0; i--) {
                 int idx  = (msm / net_metering_period - i + 96) % 96;

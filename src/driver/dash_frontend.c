@@ -180,21 +180,21 @@ int http_fn_custom_dash(http_request_t *request) {
         /* Config popup only: fixed 750px, two columns. The page is 750px min in
            portrait already; browser zoom handles smaller screens (no collapse). */
         "#sns-pop{width:750px;}"
-        ".cols{display:-webkit-box;display:-webkit-flex;display:flex;}"
+        ".cols{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:stretch;display:-webkit-flex;display:flex;}"
         ".ccol{min-width:0;-webkit-box-sizing:border-box;box-sizing:border-box;}"
         ".ccol.L{-webkit-box-flex:0;-webkit-flex:0 0 395px;flex:0 0 395px;border-right:1px solid #23272e;}"
         ".ccol.R{-webkit-box-flex:1;-webkit-flex:1;flex:1;}"
         /* rounded section cards (matches the thermometer card look) */
         ".thc{margin:6px 12px 8px;background:#141920;border:1px solid #222a33;border-radius:8px;padding:10px 12px;}"
-        ".thc .top{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:space-between;justify-content:space-between;margin-bottom:6px;}"
-        ".thc .nm{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;color:#cdd6df;font-size:13px;font-weight:600;}"
+        ".thc .top{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;-webkit-box-pack:justify;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:space-between;justify-content:space-between;margin-bottom:6px;}"
+        ".thc .nm{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;color:#cdd6df;font-size:13px;font-weight:600;}"
         ".thc .nm svg{width:15px;height:15px;stroke:#7c8a9a;fill:none;stroke-width:2.2;margin-right:7px;}"
         ".thc .lr{color:#5f6b78;font-size:10px;font-weight:400;margin-left:6px;}"
         ".thc .rd{color:#e8edf2;font-size:15px;font-weight:700;font-family:\'Courier New\',monospace;}"
         ".thc .rd .dim{color:#5f6b78;}"
-        ".thc .fld{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;margin:4px 0 2px;}"
+        ".thc .fld{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;margin:4px 0 2px;}"
         ".thc .fld label{-webkit-box-flex:1;-webkit-flex:1;flex:1;font-size:11px;color:#7c8a9a;}"
-        ".strip{display:-webkit-flex;display:flex;border-top:1px solid #1c222b;padding-top:8px;margin-top:8px;}"
+        ".strip{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:stretch;display:-webkit-flex;display:flex;border-top:1px solid #1c222b;padding-top:8px;margin-top:8px;}"
         ".strip .s{-webkit-box-flex:1;-webkit-flex:1;flex:1;font-size:11px;white-space:nowrap;padding-right:14px;}"
         ".strip .s:last-child{padding-right:0;}"
         ".strip .s:first-child{-webkit-flex:1.25;flex:1.25;}"
@@ -205,8 +205,8 @@ int http_fn_custom_dash(http_request_t *request) {
         ".dot.up{background:#37d67a;}.dot.dn{background:#6b7480;}"
         ".conn.up{color:#8fe0a8;}.conn.dn{color:#7c8a9a;}"
         /* vertical checkbox stack in meter cells, custom coherent styling */
-        ".cbstack{display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;margin-left:6px;-webkit-justify-content:center;justify-content:center;}"
-        ".cbrow{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;font-size:9px;color:#7c8a9a;cursor:pointer;line-height:1.35;white-space:nowrap;-webkit-box-flex:0!important;-webkit-flex:none!important;flex:none!important;padding-right:0!important;}"
+        ".cbstack{display:-webkit-box;-webkit-box-orient:vertical;-webkit-box-pack:center;display:-webkit-flex;display:flex;-webkit-flex-direction:column;flex-direction:column;margin-left:6px;-webkit-justify-content:center;justify-content:center;}"
+        ".cbrow{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;font-size:9px;color:#7c8a9a;cursor:pointer;line-height:1.35;white-space:nowrap;-webkit-box-flex:0!important;-webkit-flex:none!important;flex:none!important;padding-right:0!important;}"
         ".cbrow input{-webkit-appearance:none;appearance:none;width:13px;height:13px;margin:0 4px 0 0;border:1px solid #3a4452;border-radius:3px;background:#1e2530;position:relative;cursor:pointer;-webkit-box-sizing:border-box;box-sizing:border-box;}"
         ".cbrow input:checked{background:#1f6fd6;border-color:#1f6fd6;}"
         ".cbrow input:checked::after{content:\'\';position:absolute;left:3px;top:0px;width:4px;height:8px;border:solid #fff;border-width:0 2px 2px 0;-webkit-transform:rotate(45deg);transform:rotate(45deg);}"
@@ -220,7 +220,7 @@ int http_fn_custom_dash(http_request_t *request) {
         ".t-inp.vv.err{border-color:#8a3a3a;color:#e6a5a5;}"
         ".cfg-err{font-size:10px;color:#d8807f;padding:6px 0 0;display:none;}"
         /* horizontal maintenance buttons */
-        ".btnrow{display:-webkit-flex;display:flex;padding:0;}"
+        ".btnrow{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:stretch;display:-webkit-flex;display:flex;padding:0;}"
         ".btnrow button{-webkit-box-flex:1;-webkit-flex:1;flex:1;}"
         ".btnrow .rstb{background:#1e2530;border:1px solid #3a4452;color:#9aa6b2;border-radius:6px;padding:8px 0;font-size:11px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.3px;margin-left:8px;font-family:-apple-system,sans-serif;}"
         ".btnrow .clrb{background:#3a1e1e;border:1px solid #6b2b2b;color:#e08a8a;border-radius:6px;padding:8px 0;font-size:11px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.3px;font-family:-apple-system,sans-serif;}"
@@ -283,9 +283,18 @@ int http_fn_custom_dash(http_request_t *request) {
         ".clk-text{display:-webkit-box;-webkit-box-orient:horizontal;-webkit-box-align:baseline;-webkit-box-pack:start;display:-webkit-flex;display:flex;-webkit-flex-direction:row;flex-direction:row;-webkit-align-items:baseline;align-items:baseline;-webkit-justify-content:flex-start;justify-content:flex-start;margin-top:6px;font-size:19px;color:#ccc;}"
         ".clk-text #d-day{font-weight:bold;color:#aaa;}"
         ".clk-text #d-date{margin-left:9px;color:#aaa;}"
-        "#tb-thm{position:absolute;right:18px;bottom:12px;color:#ccc;font-weight:700;font-family:monospace;font-size:21px;line-height:1;}"
-        "#tb-thm .thm-l{display:inline-block;margin-left:18px;}"
-        "#tb-thm svg{width:16px;height:16px;vertical-align:-2px;margin-right:6px;}"
+        /* Landscape: two boxed sensor cards stacked at the right of the clock
+           row. Each card is a 4-row stack -- icon / max / value / min -- which
+           keeps the block narrow (the clock digits leave little horizontal
+           room). The value is the bold anchor; max is amber, min is blue. */
+        "#tb-thm{position:absolute;right:18px;top:50%;-webkit-transform:translateY(-50%);transform:translateY(-50%);color:#ccc;font-weight:700;font-family:monospace;font-size:17px;line-height:1;text-align:center;}"
+        "#tb-thm .thm-l{display:block;margin-left:0;border:1px solid #2f3742;border-radius:8px;padding:5px 9px 6px;-webkit-box-sizing:border-box;box-sizing:border-box;}"
+        "#tb-thm .thm-l+.thm-l{margin-top:8px;}"
+        "#tb-thm svg{display:block;margin:0 auto 3px;width:14px;height:14px;}"
+        "#tb-thm .thm-v{display:block;white-space:nowrap;font-weight:900;}"
+        "#tb-thm .thm-mm{display:block;white-space:nowrap;font-family:'Courier New',monospace;font-weight:700;font-size:10px;line-height:1.15;}"
+        "#tb-thm .thm-mm.hi{color:#f2a33e;margin-bottom:3px;}"
+        "#tb-thm .thm-mm.lo{color:#60a5fa;margin-top:3px;}"
         "#d-clk{font-size:144px;font-weight:bold;color:#09F;font-family:monospace;line-height:1;letter-spacing:-6px;}"
         "#d-day{font-size:20px;font-weight:600;color:#eee;text-transform:uppercase;letter-spacing:1px;}"
         "#d-date{font-size:14px;color:#888;}"
@@ -366,9 +375,6 @@ int http_fn_custom_dash(http_request_t *request) {
         ".ess-hdr{width:100%;border-collapse:collapse;margin:0 0 9px;}"
         ".ess-hdr-t{text-align:left;color:#9aa0a8;font-weight:700;font-size:10px;letter-spacing:.5px;text-transform:uppercase;font-family:-apple-system,sans-serif;}"
         ".ess-hdr-c{text-align:right;width:26px;vertical-align:middle;}"
-        ".ess-cog{width:30px;height:30px;background:none;cursor:pointer;color:#cfd6dd;display:-webkit-box;-webkit-box-pack:center;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-justify-content:center;justify-content:center;-webkit-align-items:center;align-items:center;opacity:.32;-webkit-transition:opacity .2s;transition:opacity .2s;}"
-        ".ess-cog svg{width:17px;height:17px;stroke:currentColor;fill:none;display:block;}"
-        ".ess-cog:hover{opacity:.85;}"
         ".bgrid{width:100%;border-collapse:separate;border-spacing:6px;table-layout:fixed;margin:0;}"
         ".btn{text-align:center;vertical-align:middle;border-radius:8px;color:#fff;cursor:pointer;overflow:hidden;font-family:-apple-system,sans-serif;font-weight:bold;-webkit-box-sizing:border-box;box-sizing:border-box;-webkit-tap-highlight-color:rgba(0,0,0,0);}"
         ".r1{height:74px;background:#555;width:50%;}"
@@ -385,7 +391,6 @@ int http_fn_custom_dash(http_request_t *request) {
         ".ip-block .t-inp{width:64px;}"
         ".tmr{display:none;width:13px;height:13px;margin-right:6px;}"
         ".tmr.show{display:-webkit-inline-box;display:inline-block;}"
-        ".cfg-pop{position:absolute;left:14px;right:14px;top:36px;background:#15181d;border:1px solid #3a3d42;border-radius:8px;padding:10px 12px 2px;z-index:30;-webkit-box-sizing:border-box;box-sizing:border-box;}"
         ".cfg-head{display:-webkit-box;-webkit-box-pack:justify;-webkit-box-align:center;display:-webkit-flex;display:flex;-webkit-justify-content:space-between;justify-content:space-between;-webkit-align-items:center;align-items:center;margin-bottom:10px;font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:#888;}"
         ".cfg-x{cursor:pointer;color:#cfd6dd;font-size:16px;line-height:1;padding:2px 6px;-webkit-border-radius:4px;border-radius:4px;background:#2a2d31;}"
         ".sld-block{margin-bottom:12px;}"
@@ -395,11 +400,10 @@ int http_fn_custom_dash(http_request_t *request) {
    NOTE: every flex rule carries the 2009 -webkit-box fallback, required
    for iOS 5 / Android 4 WebKit (modern -webkit-flex is iOS 7+). ==== */
         "\n"
-        ".p3card,#stats-sec,#clk-gear{display:none;}\n"
+        ".p3card,#stats-sec{display:none;}\n"
         ".row750{display:none;}\n"
         "body.portrait .p3card,body.portrait #stats-sec{display:block;}\n"
         "body.portrait .row750{display:-webkit-box;display:-webkit-flex;display:flex;}\n"
-        "body.portrait #clk-gear{display:block;}\n"
         "body.portrait #top-stats,body.portrait .dash-row{display:none!important;}\n"
         "html.portrait,body.portrait{overflow:auto!important;height:auto!important;}\n"
         "body.portrait #dash-container{width:750px!important;padding:12px 14px 10px!important;}\n"
@@ -440,12 +444,20 @@ int http_fn_custom_dash(http_request_t *request) {
         "body.portrait .ess-hdr{margin:0 0 4px!important;}\n"
         "body.portrait .btn-box{padding:8px 12px!important;}\n"
         "body.portrait .clk-row{margin-top:8px;-webkit-flex:none!important;flex:none!important;padding:8px 12px 8px 30px!important;position:relative;}\n"
+        /* Portrait (P2): more room, so the value stays large (48px) and the
+           range sits as a small two-line column to the RIGHT of it, at roughly
+           the value's cap height. hi+lo are wrapped into .mmcol at runtime
+           (toPortrait) so inline-block stacks them as one column; landscape
+           unwraps them back to the flat card stack. No card border here -- the
+           portrait clock panel already frames it. */
         "body.portrait #tb-thm{bottom:auto;top:50%;-webkit-transform:translateY(-50%);transform:translateY(-50%);right:34px;font-size:48px;line-height:1.45;text-align:right;}\n"
-        "body.portrait #tb-thm .thm-l{display:block;margin-left:0;}\n"
-        "body.portrait #tb-thm svg{width:32px;height:32px;vertical-align:-4px;margin-right:12px;}\n"
+        "body.portrait #tb-thm .thm-l{display:block;margin-left:0;border:none;border-radius:0;padding:0;white-space:nowrap;}\n"
+        "body.portrait #tb-thm .thm-l+.thm-l{margin-top:0;}\n"
+        "body.portrait #tb-thm svg{display:inline-block;width:32px;height:32px;vertical-align:middle;margin:0 12px 0 0;}\n"
+        "body.portrait #tb-thm .thm-v{display:inline;font-weight:700;vertical-align:middle;}\n"
+        "body.portrait #tb-thm .mmcol{display:inline-block;vertical-align:middle;margin-left:12px;text-align:left;}\n"
+        "body.portrait #tb-thm .mmcol .thm-mm{display:block;font-size:15px;line-height:1.3;margin:0;}\n"
         "body.portrait #d-clk{font-size:126px!important;letter-spacing:-3px!important;}\n"
-        "#clk-gear{position:absolute;top:10px;right:12px;width:20px;height:20px;color:#5a6470;cursor:pointer;background:none;border:none;padding:0;}\n"
-        "#clk-gear svg{width:20px;height:20px;}\n"
         "#stats-sec{margin-top:8px;}\n"
         ".st-row{display:-webkit-box;display:-webkit-flex;display:flex;}\n"
         ".st-row>*{-webkit-box-flex:1;-webkit-flex:1;flex:1;min-width:0;}\n"
@@ -666,9 +678,14 @@ int http_fn_custom_dash(http_request_t *request) {
         "</tr></table></div>"
         "<div class='cfg-sec'>Net Energy Triggers</div>"
         "<div class='thc'><table style='width:100%;border-collapse:collapse;'><tr>"
-        "<td style='padding-right:12px;width:50%;'><div class='irow' style='height:auto;'><label>Charge trigger</label><input class='t-inp vv' type='text' id='boost-wh' value='10'><span style='color:#7c8a9a;font-size:11px;margin-left:6px;'>Wh</span></div></td>"
-        "<td style='width:50%;'><div class='irow' style='height:auto;'><label>Divert trigger</label><input class='t-inp vv' type='text' id='div-wh' value='-60'><span style='color:#7c8a9a;font-size:11px;margin-left:6px;'>Wh</span></div></td>"
-        "</tr></table></div>"
+        "<td style='padding-right:12px;width:50%;'><div class='irow' style='height:auto;'><label>Charge trigger</label><input class='t-inp vv' type='text' id='boost-wh' value='10' oninput='valT()'><span style='color:#7c8a9a;font-size:11px;margin-left:6px;'>Wh</span></div></td>"
+        "<td style='width:50%;'><div class='irow' style='height:auto;'><label>Divert trigger</label><input class='t-inp vv' type='text' id='div-wh' value='-60' oninput='valT()'><span style='color:#7c8a9a;font-size:11px;margin-left:6px;'>Wh</span></div></td>"
+        "</tr><tr>"
+        "<td style='padding-right:12px;padding-top:8px;'><div class='irow' style='height:auto;'><label>Max power</label><input class='t-inp vv' type='text' id='tgt-pwr' value='100' oninput='valT()'><span style='color:#7c8a9a;font-size:11px;margin-left:6px;'>%</span></div></td>"
+        "<td style='padding-top:8px;'><div class='irow' style='height:auto;'><label>Export</label><input class='t-inp vv' type='text' id='tgt-exp' value='20' oninput='valT()'><span style='color:#7c8a9a;font-size:11px;margin-left:6px;'>Wh</span></div></td>"
+        "</tr></table>"
+        "<div class='cfg-err' id='trig-err' style='display:none;'></div>"
+        "</div>"
         "<div class='cfg-sec'>Maintenance</div>"
         "<div class='thc'><div class='btnrow'>"
         "<button class='clrb' id='clr-met-btn' onclick='doClearMetering()'>Clear Metering</button>"
@@ -818,8 +835,11 @@ int http_fn_custom_dash(http_request_t *request) {
            date row (the big digits leave no side room). Portrait: large
            stacked block, vertically centered in the right-hand empty space. */
         "<div id='tb-thm' style='display:none;'>"
-        "<div class='thm-l'><svg viewBox='0 0 24 24' fill='none' stroke='#7c8a9a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 11.5 12 4l9 7.5'/><path d='M5 10v10h14V10'/></svg><span id='tb-tin'>--</span></div>"
-        "<div class='thm-l'><svg viewBox='0 0 24 24' fill='none' stroke='#7c8a9a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.6A4 4 0 0 0 7 19z'/></svg><span id='tb-tout'>--</span></div>"
+        /* Per-sensor card, flat 4-child stack for the L8 landscape look:
+           icon / max(hi) / value / min(lo). Portrait (P2) re-wraps hi+lo into
+           a right-hand column at runtime -- see toPortrait()/toLandscape(). */
+        "<div class='thm-l'><svg viewBox='0 0 24 24' fill='none' stroke='#7c8a9a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 11.5 12 4l9 7.5'/><path d='M5 10v10h14V10'/></svg><span class='thm-mm hi' id='tb-tin-hi'></span><span class='thm-v' id='tb-tin'>--</span><span class='thm-mm lo' id='tb-tin-lo'></span></div>"
+        "<div class='thm-l'><svg viewBox='0 0 24 24' fill='none' stroke='#7c8a9a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.6A4 4 0 0 0 7 19z'/></svg><span class='thm-mm hi' id='tb-tout-hi'></span><span class='thm-v' id='tb-tout'>--</span><span class='thm-mm lo' id='tb-tout-lo'></span></div>"
         "</div>"
         "</div>"
         "</div>"
@@ -933,7 +953,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "<div class='btn-box'>"
         "<table class='ess-hdr'><tr>"
         "<td class='ess-hdr-t'>ESS System Modes</td>"
-        "<td class='ess-hdr-c'><span class='ess-cog' id='gear-btn' onclick='toggleCfg()'><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='3'></circle><path d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'></path></svg></span></td>"
+        "<td class='ess-hdr-c'></td>"
         "</tr></table>"
         "<table class='bgrid'><tr>"
         "<td class='btn r1 btn-auto' id='m-btn' onclick='tm()'>"
@@ -946,13 +966,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "<td class='btn r2' id='inv1-btn' onclick='t_inv1()'><span class='btxt'>INV1</span></td>"
         "<td class='btn r2' id='inv2-btn' onclick='t_inv2()'><span class='btxt'>INV2</span></td>"
         "</tr></table>"
-        "<div id='cfg-pop' class='cfg-pop' style='display:none;'>"
-        "<div class='cfg-head'><span>Settings</span><span class='cfg-x' onclick='toggleCfg()'>&#x2715;</span></div>"
-        "<div class='sld-block'><label>Max Pwr (<span id='lbl-pwr'></span>%)</label>"
-        "<input type='range' id='sld-pwr' min='18' max='100' value='100' oninput='sIn(\"pwr\",this.value)' onchange='s_pwr(this.value)'></div>"
-        "<div class='sld-block'><label>Export (<span id='lbl-exp'></span> Wh)</label>"
-        "<input type='range' id='sld-exp' min='10' max='100' value='20' oninput='sIn(\"exp\",this.value)' onchange='s_exp(this.value)'></div>"
-        "</div>"
+
         "</div>"   // btn-box
         "</div>"   // right-col
         "</div>"   // dash-row
@@ -1103,10 +1117,10 @@ int http_fn_custom_dash(http_request_t *request) {
         "function rec(k,dev,loc){var p=pend[k];if(!p)return dev;if(Date.now()>=p.t){delete pend[k];return dev;}if(dev===p.v){delete pend[k];return dev;}return loc;}"
         "function clrIf(k,dev){var p=pend[k];if(p&&dev===p.v)delete pend[k];}"
         "function cmd(u,k,v){if(k!==null)mark(k,v);xhr(u,function(){xhr('/api_dash?req=core',function(d){if(d&&d.c)applyCore(d);});});}"
-        "function toggleCfg(){var p=document.getElementById('cfg-pop');if(p)p.style.display=(p.style.display==='none')?'block':'none';}"
         "function refreshSliders(){"
-        "var mp=(mode===0)?tpa:tpm;if(!held('pwr')){setV('lbl-pwr',mp);if(mp>=18)setV('sld-pwr',mp);}"
-        "if(!held('exp')){setV('lbl-exp',texp);setV('sld-exp',texp);}}"
+        "var mp=(mode===0)?tpa:tpm,ep;"
+        "if(!held('pwr')){ep=document.getElementById('tgt-pwr');if(ep&&document.activeElement!==ep)ep.value=mp;}"
+        "if(!held('exp')){ep=document.getElementById('tgt-exp');if(ep&&document.activeElement!==ep)ep.value=texp;}}"
         "function fmtMac(el){var raw=el.value.replace(/[^0-9a-fA-F]/g,'').slice(0,12).toUpperCase();var out='';for(var i=0;i<raw.length;i++){if(i>0&&i%2===0)out+=':';out+=raw[i];}el.value=out;}"
         "function loadCfg(){try{var ls=localStorage;"
         "var m=ls.getItem('bmsMAC');if(m){bmsMAC=m;setV('bms1-mac',m);}"
@@ -1141,7 +1155,7 @@ int http_fn_custom_dash(http_request_t *request) {
         /* battery-protection cut-offs, centivolts -> volts text boxes */
         "if(d.ccut){var ec=document.getElementById('cut-cv');if(ec){ec.value=(d.ccut/100).toFixed(2);}}"
         "if(d.icut){var ei=document.getElementById('cut-iv');if(ei){ei.value=(d.icut/100).toFixed(2);}}"
-        "valV();}"
+        "valV();valT();}"
         "if(rb){rb.disabled=false;rb.innerHTML='&#x21d3; Retrieve';}}); }"
         "function doCfgSave(){var get=function(id){var e=document.getElementById(id);return e?e.value:'';};"
         "bmsMAC=get('bms1-mac');bms2MAC=get('bms2-mac');inv2IP=get('inv2-ip');bypIP=get('byp-ip');"
@@ -1163,6 +1177,10 @@ int http_fn_custom_dash(http_request_t *request) {
         "if(bypIP)cmd('/cm?cmnd=SetBypassIP%20'+bypIP,null,0);"
         "cmd('/cm?cmnd=SetBoostPower%20'+boostWh,null,0);"
         "cmd('/cm?cmnd=SetDivertThreshold%20'+dthr,null,0);"
+        /* relocated from the old ESS Settings sliders: only push in-range values */
+        "var tp=parseInt(get('tgt-pwr'),10),tx=parseInt(get('tgt-exp'),10);"
+        "if(tp>=18&&tp<=100)s_pwr(tp);"
+        "if(tx>=10&&tx<=100)s_exp(tx);"
         /* battery-protection cut-offs: only push values inside 3.30-4.05 V */
         "var cc=Math.round(parseFloat(get('cut-cv'))*100),ci=Math.round(parseFloat(get('cut-iv'))*100);"
         "if(cc>=330&&cc<=405)cmd('/cm?cmnd=SetChargerCutoff%20'+cc,null,0);"
@@ -1170,9 +1188,8 @@ int http_fn_custom_dash(http_request_t *request) {
         "setTimeout(function(){cmd('/cm?cmnd=SaveCfg',null,0);},800);"
         "var sb=document.getElementById('cfg-sv-btn');"
         "if(sb){sb.innerHTML='Saved &#x2713;';setTimeout(function(){sb.innerHTML='Save';},2000);}}"
-        "function sIn(k,v){mark(k,parseInt(v,10));if(k==='pwr')setV('lbl-pwr',v);else if(k==='exp')setV('lbl-exp',v);}"
-        "function s_pwr(v){var iv=parseInt(v,10);if(mode===0)tpa=iv;else tpm=iv;mark('pwr',iv);cmd('/cm?cmnd=SetTargetPower%20'+v,null,0);setV('lbl-pwr',v);}"
-        "function s_exp(v){texp=parseInt(v,10);mark('exp',texp);cmd('/cm?cmnd=SetTargetExport%20'+v,null,0);setV('lbl-exp',v);}"
+        "function s_pwr(v){var iv=parseInt(v,10);if(mode===0)tpa=iv;else tpm=iv;mark('pwr',iv);cmd('/cm?cmnd=SetTargetPower%20'+iv,null,0);}"
+        "function s_exp(v){texp=parseInt(v,10);mark('exp',texp);cmd('/cm?cmnd=SetTargetExport%20'+texp,null,0);}"
         "var IC_AUTO=\"<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M23 4v6h-6'/><path d='M1 20v-6h6'/><path d='M3.51 9a9 9 0 0 1 14.85-3.36L23 10'/><path d='M1 14l4.64 4.36A9 9 0 0 0 20.49 15'/></svg>\";"
         "var IC_CLOCK=\"<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/></svg>\";"
         "var IC_LOCK=\"<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='11' width='18' height='11' rx='2'/><path d='M7 11V7a5 5 0 0 1 10 0v4'/></svg>\";"
@@ -1194,7 +1211,12 @@ int http_fn_custom_dash(http_request_t *request) {
         "function t_inv1(){if(mode===0)return;setDump(dmp===5?0:5);}"
         "function t_inv2(){inv2On=!inv2On;if(inv2IP)cmd('/cm?cmnd=SetInv2%20'+(inv2On?1:0),null,0);btnColor();}"
         "function t_chg(){if(mode===0)return;setDump(dmp>=18?0:18);}"
-        "function toggleSnsCfg(){var m=document.getElementById('snsMsk');if(m)m.className=(m.className==='msk open')?'msk':'msk open';}"
+        /* Opening the panel now pulls the live config from the device, instead
+           of waiting for a Retrieve click. Without this the MAC/IP fields show
+           only whatever localStorage happened to cache (or nothing), and a Save
+           would write those blanks over good settings. Retrieve stays as a
+           manual refresh / fallback. */
+        "function toggleSnsCfg(){var m=document.getElementById('snsMsk');var opening=m&&m.className!=='msk open';if(m)m.className=(m.className==='msk open')?'msk':'msk open';if(opening){valV();valT();doCfgRetrieve();}}"
         "function doResetStats(){cmd('/cm?cmnd=MeterStatsReset',null,0);"
         "var b=event&&event.target;if(b){var t=b.innerHTML;b.innerHTML='Done &#x2713;';setTimeout(function(){b.innerHTML=t;},1500);}}"
         "function valV(){var ok=1;var ck=function(id){var e=document.getElementById(id);if(!e)return 1;"
@@ -1202,6 +1224,21 @@ int http_fn_custom_dash(http_request_t *request) {
         "e.className='t-inp vv '+(bad?'err':'ok');return bad?0:1;};"
         "var a=ck('cut-cv'),b2=ck('cut-iv');"
         "var er=document.getElementById('cut-err');if(er)er.style.display=(a&&b2)?'none':'block';}"
+        /* validates the 4 net-energy-trigger fields, incl. the two relocated
+           from the old ESS Settings sliders (Max power, Export). Ranges match
+           the sliders they replaced. */
+        "function valT(){"
+        "var R={'boost-wh':[10,50,'Charge trigger must be 10\u201350 Wh'],"
+        "'div-wh':[-200,-30,'Divert trigger must be -30 to -200 Wh'],"
+        "'tgt-pwr':[18,100,'Max power must be 18\u2013100 %'],"
+        "'tgt-exp':[10,100,'Export must be 10\u2013100 Wh']};"
+        "var msg='';"
+        "for(var id in R){var e=document.getElementById(id);if(!e)continue;"
+        "var v=parseFloat(e.value),bad=isNaN(v)||v<R[id][0]||v>R[id][1];"
+        "e.className='t-inp vv '+(bad?'err':'ok');"
+        "if(bad&&!msg)msg='\u26a0 '+R[id][2];}"
+        "var el=document.getElementById('trig-err');"
+        "if(el){el.innerHTML=msg;el.style.display=msg?'block':'none';}}"
         "function doClearMetering(){"
         "if(!confirm('Clear all metering data? This zeroes every energy counter (grid, solar, ESS totals, today, last-hour and the graph history). Meter IPs and settings are kept.'))return;"
         "if(!confirm('This CANNOT be undone. Confirm you want to permanently clear all metering data?'))return;"
@@ -1291,10 +1328,13 @@ int http_fn_custom_dash(http_request_t *request) {
     // --- JS part 5: graph decode + poll cycle ---
     poststr(request,
         "function _decodeNet(d){if(!d.net)return;var b=_b64toBytes(d.net),n=b.length,i;state_import=new Array(n);state_export=new Array(n);for(i=0;i<n;i++){var v=b[i]*2-150;state_import[i]=v>0?v:0;state_export[i]=v<0?v:0;}"
-        "if(d.sol){var s=_b64toBytes(d.sol),sn=s.length;state_solar=new Array(sn);for(i=0;i<sn;i++){state_solar[i]=-s[i]*0.8;}}}"
+        "if(d.sol){var s=_b64toBytes(d.sol),sn=s.length;state_solar=new Array(sn);for(i=0;i<sn;i++){state_solar[i]=-s[i];}}}"
         "function applyMeters(d){if(!d.mt)return;var i,m,el,on,ts=0,tso=0,te=0,teo=0,tg=0,tgo=0,sv=0;"
         "if(d.th){var thq=function(id,o,lbl){var e=document.getElementById(id);if(!e)return 0;"
-        "if(o&&o.o){e.innerHTML=(o.t/10).toFixed(1)+'&deg;';e.title=lbl+': '+(o.t/10).toFixed(1)+'\u00b0C \u00b7 '+o.h+'%RH \u00b7 batt '+o.b+'%';return 1;}"
+        "var hs=document.getElementById(id+'-hi'),ls=document.getElementById(id+'-lo');"
+        "if(hs)hs.innerHTML=(o&&o.hi!=null)?('&#8593;'+(o.hi/10).toFixed(1)+'&deg;'):'';"
+        "if(ls)ls.innerHTML=(o&&o.lo!=null)?('&#8595;'+(o.lo/10).toFixed(1)+'&deg;'):'';"
+        "if(o&&o.o){e.innerHTML=(o.t/10).toFixed(1)+'&deg;';e.title=lbl+': '+(o.t/10).toFixed(1)+'\u00b0C \u00b7 '+o.h+'%RH \u00b7 batt '+o.b+'%'+((o.hi!=null)?(' \u00b7 today '+(o.lo/10).toFixed(1)+'-'+(o.hi/10).toFixed(1)+'\u00b0C'):'');return 1;}"
         "e.innerHTML='--';e.title=lbl+': no data';return 0;};"
         "thq('tb-tin',d.th[0],'Inside');thq('tb-tout',d.th[1],'Outside');"
         /* config-popup thermometer cards: reading + last-seen / interval-EWMA /
@@ -1564,11 +1604,6 @@ int http_fn_custom_dash(http_request_t *request) {
         " dc.insertBefore(netcard,ts);dc.insertBefore(gaugecard,ts);\n"
         " dc.insertBefore(graphcard,ts);dc.insertBefore(row750,ts);dc.insertBefore(statsSec,ts);\n"
         "\n"
-        " /* clock gear (portrait only, shown via CSS) */\n"
-        " var cg=document.createElement('button');cg.id='clk-gear';cg.title='Clock settings';\n"
-        " cg.innerHTML=\"<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='3'/><path d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'/></svg>\";\n"
-        " clk.appendChild(cg);\n"
-        "\n"
         " var balEl=document.getElementById('d-bal');\n"
         " if(balEl){var u=document.createElement('span');u.className='nw-unit';u.innerHTML='W';\n"
         "   balEl.parentNode.appendChild(u);}\n"
@@ -1631,6 +1666,22 @@ int http_fn_custom_dash(http_request_t *request) {
         " var cur='';\n"
         " function setGraph(step,w){window.GSTEP=step;window.GW=w;\n"
         "   if(window.__redraw)window.__redraw();}\n"
+        /* Thermometer range regrouping between layouts. Landscape keeps the
+           flat card stack (icon / hi / value / lo). Portrait moves hi+lo into
+           a .mmcol wrapper after the value, so they read as a right-hand
+           column. Idempotent and null-safe -- runs on every layout switch. */
+        " function thmWrap(){var ids=['tb-tin','tb-tout'];for(var i=0;i<ids.length;i++){\n"
+        "   var v=document.getElementById(ids[i]);if(!v)continue;var l=v.parentNode;\n"
+        "   if(l.querySelector('.mmcol'))continue;\n"
+        "   var hi=document.getElementById(ids[i]+'-hi'),lo=document.getElementById(ids[i]+'-lo');\n"
+        "   if(!hi||!lo)continue;\n"
+        "   var c=document.createElement('span');c.className='mmcol';\n"
+        "   l.insertBefore(c,null);c.appendChild(hi);c.appendChild(lo);}}\n"
+        " function thmUnwrap(){var ids=['tb-tin','tb-tout'];for(var i=0;i<ids.length;i++){\n"
+        "   var v=document.getElementById(ids[i]);if(!v)continue;var l=v.parentNode;\n"
+        "   var c=l.querySelector('.mmcol');if(!c)continue;\n"
+        "   var hi=document.getElementById(ids[i]+'-hi'),lo=document.getElementById(ids[i]+'-lo');\n"
+        "   l.insertBefore(hi,v);l.insertBefore(lo,v.nextSibling);l.removeChild(c);}}\n"
         " function toPortrait(){\n"
         "   if(cur==='p')return;cur='p';\n"
         "   document.documentElement.className='portrait';document.body.className='portrait';\n"
@@ -1641,6 +1692,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "   row750.appendChild(btn);row750.appendChild(left);\n"
         "   dc.insertBefore(clk,statsSec);\n"
         "   phScal.parentNode.insertBefore(scal,phScal);\n"
+        "   thmWrap();\n"
         "   setGraph(13,694);\n"
         " }\n"
         " function toLandscape(){\n"
@@ -1649,6 +1701,7 @@ int http_fn_custom_dash(http_request_t *request) {
         "   var m={mid:mid,lg1:lg1,lg2:lg2,stack:stack,graph:graph,leg:leg,clk:clk,btn:btn,left:left};\n"
         "   for(var k in m)ph[k].parentNode.insertBefore(m[k],ph[k]);\n"
         "   clip.appendChild(scal);\n"
+        "   thmUnwrap();\n"
         "   setGraph(11,592);\n"
         " }\n"
         "\n"

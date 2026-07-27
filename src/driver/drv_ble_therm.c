@@ -39,8 +39,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>            /* lroundf for the tenths-of-a-degree encoding */
 
 #include "../logging/logging.h"
+#include "../hal/hal_flashVars.h"   /* daily min/max persistence */
 #include "../cmnds/cmd_local.h"
 #include "../cmnds/cmd_public.h"   /* commandResult_t, CMD_RES_* */
 
@@ -69,6 +71,14 @@ static volatile int      s_batt[THERM_COUNT];
 static volatile uint32_t s_seen[THERM_COUNT];        /* g_secondsElapsed stamp */
 static volatile uint32_t s_ivl_q8[THERM_COUNT];      /* interval EWMA, x256 fixed */
 static volatile int8_t   s_rssi[THERM_COUNT];        /* last frame RSSI, dBm      */
+/* Today's high/low, degC. s_day_seeded[idx]==0 means "no reading yet today" --
+   the next valid frame seeds hi=lo=that reading, rather than comparing against
+   a stale value. Persisted as tenths inside the graph blob, which is written
+   at every 15-min boundary, so a reboot recovers the day so far. */
+static void push_shadow(void);   /* defined with the persistence block below */
+static float             s_day_hi[THERM_COUNT];
+static float             s_day_lo[THERM_COUNT];
+static unsigned char     s_day_seeded[THERM_COUNT];
 
 static volatile unsigned char s_enabled   = 0;       /* driver started         */
 static volatile unsigned char s_suspended = 0;       /* jk_bms is connecting   */
@@ -157,6 +167,19 @@ static void parse_svcdata_181a(int idx, const uint8_t *p, int len)
     s_temp[idx] = t;
     s_hum[idx]  = rh;
     s_batt[idx] = batt;
+    {
+        int moved = 0;
+        if (!s_day_seeded[idx]) {
+            s_day_hi[idx] = t; s_day_lo[idx] = t; s_day_seeded[idx] = 1; moved = 1;
+        } else {
+            if (t > s_day_hi[idx]) { s_day_hi[idx] = t; moved = 1; }
+            if (t < s_day_lo[idx]) { s_day_lo[idx] = t; moved = 1; }
+        }
+        /* Mirror into the HAL shadow only when the range actually moved --
+           a few stores, no NVS access, safe from the BLE callback. The next
+           graph save (15-min boundary) carries it to flash. */
+        if (moved) push_shadow();
+    }
     /* Interval EWMA: seconds since the previous frame, averaged alpha=1/64
        (~1/50) in x256 fixed-point. Seeded on the second frame (needs a prior
        timestamp). Diagnostic for placement / packet loss: settles near the
@@ -335,6 +358,114 @@ void BLETherm_ResetIntervalStats(void)
     for (i = 0; i < THERM_COUNT; i++) s_ivl_q8[i] = 0;
 }
 
+/* Today's high/low, degC. Returns 1 if a reading has arrived today, 0 if
+   the sensor hasn't seeded yet (shows "--" on the dashboard). */
+int BLETherm_GetMinMax(int idx, float *hi, float *lo)
+{
+    if (idx < 0 || idx >= THERM_COUNT || !s_day_seeded[idx]) {
+        if (hi) *hi = 0; if (lo) *lo = 0;
+        return 0;
+    }
+    if (hi) *hi = s_day_hi[idx];
+    if (lo) *lo = s_day_lo[idx];
+    return 1;
+}
+
+/* --- daily min/max persistence -------------------------------------------
+   RAM is the live store, updated on every valid frame. The persisted copy
+   lives inside the graph blob (see hal_flashVars_espidf.c): that blob is
+   already written at every 15-min boundary and had spare bytes NVS was
+   paying for regardless, so the range costs no extra key, no extra entry
+   and no extra write. Values move through a shadow copy in the HAL, pushed
+   whenever the range changes.
+
+   Nothing here is time-gated on its own -- it doesn't need to be. The range
+   carries its own packed date (see therm_pack_date), so a stored range is
+   only ever adopted if it belongs to today. That also makes the save order
+   irrelevant: at midnight BLETherm_MidnightReset() clears the range and
+   re-stamps the shadow, and whichever function next writes the graph blob
+   persists the cleared state with the new date. There is no window in which
+   yesterday's numbers can be re-adopted as today's. */
+
+#define TENTHS_NONE  ((short)-32768)
+
+static unsigned char  s_restored   = 0;   /* one-shot adoption guard          */
+static unsigned short s_today_date = 0;   /* packed local date, 0 until synced */
+
+/* Local date -> 16 bits: y7|m4|d5. 0 means "no date". Two bytes disambiguates
+   any outage shorter than a century, which is enough. */
+unsigned short BLETherm_PackDate(int year, int month, int mday)
+{
+    if (month < 1 || month > 12 || mday < 1 || mday > 31) return 0;
+    return (unsigned short)((((unsigned)year % 100u) << 9)
+                            | (((unsigned)month & 0xFu) << 5)
+                            | ((unsigned)mday & 0x1Fu));
+}
+
+/* Mirror the live range into the HAL shadow so the next graph save picks it
+   up. Cheap (a few stores); called whenever the range actually moves.
+   The date used is s_today_date, which stays 0 until the first synced sweep.
+   A shadow stamped 0 is never adopted on restore, so readings taken before
+   NTP sync can be tracked live but can never be mistaken for a dated range. */
+static void push_shadow(void)
+{
+    short hi[2], lo[2];
+    int i;
+    for (i = 0; i < THERM_COUNT; i++) {
+        if (s_day_seeded[i]) {
+            hi[i] = (short)lroundf(s_day_hi[i] * 10.0f);
+            lo[i] = (short)lroundf(s_day_lo[i] * 10.0f);
+        } else {
+            hi[i] = TENTHS_NONE;
+            lo[i] = TENTHS_NONE;
+        }
+    }
+    HAL_FlashVars_SetThermShadow(hi, lo, s_today_date);
+}
+
+/* New day starting: drop the range and re-stamp with the new date, so the
+   next graph write persists a cleared range that belongs to today. */
+void BLETherm_MidnightReset(unsigned short today_date)
+{
+    s_today_date    = today_date;
+    s_day_seeded[0] = 0;
+    s_day_seeded[1] = 0;
+    push_shadow();
+}
+
+/* First synced sweep after boot. The graph load has already parked whatever
+   was in flash into the shadow; adopt it only if it is stamped with today.
+   Runs once. */
+void BLETherm_SyncRestore(unsigned short today_date)
+{
+    short hi[2], lo[2];
+    unsigned short stored = 0;
+    int i;
+
+    if (s_restored) return;
+    s_restored   = 1;
+    s_today_date = today_date;
+
+    HAL_FlashVars_GetThermShadow(hi, lo, &stored);
+
+    if (stored != 0 && stored == today_date) {
+        for (i = 0; i < THERM_COUNT; i++) {
+            if (hi[i] != TENTHS_NONE && lo[i] != TENTHS_NONE) {
+                s_day_hi[i]     = hi[i] / 10.0f;
+                s_day_lo[i]     = lo[i] / 10.0f;
+                s_day_seeded[i] = 1;
+            } else {
+                s_day_seeded[i] = 0;
+            }
+        }
+    } else {
+        s_day_seeded[0] = 0;
+        s_day_seeded[1] = 0;
+    }
+    /* Re-stamp either way: from here on the shadow tracks today. */
+    push_shadow();
+}
+
 /* ---- console commands -----------------------------------------------------
    NOTE: this fork's commandHandler_t is
      commandResult_t fn(const void*, const char*, const char*, int flags)
@@ -440,5 +571,10 @@ void BLETherm_ResumeScan(void) { }
 int  BLETherm_Get(int idx, float *t, float *h, int *b) { (void)idx; (void)t; (void)h; (void)b; return 0; }
 int  BLETherm_GetStats(int idx, int *s, int *a, int *r) { (void)idx; if(s)*s=-1; if(a)*a=0; if(r)*r=0; return 0; }
 void BLETherm_ResetIntervalStats(void) { }
+int  BLETherm_GetMinMax(int idx, float *hi, float *lo) { (void)idx; if(hi)*hi=0; if(lo)*lo=0; return 0; }
+unsigned short BLETherm_PackDate(int y, int m, int d) { (void)y; (void)m; (void)d; return 0; }
+void BLETherm_RangeChanged(unsigned short d) { (void)d; }
+void BLETherm_MidnightReset(unsigned short d) { (void)d; }
+void BLETherm_SyncRestore(unsigned short d) { (void)d; }
 
 #endif /* ENABLE_BLE_THERM */
