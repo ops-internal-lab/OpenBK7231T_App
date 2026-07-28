@@ -363,7 +363,8 @@ void BLETherm_ResetIntervalStats(void)
 int BLETherm_GetMinMax(int idx, float *hi, float *lo)
 {
     if (idx < 0 || idx >= THERM_COUNT || !s_day_seeded[idx]) {
-        if (hi) *hi = 0; if (lo) *lo = 0;
+        if (hi) *hi = 0;
+        if (lo) *lo = 0;
         return 0;
     }
     if (hi) *hi = s_day_hi[idx];
@@ -573,7 +574,6 @@ int  BLETherm_GetStats(int idx, int *s, int *a, int *r) { (void)idx; if(s)*s=-1;
 void BLETherm_ResetIntervalStats(void) { }
 int  BLETherm_GetMinMax(int idx, float *hi, float *lo) { (void)idx; if(hi)*hi=0; if(lo)*lo=0; return 0; }
 unsigned short BLETherm_PackDate(int y, int m, int d) { (void)y; (void)m; (void)d; return 0; }
-void BLETherm_RangeChanged(unsigned short d) { (void)d; }
 void BLETherm_MidnightReset(unsigned short d) { (void)d; }
 void BLETherm_SyncRestore(unsigned short d) { (void)d; }
 
