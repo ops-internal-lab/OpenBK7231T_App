@@ -59,94 +59,31 @@ set(OBKM_SRC
 
 	${OBK_SRCS}driver/drv_main.c
 
-	${OBK_SRCS}driver/drv_adcButton.c
-	${OBK_SRCS}driver/drv_adcSmoother.c
 	${OBK_SRCS}driver/drv_battery.c
 	${OBK_SRCS}driver/drv_bl0942.c
 	${OBK_SRCS}driver/drv_bl_shared.c
-	${OBK_SRCS}driver/drv_bmp280.c
-	${OBK_SRCS}driver/drv_bp1658cj.c
-	${OBK_SRCS}driver/drv_bp5758d.c
-	${OBK_SRCS}driver/drv_bridge_driver.c
-	${OBK_SRCS}driver/drv_chargingLimit.c
-	${OBK_SRCS}driver/drv_charts.c
-	${OBK_SRCS}driver/drv_cse7761.c
 	${OBK_SRCS}driver/drv_cse7766.c
-	${OBK_SRCS}driver/drv_ddp.c
-	${OBK_SRCS}driver/drv_dmx512.c
-	${OBK_SRCS}driver/drv_debouncer.c
-	${OBK_SRCS}driver/drv_drawers.c
-	${OBK_SRCS}driver/drv_doorSensorWithDeepSleep.c
-	${OBK_SRCS}driver/drv_esphome_api.c
-	${OBK_SRCS}driver/drv_esphome_api_server.c
-	${OBK_SRCS}driver/drv_freeze.c
-	${OBK_SRCS}driver/drv_gn6932.c
-	${OBK_SRCS}driver/drv_hd2015.c
-	${OBK_SRCS}driver/drv_hgs02.c
-	${OBK_SRCS}driver/drv_ht16k33.c
-	${OBK_SRCS}driver/drv_httpButtons.c
-	${OBK_SRCS}driver/drv_hue.c
-	${OBK_SRCS}driver/drv_kp18058.c
-	${OBK_SRCS}driver/drv_kp18068.c
-	${OBK_SRCS}driver/drv_max6675.c
-	${OBK_SRCS}driver/drv_max72xx_clock.c
-	${OBK_SRCS}driver/drv_max72xx_internal.c
-	${OBK_SRCS}driver/drv_max72xx_single.c
-	${OBK_SRCS}driver/drv_mqttServer.c
-	${OBK_SRCS}driver/drv_mqttServerBerry.c
-	${OBK_SRCS}driver/drv_multiPinI2CScanner.c
 	${OBK_SRCS}driver/drv_ntp.c
 	${OBK_SRCS}driver/drv_deviceclock.c
 	${OBK_SRCS}driver/drv_ds3231.c
 	${OBK_SRCS}driver/drv_DCF77.c
 	${OBK_SRCS}libraries/obktime/obktime.c
-	${OBK_SRCS}driver/drv_timed_events.c
 	${OBK_SRCS}driver/drv_openWeatherMap.c
-	${OBK_SRCS}driver/drv_pir.c
-	${OBK_SRCS}driver/drv_pixelAnim.c
-	${OBK_SRCS}driver/drv_pt6523.c
-	${OBK_SRCS}driver/drv_pwm_groups.c
-	${OBK_SRCS}driver/drv_pwmToggler.c
 	${OBK_SRCS}driver/drv_pwrCal.c
-	${OBK_SRCS}driver/drv_shiftRegister.c
-	${OBK_SRCS}driver/drv_sm2135.c
-	${OBK_SRCS}driver/drv_sm2235.c
-	${OBK_SRCS}driver/drv_soft_spi.c
-	${OBK_SRCS}driver/drv_sm15155e.c
-	${OBK_SRCS}driver/drv_sm16703P.c
-	${OBK_SRCS}driver/drv_simpleEEPROM.c
-	${OBK_SRCS}driver/drv_shutters.c
-	${OBK_SRCS}driver/drv_leds_shared.c
 	${OBK_SRCS}driver/drv_spi.c
-	${OBK_SRCS}driver/drv_spiLED.c
-	${OBK_SRCS}driver/drv_spi_flash.c
-	${OBK_SRCS}driver/drv_spidma.c
 	${OBK_SRCS}driver/drv_mdns.c
 	${OBK_SRCS}driver/drv_ssdp.c
-	${OBK_SRCS}driver/drv_ssd1306.c
-	${OBK_SRCS}driver/drv_tasmotaDeviceGroups.c
-	${OBK_SRCS}driver/drv_tclAC.c
 	${OBK_SRCS}driver/drv_test.c
 	${OBK_SRCS}driver/drv_test_drivers.c
-	${OBK_SRCS}driver/drv_textScroller.c
-	${OBK_SRCS}driver/drv_tm1637.c
-	${OBK_SRCS}driver/drv_tm1638.c
-	${OBK_SRCS}driver/drv_tm_gn_display_shared.c
 	${OBK_SRCS}driver/drv_girierMCU.c
 	${OBK_SRCS}driver/drv_tuyaMCU.c
-	${OBK_SRCS}driver/drv_tuyaMCUSensor.c
 	${OBK_SRCS}driver/drv_uart.c
-	${OBK_SRCS}driver/drv_uart_tcp.c
-	${OBK_SRCS}driver/drv_ucs1912.c
-	${OBK_SRCS}driver/drv_wemo.c
-	${OBK_SRCS}driver/drv_widget.c
 	${OBK_SRCS}i2c/drv_i2c_ads1115.c
 	${OBK_SRCS}i2c/drv_i2c_lcd_pcf8574t.c
 	${OBK_SRCS}i2c/drv_i2c_main.c
 	${OBK_SRCS}i2c/drv_i2c_mcp23017.c
 	${OBK_SRCS}i2c/drv_i2c_tc74.c
 
-#	${OBK_SRCS}driver/drv_test_charts.c
 )
 
 
