@@ -469,28 +469,38 @@
 
 #elif PLATFORM_ESPIDF
 
-#define ENABLE_SEND_POSTANDGET					1
+/* =====================================================================
+   STAGE 1 STRIP  -- feature flags only, no code edits.
+   Everything disabled below is already disabled on other shipped OBK
+   platforms, so the #if guards around it are real and exercised
+   upstream. Each line keeps its original text, commented out, so this
+   is reversible by deleting one "//".
+   Kept: NTP, MQTT, BL0942 (drv_bl_shared builds on it), UART-TCP,
+         JK-BMS, BLE thermometers.
+   ===================================================================== */
+
+#define ENABLE_SEND_POSTANDGET					1	// VERIFY: drv_uart_tcp_client shows no http_client use; likely removable
 /* HA discovery removed - all entities are declared manually in HA YAML
    (see mqtt_stream topics in drv_mqtt_stream.c). This compiles out hass.c,
    the /ha discovery HTTP page, the scheduleHADiscovery command and the
    automatic discovery-on-boot/IP-change publishes. */
 //#define	ENABLE_HA_DISCOVERY					1
 #define ENABLE_MQTT								1
-#define ENABLE_I2C								1
+//#define ENABLE_I2C							1	// STRIP: no I2C peripherals; off on 17 other platforms
 #define ENABLE_NTP								1
 //#define ENABLE_TIME_DST						1
-#define ENABLE_DRIVER_LED						1
+//#define ENABLE_DRIVER_LED						1	// STRIP: no LED/lighting channels; off on 12 other platforms
 //#define ENABLE_DRIVER_TUYAMCU					1
-#define ENABLE_LITTLEFS							1
-#define ENABLE_DRIVER_BMPI2C					1
-#define ENABLE_DRIVER_DS1820					1
-#define ENABLE_DRIVER_DHT						1
-#define ENABLE_DRIVER_AHT2X						1
-#define ENABLE_DRIVER_BATTERY					1
-#define ENABLE_DRIVER_CHARTS					1
-#define ENABLE_EXPAND_CONSTANT					1
+//#define ENABLE_LITTLEFS						1	// STRIP: ~7.9k lines, LFS_* unused in your code; off on 8 other platforms
+//#define ENABLE_DRIVER_BMPI2C					1	// STRIP: I2C sensor
+//#define ENABLE_DRIVER_DS1820					1	// STRIP: 1-wire sensor
+//#define ENABLE_DRIVER_DHT						1	// STRIP: DHT sensor
+//#define ENABLE_DRIVER_AHT2X					1	// STRIP: I2C sensor
+//#define ENABLE_DRIVER_BATTERY					1	// STRIP: OBK battery driver, unrelated to JK-BMS
+//#define ENABLE_DRIVER_CHARTS					1	// STRIP: ~700 lines, you render your own charts
+//#define ENABLE_EXPAND_CONSTANT				1	// STRIP: scripting helper; off on 9 other platforms
 //#define ENABLE_DRIVER_HUE						1
-//#define ENABLE_DRIVER_WEMO						1
+//#define ENABLE_DRIVER_WEMO					1
 /* Trimmed for this ESS build: no local BL0937 chip, no LED strips, no
    Alexa (Wemo/Hue) emulation, no TuyaMCU, no device-group UDP, no SSDP
    announcements. Less flash, fewer open network listeners. */
@@ -498,27 +508,34 @@
 #define ENABLE_DRIVER_BL0942				1
 #define ENABLE_DRIVER_UART_TCP    1
 //#define ENABLE_TASMOTADEVICEGROUPS				1
-#define ENABLE_TASMOTA_JSON						1
-#define ENABLE_CALENDAR_EVENTS					1
-#define ENABLE_DRIVER_DDP						1
+//#define ENABLE_TASMOTA_JSON					1	// STRIP: Tasmota-compat JSON; off on 12 other platforms
+//#define ENABLE_CALENDAR_EVENTS				1	// STRIP: off on 18 other platforms
+//#define ENABLE_DRIVER_DDP						1	// STRIP: xLights lighting protocol
 //#define ENABLE_DRIVER_ARISTON					1
-//#define ENABLE_DRIVER_SSDP						1
-#define ENABLE_DRIVER_CHT83XX					1
+//#define ENABLE_DRIVER_SSDP					1
+//#define ENABLE_DRIVER_CHT83XX					1	// STRIP: I2C sensor
 //#define ENABLE_DRIVER_CSE7761					1
-#define ENABLE_OBK_SCRIPTING					1
-#define ENABLE_ADVANCED_CHANNELTYPES_DISCOVERY	1
-//#define ENABLE_DRIVER_SM16703P					1
-//#define ENABLE_DRIVER_PIXELANIM					1
-#define ENABLE_DRIVER_TINYIR_NEC				1
+//#define ENABLE_OBK_SCRIPTING					1	// STRIP: see note below; off on 8 other platforms
+//#define ENABLE_ADVANCED_CHANNELTYPES_DISCOVERY	1	// STRIP: off on 9 other platforms
+//#define ENABLE_DRIVER_SM16703P				1
+//#define ENABLE_DRIVER_PIXELANIM				1
+//#define ENABLE_DRIVER_TINYIR_NEC				1	// STRIP: IR remote decoding
+
+/* NOTE on ENABLE_OBK_SCRIPTING: drv_bl_shared.c calls
+   EventHandlers_ProcessVariableChange_Integer(). That function is defined
+   unguarded in cmd_eventHandlers.c, so it still links with scripting off --
+   the calls simply become no-ops with no script listening. If you rely on
+   autoexec.bat or scripted rules, re-enable this. The command console
+   itself lives in src/cmnds and is NOT affected by this flag. */
 
 #if (OBK_VARIANT == OBK_VARIANT_ESP4M || OBK_VARIANT == OBK_VARIANT_ESP2M_BERRY)
-#define ENABLE_OBK_BERRY						1
+//#define ENABLE_OBK_BERRY						1	// STRIP: Berry scripting VM
 #endif
 
 #if (OBK_VARIANT == OBK_VARIANT_ESP4M)
-#define ENABLE_DRIVER_TCA9554					1
-#define ENABLE_DRIVER_DMX						1
-#define ENABLE_DRIVER_MQTTSERVER				1
+//#define ENABLE_DRIVER_TCA9554					1	// STRIP: I2C port expander
+//#define ENABLE_DRIVER_DMX						1	// STRIP: DMX lighting
+//#define ENABLE_DRIVER_MQTTSERVER				1	// STRIP: embedded MQTT broker (~1.2k lines)
 #endif
 //#define ENABLE_DRIVER_DCF77					1
 
