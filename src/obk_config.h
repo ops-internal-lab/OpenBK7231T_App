@@ -506,7 +506,7 @@
    announcements. Less flash, fewer open network listeners. */
 //#define ENABLE_DRIVER_BL0937					1
 #define ENABLE_DRIVER_BL0942				1
-#define ENABLE_DRIVER_UART_TCP    1
+//#define ENABLE_DRIVER_UART_TCP    1
 //#define ENABLE_TASMOTADEVICEGROUPS				1
 //#define ENABLE_TASMOTA_JSON					1	// STRIP: Tasmota-compat JSON; off on 12 other platforms
 //#define ENABLE_CALENDAR_EVENTS				1	// STRIP: off on 18 other platforms
@@ -592,7 +592,7 @@
 #define ENABLE_DRIVER_BL0942					1
 #define ENABLE_DRIVER_BL0937					1
 #define ENABLE_DRIVER_CSE7766					1
-#define ENABLE_DRIVER_UART_TCP					1
+//#define ENABLE_DRIVER_UART_TCP					1
 #define ENABLE_ADVANCED_CHANNELTYPES_DISCOVERY	1
 #define ENABLE_DRIVER_SSDP						1
 #define ENABLE_OBK_SCRIPTING					1
