@@ -63,7 +63,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_adcSmoother.c
 	${OBK_SRCS}driver/drv_aht2x.c
 	${OBK_SRCS}driver/drv_battery.c
-	${OBK_SRCS}driver/drv_bl0937.c
 	${OBK_SRCS}driver/drv_bl0942.c
 	${OBK_SRCS}driver/drv_bl_shared.c
 	${OBK_SRCS}driver/drv_bmp280.c
@@ -83,9 +82,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_dht.c
 	${OBK_SRCS}driver/drv_drawers.c
 	${OBK_SRCS}driver/drv_doorSensorWithDeepSleep.c
-	${OBK_SRCS}driver/drv_ds1820_common.c
-	${OBK_SRCS}driver/drv_ds1820_simple.c
-	${OBK_SRCS}driver/drv_ds1820_full.c
 	${OBK_SRCS}driver/drv_esphome_api.c
 	${OBK_SRCS}driver/drv_esphome_api_server.c
 	${OBK_SRCS}driver/drv_freeze.c
@@ -109,7 +105,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_ntp.c
 	${OBK_SRCS}driver/drv_deviceclock.c
 	${OBK_SRCS}driver/drv_ds3231.c
-	${OBK_SRCS}driver/drv_neo6m.c
 	${OBK_SRCS}driver/drv_DCF77.c
 	${OBK_SRCS}libraries/obktime/obktime.c
 	${OBK_SRCS}driver/drv_timed_events.c
@@ -120,7 +115,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_pwm_groups.c
 	${OBK_SRCS}driver/drv_pwmToggler.c
 	${OBK_SRCS}driver/drv_pwrCal.c
-	${OBK_SRCS}driver/drv_rn8209.c
 	${OBK_SRCS}driver/drv_sgp.c
 	${OBK_SRCS}driver/drv_shiftRegister.c
 	${OBK_SRCS}driver/drv_sht3x.c
