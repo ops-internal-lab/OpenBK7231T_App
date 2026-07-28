@@ -61,25 +61,20 @@ set(OBKM_SRC
 
 	${OBK_SRCS}driver/drv_adcButton.c
 	${OBK_SRCS}driver/drv_adcSmoother.c
-	${OBK_SRCS}driver/drv_aht2x.c
 	${OBK_SRCS}driver/drv_battery.c
 	${OBK_SRCS}driver/drv_bl0942.c
 	${OBK_SRCS}driver/drv_bl_shared.c
 	${OBK_SRCS}driver/drv_bmp280.c
-	${OBK_SRCS}driver/drv_bmpi2c.c
 	${OBK_SRCS}driver/drv_bp1658cj.c
 	${OBK_SRCS}driver/drv_bp5758d.c
 	${OBK_SRCS}driver/drv_bridge_driver.c
 	${OBK_SRCS}driver/drv_chargingLimit.c
 	${OBK_SRCS}driver/drv_charts.c
-	${OBK_SRCS}driver/drv_cht8305.c
 	${OBK_SRCS}driver/drv_cse7761.c
 	${OBK_SRCS}driver/drv_cse7766.c
 	${OBK_SRCS}driver/drv_ddp.c
 	${OBK_SRCS}driver/drv_dmx512.c
 	${OBK_SRCS}driver/drv_debouncer.c
-	${OBK_SRCS}driver/drv_dht_internal.c
-	${OBK_SRCS}driver/drv_dht.c
 	${OBK_SRCS}driver/drv_drawers.c
 	${OBK_SRCS}driver/drv_doorSensorWithDeepSleep.c
 	${OBK_SRCS}driver/drv_esphome_api.c
@@ -97,7 +92,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_max72xx_clock.c
 	${OBK_SRCS}driver/drv_max72xx_internal.c
 	${OBK_SRCS}driver/drv_max72xx_single.c
-	${OBK_SRCS}driver/drv_mcp9808.c
 	${OBK_SRCS}driver/drv_mqttServer.c
 	${OBK_SRCS}driver/drv_mqttServerBerry.c
 	${OBK_SRCS}driver/drv_multiPinI2CScanner.c
@@ -114,19 +108,15 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_pwm_groups.c
 	${OBK_SRCS}driver/drv_pwmToggler.c
 	${OBK_SRCS}driver/drv_pwrCal.c
-	${OBK_SRCS}driver/drv_sgp.c
 	${OBK_SRCS}driver/drv_shiftRegister.c
-	${OBK_SRCS}driver/drv_sht3x.c
 	${OBK_SRCS}driver/drv_sm2135.c
 	${OBK_SRCS}driver/drv_sm2235.c
-	${OBK_SRCS}driver/drv_soft_i2c.c
 	${OBK_SRCS}driver/drv_soft_spi.c
 	${OBK_SRCS}driver/drv_sm15155e.c
 	${OBK_SRCS}driver/drv_sm16703P.c
 	${OBK_SRCS}driver/drv_simpleEEPROM.c
 	${OBK_SRCS}driver/drv_shutters.c
 	${OBK_SRCS}driver/drv_leds_shared.c
-	${OBK_SRCS}driver/drv_ltr_als.c
 	${OBK_SRCS}driver/drv_spi.c
 	${OBK_SRCS}driver/drv_spiLED.c
 	${OBK_SRCS}driver/drv_spi_flash.c
@@ -135,7 +125,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_ssdp.c
 	${OBK_SRCS}driver/drv_ssd1306.c
 	${OBK_SRCS}driver/drv_tasmotaDeviceGroups.c
-	${OBK_SRCS}driver/drv_tca9554.c
 	${OBK_SRCS}driver/drv_tclAC.c
 	${OBK_SRCS}driver/drv_test.c
 	${OBK_SRCS}driver/drv_test_drivers.c
