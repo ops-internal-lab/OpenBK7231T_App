@@ -21,8 +21,6 @@
 #include "../driver/drv_deviceclock.h"
 #include "../driver/drv_local.h"
 #include "../driver/drv_bl_shared.h"
-#include "../driver/drv_ds1820_simple.h"
-#include "../driver/drv_ds1820_full.h"
 
 
 #include "../libraries/obktime/obktime.h"	// for time functions
