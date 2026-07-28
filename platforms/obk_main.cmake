@@ -91,7 +91,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_ht16k33.c
 	${OBK_SRCS}driver/drv_httpButtons.c
 	${OBK_SRCS}driver/drv_hue.c
-	${OBK_SRCS}driver/drv_ir2.c
 	${OBK_SRCS}driver/drv_kp18058.c
 	${OBK_SRCS}driver/drv_kp18068.c
 	${OBK_SRCS}driver/drv_max6675.c
@@ -141,7 +140,6 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_test.c
 	${OBK_SRCS}driver/drv_test_drivers.c
 	${OBK_SRCS}driver/drv_textScroller.c
-	${OBK_SRCS}driver/drv_tinyir_nec.c
 	${OBK_SRCS}driver/drv_tm1637.c
 	${OBK_SRCS}driver/drv_tm1638.c
 	${OBK_SRCS}driver/drv_tm_gn_display_shared.c
