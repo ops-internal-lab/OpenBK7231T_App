@@ -1,4 +1,0 @@
-#ifdef WINDOWS
-
-
-#endif // WINDOWS
