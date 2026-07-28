@@ -1,6 +1,5 @@
 #include "../i2c/drv_i2c_public.h"
 #include "../logging/logging.h"
-#include "drv_bl0937.h"
 #include "drv_bl0942.h"
 #include "drv_bl_shared.h"
 #if defined(PLATFORM_ESPIDF)
@@ -14,7 +13,6 @@
 #include "drv_mqtt_stream.h"
 #include "drv_ble_therm.h"
 #endif
-#include "drv_neo6m.h"
 #include "drv_cse7766.h"
 #include "drv_ir.h"
 #include "drv_rc.h"
@@ -29,9 +27,6 @@
 #include "drv_girierMCU.h"
 #include "drv_uart.h"
 #include "drv_gaitekAC.h"
-#include "drv_ds1820_simple.h"
-#include "drv_ds1820_full.h"
-#include "drv_ds1820_common.h"
 #include "drv_ds3231.h"
 #include "drv_hlw8112.h"
 #include "drv_DCF77.h"
